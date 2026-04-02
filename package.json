@@ -1,0 +1,49 @@
+{
+  "name": "acp-runtime",
+  "version": "0.1.0",
+  "description": "High-level runtime for ACP (Agent Client Protocol) agents. Lifecycle management, turn serialization, state persistence, and a clean three-layer API.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "ai-agent",
+    "runtime",
+    "session",
+    "claude",
+    "codex",
+    "gemini"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "peerDependencies": {
+    "@agentclientprotocol/sdk": ">=0.1.0"
+  },
+  "devDependencies": {
+    "@agentclientprotocol/sdk": "^0.1.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  }
+}
