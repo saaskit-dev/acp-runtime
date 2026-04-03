@@ -2,6 +2,11 @@
   "version": 1,
   "id": "protocol.authenticate",
   "kind": "protocol",
+  "classification": {
+    "opencode": {
+      "executionErrorStatus": "mismatch"
+    }
+  },
   "title": "Authenticate",
   "description": "验证 agent 在 initialize 返回 authMethods 时，是否支持 authenticate。",
   "protocolDependencies": ["initialize", "authenticate"],

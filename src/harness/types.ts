@@ -8,10 +8,6 @@ export type TranscriptEntryKind = "wire" | "runtime";
 
 export type CoverageStatus = "PASS" | "FAIL" | "N/A" | "MISSING" | "MISMATCH" | "NOT_OBSERVED";
 
-export type HarnessAgentAuthMode = "none" | "optional" | "required";
-
-export type HarnessAgentTransport = "stdio";
-
 export type HarnessFailureStatus = "failed" | "not-applicable" | "not-observed" | "mismatch";
 
 export type HarnessProbeProfile = {
@@ -46,6 +42,7 @@ export type HarnessStep =
   | ({ type: "session-new" } & StepCommon)
   | ({ type: "session-load"; sessionRef: string } & StepCommon)
   | ({ type: "session-resume"; sessionRef: string } & StepCommon)
+  | ({ type: "session-fork"; sessionRef: string } & StepCommon)
   | ({ type: "session-list" } & StepCommon)
   | ({ type: "session-prompt"; prompt: string; defaultPrompt?: string; turnRef?: string } & StepCommon)
   | ({ type: "session-cancel"; turnRef: string } & StepCommon)
@@ -85,11 +82,8 @@ export type HarnessCase = {
     count: number;
     onStatuses: HarnessFailureStatus[];
   };
-  classification?: {
-    assertionFailureStatus?: HarnessFailureStatus;
-    timeoutStatus?: HarnessFailureStatus;
-    executionErrorStatus?: HarnessFailureStatus;
-  };
+  classification?: Record<string, HarnessClassification>;
+  probes?: Record<string, HarnessProbeProfile>;
   steps: HarnessStep[];
   assertions: HarnessAssertion[];
 };
@@ -101,33 +95,8 @@ export type HarnessClassification = {
 };
 
 export type HarnessAgentDefinition = {
-  version: 1;
   id: string;
   displayName: string;
-  transport: HarnessAgentTransport;
-  launch: {
-    command: string;
-    args?: string[];
-    env?: Record<string, string>;
-  };
-  auth: {
-    mode: HarnessAgentAuthMode;
-  };
-  probes?: Record<string, HarnessProbeProfile>;
-  /**
-   * Per-case classification overrides for this agent.
-   * Key = case ID (e.g. "protocol.session-cancel").
-   *
-   * Classification controls how failures are reported:
-   * - assertionFailureStatus: what to report when assertions fail (default: "failed")
-   * - timeoutStatus: what to report on timeout (default: "failed")
-   * - executionErrorStatus: what to report on execution errors (default: "failed")
-   *
-   * This is agent×case specific because the same case may be expected to fail
-   * differently on different agents (e.g. "set-mode" is N/A on agents without modes).
-   */
-  caseClassifications?: Record<string, HarnessClassification>;
-  metadata?: Record<string, unknown>;
 };
 
 export type HarnessRunStatus = "passed" | HarnessFailureStatus;

@@ -2,6 +2,12 @@
   "version": 1,
   "id": "scenario.permission-denied",
   "kind": "scenario",
+  "classification": {
+    "opencode": {
+      "assertionFailureStatus": "not-observed",
+      "timeoutStatus": "not-observed"
+    }
+  },
   "title": "Permission Denied",
   "description": "验证 agent 在权限被拒绝时是否能以可观测方式收尾。",
   "level": "P1",

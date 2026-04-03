@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { readdir, mkdir, writeFile } from "node:fs/promises";
 import { resolve, join, relative, basename } from "node:path";
 
-import { loadHarnessAgentDefinition } from "./agent-registry.js";
+import { getAgentMeta } from "./agent-registry.js";
 import { loadHarnessCase } from "./case-loader.js";
 import { cleanupAgent } from "./clean-outputs.js";
 import type { HarnessRunStatus } from "./types.js";
@@ -43,7 +43,7 @@ function toRelativeOutputPath(outputRoot: string, value: string): string {
 }
 
 async function runSingleCase(
-  agentPath: string,
+  agentId: string,
   casePath: string,
   outputRoot: string,
   cwd: string,
@@ -68,7 +68,7 @@ async function runSingleCase(
     try {
       const result = spawnSync(
         process.execPath,
-        [cliEntrypoint(), "--agent", agentPath, "--case", casePath, "--output-dir", outputRoot],
+        [cliEntrypoint(), "--agent", agentId, "--case", casePath, "--output-dir", outputRoot],
         {
           cwd,
           timeout: CASE_TIMEOUT_MS,
@@ -139,16 +139,16 @@ async function runSingleCase(
 }
 
 async function main(): Promise<void> {
-  const agentPath = getArg("--agent");
+  const agentId = getArg("--agent");
   const casesRoot = getArg("--cases-root") ?? "./research/harness/cases";
   const outputRoot = getArg("--output-dir") ?? "./research/harness/outputs";
 
-  if (!agentPath) {
-    throw new Error("Usage: node dist/harness/run-agent-matrix.js --agent <agent.json> [--cases-root <dir>] [--output-dir <dir>]");
+  if (!agentId) {
+    throw new Error("Usage: node dist/harness/run-agent-matrix.js --agent <agent-id> [--cases-root <dir>] [--output-dir <dir>]");
   }
 
-  const resolvedAgentPath = resolve(agentPath);
-  const agent = await loadHarnessAgentDefinition(resolvedAgentPath);
+  const meta = await getAgentMeta(agentId);
+  const agent = { id: agentId, displayName: meta.name };
   const caseFiles = [
     ...(await listCaseFiles(resolve(casesRoot, "protocol"))),
     ...(await listCaseFiles(resolve(casesRoot, "scenario"))),
@@ -161,7 +161,7 @@ async function main(): Promise<void> {
   const results: MatrixCaseResult[] = [];
 
   for (const caseFile of caseFiles) {
-    const result = await runSingleCase(resolvedAgentPath, caseFile, outputRoot, process.cwd());
+    const result = await runSingleCase(agentId, caseFile, outputRoot, process.cwd());
     results.push(result);
   }
 

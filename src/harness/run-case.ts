@@ -51,36 +51,19 @@ function mapRunStatusToCoverageStatus(status: HarnessRunResult["status"]): "PASS
   }
 }
 
-/**
- * Resolve classification for a case+agent pair.
- * Priority: agent.caseClassifications[caseId] > testCase.classification > defaults
- */
-function resolveClassification(
-  agent: HarnessAgentDefinition,
-  testCase: HarnessCase,
-): HarnessClassification {
-  const agentOverride = agent.caseClassifications?.[testCase.id];
-  const caseDefault = testCase.classification;
-  return {
-    assertionFailureStatus: agentOverride?.assertionFailureStatus ?? caseDefault?.assertionFailureStatus,
-    timeoutStatus: agentOverride?.timeoutStatus ?? caseDefault?.timeoutStatus,
-    executionErrorStatus: agentOverride?.executionErrorStatus ?? caseDefault?.executionErrorStatus,
-  };
-}
-
 function defaultFailureStatus(
-  classification: HarnessClassification,
+  classification: HarnessClassification | undefined,
   reason: "assertion" | "timeout" | "execution",
 ): HarnessFailureStatus {
   if (reason === "assertion") {
-    return classification.assertionFailureStatus ?? "failed";
+    return classification?.assertionFailureStatus ?? "failed";
   }
 
   if (reason === "timeout") {
-    return classification.timeoutStatus ?? "failed";
+    return classification?.timeoutStatus ?? "failed";
   }
 
-  return classification.executionErrorStatus ?? "failed";
+  return classification?.executionErrorStatus ?? "failed";
 }
 
 function nowIso(): string {
@@ -315,7 +298,7 @@ export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<Ha
     ),
   };
 
-  const classification = resolveClassification(options.agent, options.testCase);
+  const classification = options.testCase.classification?.[options.agent.id];
 
   for (const assertion of options.testCase.assertions) {
     let passed = false;

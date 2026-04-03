@@ -2,6 +2,12 @@
   "version": 1,
   "id": "protocol.session-fork",
   "kind": "protocol",
+  "classification": {
+    "opencode": {
+      "executionErrorStatus": "not-observed",
+      "timeoutStatus": "not-observed"
+    }
+  },
   "title": "Session Fork",
   "description": "验证 agent 是否支持基于已有 session 执行 session/fork。",
   "protocolDependencies": ["initialize", "session/new", "session/fork"],

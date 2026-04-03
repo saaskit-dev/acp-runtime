@@ -2,6 +2,11 @@
   "version": 1,
   "id": "protocol.session-cancel",
   "kind": "protocol",
+  "classification": {
+    "opencode": {
+      "timeoutStatus": "mismatch"
+    }
+  },
   "title": "Session Cancel",
   "description": "验证 active turn 开始实际工作后，可成功发出 session/cancel。",
   "protocolDependencies": ["initialize", "session/new", "session/prompt", "session/cancel", "session/update"],

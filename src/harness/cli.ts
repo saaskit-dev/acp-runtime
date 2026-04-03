@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 
-import { loadHarnessAgentDefinition } from "./agent-registry.js";
+import { getAgentMeta } from "./agent-registry.js";
 import { loadHarnessCase } from "./case-loader.js";
 import { buildCaseOutputDir, runHarnessCase } from "./run-case.js";
 import { executeHarnessCaseOverStdio } from "./stdio-executor.js";
@@ -16,15 +16,16 @@ function getArg(flag: string): string | undefined {
 }
 
 async function main(): Promise<void> {
-  const agentPath = getArg("--agent");
+  const agentId = getArg("--agent");
   const casePath = getArg("--case");
   const outputRoot = getArg("--output-dir") ?? "./research/harness/outputs";
 
-  if (!agentPath || !casePath) {
-    throw new Error("Usage: node dist/harness/cli.js --agent <agent.json> --case <case.json> [--output-dir <dir>]");
+  if (!agentId || !casePath) {
+    throw new Error("Usage: node dist/harness/cli.js --agent <agent-id> --case <case.json> [--output-dir <dir>]");
   }
 
-  const agent = await loadHarnessAgentDefinition(resolve(agentPath));
+  const meta = await getAgentMeta(agentId);
+  const agent = { id: agentId, displayName: meta.name };
   const testCase = await loadHarnessCase(resolve(casePath));
   const runId = new Date().toISOString().replaceAll(":", "-");
   const outputDir = buildCaseOutputDir(resolve(outputRoot), agent.id, testCase.id, runId);

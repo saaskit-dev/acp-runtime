@@ -2,6 +2,18 @@
   "version": 1,
   "id": "protocol.plan-update",
   "kind": "protocol",
+  "probes": {
+    "opencode": {
+      "modeId": "Prometheus (Plan Builder)",
+      "prompt": "Before answering, emit a plan update with at least three steps that tracks your work. Keep the plan current while you work, then answer with the single word DONE."
+    }
+  },
+  "classification": {
+    "opencode": {
+      "assertionFailureStatus": "not-observed",
+      "timeoutStatus": "not-observed"
+    }
+  },
   "title": "Plan Update",
   "description": "验证 agent 在复杂 prompt 中是否发出 plan 类型的 session/update。",
   "retries": {

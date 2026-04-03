@@ -8,6 +8,7 @@ import type {
   ClientCapabilities,
   CreateTerminalRequest,
   CreateTerminalResponse,
+  ForkSessionResponse,
   InitializeResponse,
   ListSessionsResponse,
   LoadSessionResponse,
@@ -33,6 +34,8 @@ import type {
   ReleaseTerminalResponse,
 } from "@agentclientprotocol/sdk";
 
+import { resolveAgentLaunch } from "./agent-registry.js";
+import type { AgentLaunchConfig } from "./agent-registry.js";
 import type {
   HarnessAgentDefinition,
   HarnessCase,
@@ -326,7 +329,7 @@ function buildClientCapabilities(): ClientCapabilities {
 }
 
 async function createConnection(
-  agent: HarnessAgentDefinition,
+  launch: AgentLaunchConfig,
   state: RuntimeClientState,
   emitWireEntry: (
     entry: Omit<TranscriptEntry, "timestamp" | "kind"> & { kind?: TranscriptEntry["kind"] },
@@ -335,12 +338,12 @@ async function createConnection(
   connection: acp.ClientSideConnection;
   child: ChildProcess;
 }> {
-  const child = spawn(agent.launch.command, agent.launch.args ?? [], {
+  const child = spawn(launch.command, launch.args, {
     detached: true,
     stdio: ["pipe", "pipe", "inherit"],
     env: {
       ...process.env,
-      ...agent.launch.env,
+      ...launch.env,
     },
   });
 
@@ -383,6 +386,8 @@ function evaluateSkipCondition(expr: string, state: RuntimeClientState): boolean
       return !capabilities.resumeSession && !sessionCapabilities.resume;
     case "!capabilities.sessionCapabilities.resume":
       return !sessionCapabilities.resume;
+    case "!capabilities.sessionFork":
+      return !sessionCapabilities.fork;
     case "!modes":
       return !state.availableModes || state.availableModes.length === 0;
     case "!authMethods":
@@ -422,16 +427,15 @@ function mapFailureStatusToCoverageStatus(status: HarnessFailureStatus): "FAIL" 
   }
 }
 
-function classifyExecutionFailure(agent: HarnessAgentDefinition, testCase: HarnessCase, error: unknown): HarnessFailureStatus {
-  const agentOverride = agent.caseClassifications?.[testCase.id];
-  const caseDefault = testCase.classification;
+function classifyExecutionFailure(testCase: HarnessCase, agentId: string, error: unknown): HarnessFailureStatus {
+  const caseDefault = testCase.classification?.[agentId];
   const message = formatError(error);
 
   if (message.includes("timed out")) {
-    return agentOverride?.timeoutStatus ?? caseDefault?.timeoutStatus ?? "failed";
+    return caseDefault?.timeoutStatus ?? "failed";
   }
 
-  return agentOverride?.executionErrorStatus ?? caseDefault?.executionErrorStatus ?? "failed";
+  return caseDefault?.executionErrorStatus ?? "failed";
 }
 
 async function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = STEP_TIMEOUT_MS): Promise<T> {
@@ -511,7 +515,7 @@ async function executeStep(
     agent: HarnessAgentDefinition;
   },
 ): Promise<void> {
-  const probeProfile = context.agent.probes?.[context.testCase.id];
+  const probeProfile = context.testCase.probes?.[context.agent.id];
   const resolveSessionId = (sessionRef: string): string => {
     if (sessionRef === "current") {
       if (!context.state.sessionId) {
@@ -813,6 +817,40 @@ async function executeStep(
       });
       return;
     }
+    case "session-fork": {
+      const sessionId = resolveSessionId(step.sessionRef);
+      const request = {
+        sessionId,
+        cwd: process.cwd(),
+        mcpServers: [],
+      };
+      context.emitWireEntry({
+        direction: "outbound",
+        type: "request",
+        method: "session/fork",
+        sessionId,
+        payload: request,
+      });
+      const response: ForkSessionResponse = await context.connection.unstable_forkSession(request);
+      context.emitWireEntry({
+        direction: "inbound",
+        type: "response",
+        method: "session/fork",
+        sessionId: response.sessionId,
+        payload: response,
+      });
+      mergeSummaryPatch(context.state, {
+        protocolCoverage: {
+          "session/fork": {
+            status: "PASS",
+            advertised: true,
+            caseId: context.testCase.id,
+            notes: [],
+          },
+        },
+      });
+      return;
+    }
     case "session-prompt": {
       if (!context.state.sessionId) {
         throw new Error("session-prompt requires an active session");
@@ -1016,7 +1054,8 @@ export const executeHarnessCaseOverStdio: HarnessCaseExecutor = async (context) 
     summaryPatch: {},
   };
 
-  const { connection, child } = await createConnection(agent, state, emitWireEntry);
+  const launch = await resolveAgentLaunch(agent.id);
+  const { connection, child } = await createConnection(launch, state, emitWireEntry);
 
   try {
     for (const step of testCase.steps) {
@@ -1065,7 +1104,7 @@ export const executeHarnessCaseOverStdio: HarnessCaseExecutor = async (context) 
       notes: [],
     };
   } catch (error) {
-    const failureStatus = classifyExecutionFailure(agent, testCase, error);
+    const failureStatus = classifyExecutionFailure(testCase, agent.id, error);
     const coverageStatus = mapFailureStatusToCoverageStatus(failureStatus);
     const failedProtocolCoverage = Object.fromEntries(
       testCase.protocolDependencies

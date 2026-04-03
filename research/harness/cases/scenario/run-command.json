@@ -2,6 +2,11 @@
   "version": 1,
   "id": "scenario.run-command",
   "kind": "scenario",
+  "probes": {
+    "opencode": {
+      "prompt": "Use the execute tool to run `pwd`. Wait for the command output, then answer with only the resulting path."
+    }
+  },
   "title": "Run Command",
   "description": "验证 agent 能触发命令执行相关交互路径。",
   "level": "P0",

@@ -2,6 +2,11 @@
   "version": 1,
   "id": "scenario.read-file",
   "kind": "scenario",
+  "probes": {
+    "opencode": {
+      "prompt": "Use the read tool to inspect ./README.md. Do not rely on prior context. After you have read the file, answer with only its first markdown heading."
+    }
+  },
   "title": "Read File",
   "description": "验证 agent 能触发文件读取相关交互路径。",
   "level": "P0",
