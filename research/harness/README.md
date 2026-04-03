@@ -14,12 +14,10 @@
 research/harness/
   README.md
   cases/
-  scenarios/
   outputs/
 ```
 
 - `cases/`：可执行的 protocol / interaction / scenario case 定义
-- `scenarios/`：给人阅读的场景说明模板与补充文档
 - `outputs/`：真实采集结果
 
 ## 采集目标
