@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "id": "protocol.authenticate",
+  "kind": "protocol",
+  "classification": {
+    "opencode": {
+      "executionErrorStatus": "mismatch"
+    }
+  },
+  "title": "Authenticate",
+  "protocolDependencies": [
+    "initialize",
+    "authenticate"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "authenticate",
+      "skipIf": "!authMethods"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "initialize"
+    },
+    {
+      "type": "transcript-has-method",
+      "method": "authenticate"
+    }
+  ]
+}

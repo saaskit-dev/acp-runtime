@@ -328,7 +328,6 @@ export function isHarnessCase(value: unknown): value is HarnessCase {
     typeof value.id === "string" &&
     isHarnessCaseKind(value.kind) &&
     typeof value.title === "string" &&
-    typeof value.description === "string" &&
     (value.level === undefined || isHarnessCaseLevel(value.level)) &&
     isStringArray(value.protocolDependencies) &&
     (value.capabilities === undefined || isStringArray(value.capabilities)) &&
@@ -341,12 +340,12 @@ export function isHarnessCase(value: unknown): value is HarnessCase {
         value.retries.onStatuses.every(isHarnessFailureStatus))) &&
     (value.classification === undefined ||
       (isPlainObject(value.classification) &&
-        (value.classification.assertionFailureStatus === undefined ||
-          isHarnessFailureStatus(value.classification.assertionFailureStatus)) &&
-        (value.classification.timeoutStatus === undefined ||
-          isHarnessFailureStatus(value.classification.timeoutStatus)) &&
-        (value.classification.executionErrorStatus === undefined ||
-          isHarnessFailureStatus(value.classification.executionErrorStatus)))) &&
+        Object.values(value.classification).every((entry) =>
+          isPlainObject(entry) &&
+          (entry.assertionFailureStatus === undefined || isHarnessFailureStatus(entry.assertionFailureStatus)) &&
+          (entry.timeoutStatus === undefined || isHarnessFailureStatus(entry.timeoutStatus)) &&
+          (entry.executionErrorStatus === undefined || isHarnessFailureStatus(entry.executionErrorStatus))
+        ))) &&
     Array.isArray(value.steps) &&
     value.steps.every(isHarnessStep) &&
     Array.isArray(value.assertions) &&

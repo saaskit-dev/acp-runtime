@@ -74,7 +74,6 @@ export type HarnessCase = {
   id: string;
   kind: HarnessCaseKind;
   title: string;
-  description: string;
   level?: HarnessCaseLevel;
   protocolDependencies: string[];
   capabilities?: string[];

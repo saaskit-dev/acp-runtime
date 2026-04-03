@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "id": "protocol.session-fork",
+  "kind": "protocol",
+  "classification": {
+    "opencode": {
+      "executionErrorStatus": "not-observed",
+      "timeoutStatus": "not-observed"
+    }
+  },
+  "title": "Session Fork",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/fork"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "session-fork",
+      "sessionRef": "current",
+      "skipIf": "!capabilities.sessionFork"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/fork"
+    }
+  ]
+}
