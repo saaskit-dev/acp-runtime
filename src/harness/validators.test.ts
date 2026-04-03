@@ -14,15 +14,16 @@ describe("harness validators", () => {
       id: "protocol.initialize",
       kind: "protocol",
       title: "initialize",
-      description: "Verify initialize handshake",
       protocolDependencies: ["initialize"],
       retries: {
         count: 2,
         onStatuses: ["not-observed"],
       },
       classification: {
-        assertionFailureStatus: "not-observed",
-        timeoutStatus: "mismatch",
+        claude: {
+          assertionFailureStatus: "not-observed",
+          timeoutStatus: "mismatch",
+        },
       },
       steps: [{ type: "initialize" }],
       assertions: [{ type: "transcript-has-method", method: "initialize" }],
