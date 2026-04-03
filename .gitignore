@@ -6,4 +6,4 @@ dist/
 tmp-output.txt
 
 # Harness outputs (regenerated, never committed)
-research/harness/outputs/
+harness-outputs/

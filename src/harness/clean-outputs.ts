@@ -86,7 +86,7 @@ export async function cleanupAgent(agentDir: string, dryRun: boolean): Promise<C
 }
 
 async function main(): Promise<void> {
-  const outputsRoot = resolve(getArg("--outputs-dir") ?? "./research/harness/outputs");
+  const outputsRoot = resolve(getArg("--outputs-dir") ?? "./harness-outputs");
   const agentFilter = getArg("--agent");
   const dryRun = process.argv.includes("--dry-run");
 

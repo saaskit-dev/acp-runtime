@@ -5,8 +5,15 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "acp-simulator-agent": "dist/simulator-agent/cli.js"
+  },
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./simulator-agent": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
@@ -21,6 +28,7 @@
     "dev": "tsc --watch",
     "harness:clean-outputs": "node dist/harness/clean-outputs.js",
     "harness:run-agent": "node dist/harness/run-agent-matrix.js",
+    "simulator-agent": "node dist/simulator-agent/cli.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",

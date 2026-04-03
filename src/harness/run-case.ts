@@ -298,7 +298,7 @@ export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<Ha
     ),
   };
 
-  const classification = options.testCase.classification?.[options.agent.id];
+  const classification = options.testCase.classification;
 
   for (const assertion of options.testCase.assertions) {
     let passed = false;

@@ -140,8 +140,8 @@ async function runSingleCase(
 
 async function main(): Promise<void> {
   const agentId = getArg("--agent");
-  const casesRoot = getArg("--cases-root") ?? "./research/harness/cases";
-  const outputRoot = getArg("--output-dir") ?? "./research/harness/outputs";
+  const casesRoot = getArg("--cases-root") ?? "./src/harness/cases";
+  const outputRoot = getArg("--output-dir") ?? "./harness-outputs";
 
   if (!agentId) {
     throw new Error("Usage: node dist/harness/run-agent-matrix.js --agent <agent-id> [--cases-root <dir>] [--output-dir <dir>]");

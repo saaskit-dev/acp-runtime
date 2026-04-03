@@ -18,7 +18,7 @@ function getArg(flag: string): string | undefined {
 async function main(): Promise<void> {
   const agentId = getArg("--agent");
   const casePath = getArg("--case");
-  const outputRoot = getArg("--output-dir") ?? "./research/harness/outputs";
+  const outputRoot = getArg("--output-dir") ?? "./harness-outputs";
 
   if (!agentId || !casePath) {
     throw new Error("Usage: node dist/harness/cli.js --agent <agent-id> --case <case.json> [--output-dir <dir>]");

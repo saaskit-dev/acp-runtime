@@ -33,6 +33,7 @@
 - [RFC-0005：权限与 Client-Authority 方法](docs/rfcs/0005-permissions-and-client-authority.md)
 - [RFC-0006：可观测性与错误模型](docs/rfcs/0006-observability-and-errors.md)
 - [RFC-0007：宿主接入模型](docs/rfcs/0007-host-integration.md)
+- [RFC-0008：ACP Simulator Agent](docs/rfcs/0008-simulator-agent.md)
 
 ## 建议阅读顺序
 
@@ -55,3 +56,54 @@
 - [ACP 协议覆盖矩阵](docs/research/protocol-coverage-matrix.md)
 - [项目场景回归矩阵](docs/research/project-scenario-matrix.md)
 - [Agent 接入门禁清单](docs/research/agent-admission-checklist.md)
+
+## Simulator Agent
+
+仓库现在内置了一个可独立运行的 ACP simulator agent：
+
+```bash
+pnpm build
+pnpm simulator-agent
+```
+
+或者直接作为 bin 使用：
+
+```bash
+acp-simulator-agent
+```
+
+它基于 ACP 官方 SDK 的 `Agent` 接口实现，能被任意 ACP Client 直接通过 stdio 拉起。
+
+当前支持：
+
+- `initialize`
+- `authenticate` / `logout`
+- `session/new`
+- `session/load`
+- `session/list`
+- `session/resume`
+- `session/fork`
+- `session/close`
+- `session/set_mode`
+- `session/set_model`
+- `session/set_config_option`
+- `session/prompt`
+- `session/cancel`
+- `session/update`
+- `session/request_permission`
+- `fs/read_text_file`
+- `fs/write_text_file`
+- `terminal/create`
+- `terminal/output`
+- `terminal/wait_for_exit`
+- `terminal/kill`
+- `terminal/release`
+- NES 与 document lifecycle experimental 方法
+
+常用启动参数：
+
+- `--storage-dir <dir>`
+- `--auth-mode none|optional|required`
+- `--name <name>`
+- `--title <title>`
+- `--version <version>`
