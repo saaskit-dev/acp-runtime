@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "id": "protocol.session-prompt",
+  "kind": "protocol",
+  "title": "Session Prompt",
+  "description": "验证 session/prompt 发出后，session/update 流能够开始。",
+  "protocolDependencies": ["initialize", "session/new", "session/prompt", "session/update"],
+  "steps": [
+    { "type": "initialize" },
+    { "type": "session-new" },
+    { "type": "session-prompt", "prompt": "Reply with the single word OK.", "turnRef": "turn-1" },
+    { "type": "wait-for-event", "eventType": "available_commands_update" }
+  ],
+  "assertions": [
+    { "type": "transcript-has-method", "method": "session/prompt" },
+    { "type": "transcript-has-event", "eventType": "available_commands_update" }
+  ]
+}

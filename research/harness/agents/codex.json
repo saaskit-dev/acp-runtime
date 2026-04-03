@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "id": "codex",
+  "displayName": "Codex ACP Adapter",
+  "transport": "stdio",
+  "launch": {
+    "command": "codex",
+    "args": ["--acp"]
+  },
+  "auth": {
+    "mode": "optional"
+  },
+  "metadata": {
+    "verified": false,
+    "notes": "Unverified draft — launch command and auth mode need real harness validation."
+  }
+}

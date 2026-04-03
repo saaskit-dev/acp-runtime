@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "id": "opencode",
+  "displayName": "OpenCode ACP Adapter",
+  "transport": "stdio",
+  "launch": {
+    "command": "opencode",
+    "args": ["acp"]
+  },
+  "auth": {
+    "mode": "optional"
+  },
+  "probes": {
+    "protocol.plan-update": {
+      "modeId": "Prometheus (Plan Builder)",
+      "prompt": "Before answering, emit a plan update with at least three steps that tracks your work. Keep the plan current while you work, then answer with the single word DONE."
+    },
+    "scenario.read-file": {
+      "prompt": "Use the read tool to inspect ./README.md. Do not rely on prior context. After you have read the file, answer with only its first markdown heading."
+    },
+    "scenario.run-command": {
+      "prompt": "Use the execute tool to run `pwd`. Wait for the command output, then answer with only the resulting path."
+    }
+  },
+  "caseClassifications": {
+    "protocol.authenticate": {
+      "executionErrorStatus": "mismatch"
+    },
+    "protocol.session-cancel": {
+      "timeoutStatus": "mismatch"
+    },
+    "protocol.plan-update": {
+      "assertionFailureStatus": "not-observed",
+      "timeoutStatus": "not-observed"
+    },
+    "scenario.permission-denied": {
+      "assertionFailureStatus": "not-observed",
+      "timeoutStatus": "not-observed"
+    }
+  },
+  "metadata": {
+    "notes": "Real capability and permission mapping must come from harness results, not this file."
+  }
+}

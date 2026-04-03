@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "id": "protocol.plan-update",
+  "kind": "protocol",
+  "title": "Plan Update",
+  "description": "验证 agent 在复杂 prompt 中是否发出 plan 类型的 session/update。",
+  "retries": {
+    "count": 2,
+    "onStatuses": ["not-observed"]
+  },
+  "protocolDependencies": ["initialize", "session/new", "session/set_mode", "session/prompt", "session/update"],
+  "steps": [
+    { "type": "initialize" },
+    { "type": "session-new" },
+    { "type": "set-mode", "modeId": "$probe-mode", "skipIf": "!modes" },
+    { "type": "session-prompt", "prompt": "$probe-prompt", "defaultPrompt": "Before answering, emit a plan update with at least three steps. Then answer with the single word DONE.", "turnRef": "turn-plan" },
+    { "type": "wait-for-event", "eventType": "plan", "timeoutMs": 60000 }
+  ],
+  "assertions": [
+    { "type": "transcript-has-event", "eventType": "plan" }
+  ]
+}

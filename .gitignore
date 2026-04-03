@@ -2,3 +2,8 @@ node_modules/
 dist/
 *.tsbuildinfo
 .DS_Store
+.tmp/
+tmp-output.txt
+
+# Harness outputs (regenerated, never committed)
+research/harness/outputs/

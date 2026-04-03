@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "id": "scenario.write-file",
+  "kind": "scenario",
+  "title": "Write File",
+  "description": "验证 agent 写文件并完成收尾。",
+  "level": "P0",
+  "protocolDependencies": ["session/new", "session/prompt", "session/update", "session/request_permission", "fs/write_text_file"],
+  "steps": [
+    { "type": "initialize" },
+    { "type": "session-new" },
+    { "type": "permission-decision", "decision": "allow" },
+    { "type": "session-prompt", "prompt": "Create ./tmp-output.txt containing the word READY.", "turnRef": "turn-1" },
+    { "type": "wait-for-event", "eventType": "tool_call_update" }
+  ],
+  "assertions": [
+    { "type": "transcript-has-method", "method": "session/prompt" },
+    { "type": "transcript-has-event", "eventType": "tool_call_update" }
+  ]
+}
