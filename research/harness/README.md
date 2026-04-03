@@ -13,13 +13,11 @@
 ```text
 research/harness/
   README.md
-  agents/
   cases/
   scenarios/
   outputs/
 ```
 
-- `agents/`：agent registry 定义，例如启动命令、认证模式、基础元数据
 - `cases/`：可执行的 protocol / interaction / scenario case 定义
 - `scenarios/`：给人阅读的场景说明模板与补充文档
 - `outputs/`：真实采集结果
@@ -109,12 +107,12 @@ harness 不只服务权限研究，而是服务三类验证：
 - `cases/protocol/`
 - `cases/scenario/`
 
-不同 agent 的区分不写死在 case 里，而是写在 `agents/*.json` 中。
+不同 agent 的启动参数统一从 ACP Registry CDN 拉取（`https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`），本地缓存 24h，不再本地维护。
 
 也就是说：
 
-- case 定义“测什么”
-- agent registry 定义“怎么启动谁”
+- case 定义"测什么"（包含 probes 和 classification，按 agentId 分组）
+- ACP Registry 定义"怎么启动谁"
 - runner 负责把两者组合执行
 
 ## 实施原则
