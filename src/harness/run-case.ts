@@ -5,14 +5,12 @@ import type {
   HarnessAgentDefinition,
   HarnessCase,
   HarnessClassification,
-  HarnessDiscoverySummary,
   HarnessFailureStatus,
   HarnessRunResult,
   HarnessRuntimeEvent,
-  HarnessSummary,
   TranscriptEntry,
 } from "./types.js";
-import { buildHarnessOutputPaths, writeNotes, writeSummary, writeTranscript } from "./transcript-writer.js";
+import { writeTranscript } from "./transcript-writer.js";
 
 export type HarnessCaseExecutor = (context: {
   agent: HarnessAgentDefinition;
@@ -79,161 +77,6 @@ function getValueAtPath(root: unknown, path: string): unknown {
   }, root);
 }
 
-function mergeDiscoverySummary(
-  base: HarnessDiscoverySummary | undefined,
-  patch: HarnessDiscoverySummary | undefined,
-): HarnessDiscoverySummary | undefined {
-  if (!base && !patch) {
-    return undefined;
-  }
-
-  return {
-    ...base,
-    ...patch,
-    initialize: {
-      ...base?.initialize,
-      ...patch?.initialize,
-    },
-    session: {
-      ...base?.session,
-      ...patch?.session,
-    },
-    auth: {
-      ...base?.auth,
-      ...patch?.auth,
-    },
-    plan: {
-      ...base?.plan,
-      ...patch?.plan,
-    },
-    commands: {
-      ...base?.commands,
-      ...patch?.commands,
-    },
-    mode: {
-      ...base?.mode,
-      ...patch?.mode,
-      availableModes: patch?.mode?.availableModes ?? base?.mode?.availableModes,
-    },
-  };
-}
-
-function deriveDiscoveryFromTranscript(transcript: TranscriptEntry[]): HarnessDiscoverySummary | undefined {
-  let discovery: HarnessDiscoverySummary | undefined;
-
-  for (const entry of transcript) {
-    if (entry.kind !== "wire" || entry.direction !== "inbound") {
-      continue;
-    }
-
-    if (entry.method === "initialize" && entry.payload && typeof entry.payload === "object") {
-      const payload = entry.payload as Record<string, any>;
-      discovery = mergeDiscoverySummary(discovery, {
-        initialize: {
-          protocolVersion: payload.protocolVersion as number | string | undefined,
-          agentInfo: payload.agentInfo
-            ? {
-                name: payload.agentInfo.name as string | undefined,
-                version: payload.agentInfo.version as string | undefined,
-              }
-            : undefined,
-          capabilities: payload.agentCapabilities as Record<string, unknown> | undefined,
-          authMethods: Array.isArray(payload.authMethods)
-            ? payload.authMethods.map((item: any) => ({
-                id: item?.id as string | undefined,
-                name: item?.name as string | undefined,
-                description: (item?.description ?? undefined) as string | undefined,
-              }))
-            : undefined,
-        },
-      });
-      continue;
-    }
-
-    if (entry.method === "authenticate" && entry.payload && typeof entry.payload === "object") {
-      const outbound = transcript.find((candidate) =>
-        candidate.kind === "wire" &&
-        candidate.direction === "outbound" &&
-        candidate.method === "authenticate" &&
-        typeof candidate.payload === "object");
-      const payload = outbound?.payload as Record<string, any> | undefined;
-      discovery = mergeDiscoverySummary(discovery, {
-        auth: {
-          authenticated: true,
-          methodId: payload?.methodId as string | undefined,
-        },
-      });
-      continue;
-    }
-
-    if (entry.method === "session/new" && entry.payload && typeof entry.payload === "object") {
-      const payload = entry.payload as Record<string, any>;
-        discovery = mergeDiscoverySummary(discovery, {
-          session: {
-            id: payload.sessionId as string | undefined,
-          },
-          mode: {
-            currentModeId: payload.modes?.currentModeId as string | undefined,
-            availableModes: Array.isArray(payload.modes?.availableModes)
-              ? payload.modes.availableModes.map((item: any) => ({
-                  id: item.id as string,
-                  name: item.name as string | undefined,
-                  description: item.description as string | undefined,
-                }))
-              : undefined,
-          },
-        });
-        continue;
-      }
-
-    if (entry.method === "session/update" && entry.payload && typeof entry.payload === "object") {
-      const payload = entry.payload as Record<string, any>;
-      const update = payload.update as Record<string, any> | undefined;
-      if (!update) {
-        continue;
-      }
-
-      const updateType = update.sessionUpdate as string | undefined;
-
-      if (updateType === "plan" && Array.isArray(update.entries)) {
-        discovery = mergeDiscoverySummary(discovery, {
-          plan: {
-            entries: update.entries.map((item: any) => ({
-              content: item.content as string,
-              priority: item.priority as "high" | "medium" | "low",
-              status: item.status as "pending" | "in_progress" | "completed",
-            })),
-          },
-        });
-        continue;
-      }
-
-      if (updateType === "available_commands_update" && Array.isArray(update.availableCommands)) {
-        discovery = mergeDiscoverySummary(discovery, {
-          commands: {
-            available: update.availableCommands.map((item: any) => ({
-              name: item.name as string,
-              description: item.description as string,
-              inputHint: item.input?.hint as string | undefined,
-            })),
-          },
-        });
-        continue;
-      }
-
-      if (updateType === "current_mode_update") {
-        discovery = mergeDiscoverySummary(discovery, {
-          mode: {
-            currentModeId: update.currentModeId as string | undefined,
-          },
-        });
-      }
-    }
-  }
-
-  return discovery;
-}
-
 export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<HarnessRunResult> {
   const transcript: TranscriptEntry[] = [];
 
@@ -287,18 +130,8 @@ export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<Ha
   };
 
   await mkdir(options.outputDir, { recursive: true });
-  const paths = buildHarnessOutputPaths(options.outputDir);
-  const summary: HarnessSummary = {
-    agent: options.agent.id,
-    timestamp: nowIso(),
-    ...execution.summaryPatch,
-    discovery: mergeDiscoverySummary(
-      execution.summaryPatch.discovery,
-      deriveDiscoveryFromTranscript(transcript),
-    ),
-  };
 
-  const classification = options.testCase.classification;
+  const classification = options.testCase.classification?.[options.agent.id];
 
   for (const assertion of options.testCase.assertions) {
     let passed = false;
@@ -311,7 +144,7 @@ export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<Ha
         passed = transcript.some((entry) => entry.type === assertion.eventType);
         break;
       case "summary-status":
-        passed = getValueAtPath(summary, assertion.path) === assertion.equals;
+        passed = getValueAtPath(result.summaryPatch, assertion.path) === assertion.equals;
         break;
       case "transcript-method-response-has": {
         const responseEntry = transcript.find(
@@ -413,22 +246,11 @@ export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<Ha
     details: { status: result.status },
   });
 
-  await writeTranscript(paths.transcriptPath, transcript);
-  const finalSummary: HarnessSummary = {
-    ...summary,
-    ...result.summaryPatch,
-    protocolCoverage: {
-      ...summary.protocolCoverage,
-      ...result.summaryPatch.protocolCoverage,
-    },
-  };
-
-  await writeSummary(paths.summaryPath, finalSummary);
-  await writeNotes(paths.notesPath, result.notes);
+  await writeTranscript(join(options.outputDir, `${options.testCase.id}.jsonl`), transcript);
 
   return result;
 }
 
-export function buildCaseOutputDir(baseDir: string, agentId: string, caseId: string, runId: string): string {
-  return join(baseDir, agentId, caseId, runId);
+export function buildCaseOutputDir(baseDir: string, agentId: string): string {
+  return join(baseDir, agentId);
 }

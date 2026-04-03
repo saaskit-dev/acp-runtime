@@ -1,4 +1,4 @@
-import type { HarnessSummary, TranscriptEntry } from "./types.js";
+import type { TranscriptEntry } from "./types.js";
 
 type SanitizeContext = {
   sessionIds: Map<string, string>;
@@ -242,14 +242,4 @@ function sanitizeUnknown(value: unknown, context: SanitizeContext): unknown {
 export function sanitizeTranscriptEntries(entries: TranscriptEntry[]): TranscriptEntry[] {
   const context = createContext();
   return entries.map((entry) => sanitizeUnknown(entry, context) as TranscriptEntry);
-}
-
-export function sanitizeHarnessSummary(summary: HarnessSummary): HarnessSummary {
-  const context = createContext();
-  return sanitizeUnknown(summary, context) as HarnessSummary;
-}
-
-export function sanitizeNotes(notes: string[]): string[] {
-  const context = createContext();
-  return notes.map((note) => sanitizeStringValue(note, context));
 }

@@ -1,10 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { readdir, mkdir, writeFile } from "node:fs/promises";
-import { resolve, join, relative, basename } from "node:path";
+import { resolve, join, basename } from "node:path";
 
 import { getAgentMeta } from "./agent-registry.js";
 import { loadHarnessCase } from "./case-loader.js";
-import { cleanupAgent } from "./clean-outputs.js";
 import type { HarnessRunStatus } from "./types.js";
 
 const CASE_TIMEOUT_MS = 45_000;
@@ -12,7 +11,6 @@ const CASE_TIMEOUT_MS = 45_000;
 type MatrixCaseResult = {
   caseId: string;
   status: HarnessRunStatus;
-  outputDir: string;
   notes: string[];
 };
 
@@ -37,15 +35,10 @@ function cliEntrypoint(): string {
   return new URL("./cli.js", import.meta.url).pathname;
 }
 
-function toRelativeOutputPath(outputRoot: string, value: string): string {
-  const relativePath = relative(resolve(outputRoot), value);
-  return relativePath === "" ? "." : relativePath;
-}
-
 async function runSingleCase(
   agentId: string,
   casePath: string,
-  outputRoot: string,
+  outputDir: string,
   cwd: string,
 ): Promise<MatrixCaseResult> {
   let testCase;
@@ -55,7 +48,6 @@ async function runSingleCase(
     return {
       caseId: basename(casePath, ".json"),
       status: "failed",
-      outputDir: resolve(outputRoot),
       notes: [`Failed to load case ${casePath}: ${error instanceof Error ? error.message : String(error)}`],
     };
   }
@@ -68,7 +60,7 @@ async function runSingleCase(
     try {
       const result = spawnSync(
         process.execPath,
-        [cliEntrypoint(), "--agent", agentId, "--case", casePath, "--output-dir", outputRoot],
+        [cliEntrypoint(), "--agent", agentId, "--case", casePath, "--output-dir", outputDir],
         {
           cwd,
           timeout: CASE_TIMEOUT_MS,
@@ -88,7 +80,6 @@ async function runSingleCase(
       const parsed = JSON.parse(stdout) as {
         status: MatrixCaseResult["status"];
         caseId: string;
-        outputDir: string;
         notes: string[];
       };
 
@@ -99,18 +90,15 @@ async function runSingleCase(
       return {
         caseId: parsed.caseId,
         status: parsed.status,
-        outputDir: toRelativeOutputPath(outputRoot, parsed.outputDir),
         notes: stderrText.length > 0
           ? [...parsed.notes, stderrText]
           : parsed.notes,
       };
     } catch (error) {
-      const outputDir = resolve(outputRoot);
       const notes: string[] = [];
 
       if (error instanceof SyntaxError) {
-        const syntaxMessage = error.message;
-        notes.push(`Failed to parse case runner output for ${basename(casePath)}: ${syntaxMessage}`);
+        notes.push(`Failed to parse case runner output for ${basename(casePath)}: ${error.message}`);
       } else if (error instanceof Error) {
         notes.push(error.message);
       } else {
@@ -124,7 +112,6 @@ async function runSingleCase(
       return {
         caseId: testCase.id,
         status: "failed",
-        outputDir,
         notes,
       };
     }
@@ -133,41 +120,39 @@ async function runSingleCase(
   return {
     caseId: testCase.id,
     status: "failed",
-    outputDir: resolve(outputRoot),
     notes: ["Unexpected retry loop termination"],
   };
 }
 
 async function main(): Promise<void> {
   const agentId = getArg("--agent");
+  const caseFile = getArg("--case");
   const casesRoot = getArg("--cases-root") ?? "./src/harness/cases";
   const outputRoot = getArg("--output-dir") ?? "./harness-outputs";
 
   if (!agentId) {
-    throw new Error("Usage: node dist/harness/run-agent-matrix.js --agent <agent-id> [--cases-root <dir>] [--output-dir <dir>]");
+    throw new Error("Usage: node dist/harness/run-agent-matrix.js --agent <agent-id> [--case <file>] [--cases-root <dir>] [--output-dir <dir>]");
   }
 
   const meta = await getAgentMeta(agentId);
   const agent = { id: agentId, displayName: meta.name };
-  const caseFiles = [
-    ...(await listCaseFiles(resolve(casesRoot, "protocol"))),
-    ...(await listCaseFiles(resolve(casesRoot, "scenario"))),
-  ];
+  const caseFiles = caseFile
+    ? [resolve(caseFile)]
+    : await listCaseFiles(resolve(casesRoot));
 
-  const runId = new Date().toISOString().replaceAll(":", "-");
-  const matrixRoot = resolve(outputRoot, agent.id, "matrix", runId);
-  await mkdir(matrixRoot, { recursive: true });
+  const agentDir = resolve(outputRoot, agent.id);
+  await mkdir(agentDir, { recursive: true });
 
   const results: MatrixCaseResult[] = [];
 
   for (const caseFile of caseFiles) {
-    const result = await runSingleCase(agentId, caseFile, outputRoot, process.cwd());
+    const result = await runSingleCase(agentId, caseFile, agentDir, process.cwd());
     results.push(result);
   }
 
   const summary = {
     agentId: agent.id,
-    runId,
+    timestamp: new Date().toISOString(),
     totals: {
       total: results.length,
       passed: results.filter((item) => item.status === "passed").length,
@@ -179,9 +164,7 @@ async function main(): Promise<void> {
     results,
   };
 
-  await writeFile(join(matrixRoot, "matrix-summary.json"), `${JSON.stringify(summary, null, 2)}\n`, "utf8");
-
-  await cleanupAgent(resolve(outputRoot, agent.id), false);
+  await writeFile(join(agentDir, "matrix-summary.json"), `${JSON.stringify(summary, null, 2)}\n`, "utf8");
   console.log(JSON.stringify(summary, null, 2));
 
   if (summary.totals.failed > 0) {

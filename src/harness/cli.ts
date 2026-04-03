@@ -1,4 +1,3 @@
-import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { getAgentMeta } from "./agent-registry.js";
@@ -27,9 +26,7 @@ async function main(): Promise<void> {
   const meta = await getAgentMeta(agentId);
   const agent = { id: agentId, displayName: meta.name };
   const testCase = await loadHarnessCase(resolve(casePath));
-  const runId = new Date().toISOString().replaceAll(":", "-");
-  const outputDir = buildCaseOutputDir(resolve(outputRoot), agent.id, testCase.id, runId);
-  await mkdir(outputDir, { recursive: true });
+  const outputDir = buildCaseOutputDir(resolve(outputRoot), agent.id);
 
   const result = await runHarnessCase({
     agent,
