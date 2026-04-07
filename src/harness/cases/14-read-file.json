@@ -3,6 +3,9 @@
   "id": "scenario.read-file",
   "kind": "scenario",
   "probes": {
+    "simulator-agent-acp-local": {
+      "prompt": "/read $cwd/README.md"
+    },
     "opencode": {
       "prompt": "Use the read tool to inspect ./README.md. Do not rely on prior context. After you have read the file, answer with only its first markdown heading."
     }
@@ -22,6 +25,10 @@
       "type": "session-new"
     },
     {
+      "type": "permission-decision",
+      "decision": "allow"
+    },
+    {
       "type": "session-prompt",
       "prompt": "$probe-prompt",
       "defaultPrompt": "Read ./README.md and tell me the first heading.",
@@ -37,6 +44,10 @@
     {
       "type": "transcript-has-method",
       "method": "session/prompt"
+    },
+    {
+      "type": "transcript-has-method",
+      "method": "fs/read_text_file"
     },
     {
       "type": "transcript-has-event",

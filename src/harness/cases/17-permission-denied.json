@@ -3,6 +3,10 @@
   "id": "scenario.permission-denied",
   "kind": "scenario",
   "classification": {
+    "simulator-agent-acp-local": {
+      "assertionFailureStatus": "not-observed",
+      "timeoutStatus": "not-observed"
+    },
     "opencode": {
       "assertionFailureStatus": "not-observed",
       "timeoutStatus": "not-observed"
@@ -29,7 +33,7 @@
     },
     {
       "type": "session-prompt",
-      "prompt": "Read ./README.md and tell me the first heading.",
+      "prompt": "/write /tmp/acp-harness-test.txt hello world",
       "turnRef": "turn-deny"
     },
     {
@@ -51,6 +55,12 @@
       "type": "transcript-order",
       "first": "session/prompt",
       "then": "session/request_permission"
+    },
+    {
+      "type": "transcript-event-field",
+      "eventType": "permission-request",
+      "path": "options.0.kind",
+      "notEmpty": true
     }
   ]
 }

@@ -8,6 +8,7 @@ import { extract as tarExtract } from "tar";
 
 const REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+export const LOCAL_SIMULATOR_AGENT_ID = "simulator-agent-acp-local";
 
 type BinaryTarget = {
   archive: string;
@@ -59,6 +60,24 @@ export type AgentLaunchConfig = {
   args: string[];
   env: Record<string, string>;
 };
+
+function isLocalSimulatorAgent(agentId: string): boolean {
+  return agentId === LOCAL_SIMULATOR_AGENT_ID;
+}
+
+function resolveLocalSimulatorLaunch(): AgentLaunchConfig {
+  return {
+    command: process.execPath,
+    args: [
+      resolve(process.cwd(), "dist/simulator-agent/cli.js"),
+      "--auth-mode",
+      "none",
+      "--storage-dir",
+      resolve(process.cwd(), ".simulator-agent-acp-harness"),
+    ],
+    env: {},
+  };
+}
 
 function currentPlatformKey(): keyof BinaryDistribution {
   const os = platform();
@@ -229,6 +248,10 @@ function resolveUvx(dist: UvxDistribution): AgentLaunchConfig {
 }
 
 export async function resolveAgentLaunch(agentId: string): Promise<AgentLaunchConfig> {
+  if (isLocalSimulatorAgent(agentId)) {
+    return resolveLocalSimulatorLaunch();
+  }
+
   const registry = await fetchRegistry();
   const agent = findAgent(registry, agentId);
   const { distribution } = agent;
@@ -249,6 +272,14 @@ export async function resolveAgentLaunch(agentId: string): Promise<AgentLaunchCo
 }
 
 export async function getAgentMeta(agentId: string): Promise<{ name: string; version: string; description: string }> {
+  if (isLocalSimulatorAgent(agentId)) {
+    return {
+      name: "Simulator Agent ACP (Local)",
+      version: "0.1.0",
+      description: "Launches the local simulator-agent-acp build from dist/ for harness baseline validation.",
+    };
+  }
+
   const registry = await fetchRegistry();
   const agent = findAgent(registry, agentId);
   return { name: agent.name, version: agent.version, description: agent.description };

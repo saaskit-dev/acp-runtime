@@ -15,6 +15,11 @@ export type HarnessProbeProfile = {
   prompt?: string;
 };
 
+export type HarnessAgentFilter = {
+  include?: string[];
+  exclude?: string[];
+};
+
 /**
  * `skipIf` — optional condition to skip a step at runtime.
  *
@@ -74,6 +79,7 @@ export type HarnessCase = {
   id: string;
   kind: HarnessCaseKind;
   title: string;
+  agents?: HarnessAgentFilter;
   level?: HarnessCaseLevel;
   protocolDependencies: string[];
   capabilities?: string[];

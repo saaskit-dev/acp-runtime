@@ -2,6 +2,11 @@
   "version": 1,
   "id": "scenario.write-file",
   "kind": "scenario",
+  "probes": {
+    "simulator-agent-acp-local": {
+      "prompt": "/write /tmp/acp-harness-test.txt READY"
+    }
+  },
   "title": "Write File",
   "level": "P0",
   "protocolDependencies": [
@@ -24,7 +29,8 @@
     },
     {
       "type": "session-prompt",
-      "prompt": "Create ./tmp-output.txt containing the word READY.",
+      "prompt": "$probe-prompt",
+      "defaultPrompt": "Create ./tmp-output.txt containing the word READY.",
       "turnRef": "turn-1"
     },
     {
@@ -36,6 +42,14 @@
     {
       "type": "transcript-has-method",
       "method": "session/prompt"
+    },
+    {
+      "type": "transcript-has-method",
+      "method": "session/request_permission"
+    },
+    {
+      "type": "transcript-has-method",
+      "method": "fs/write_text_file"
     },
     {
       "type": "transcript-has-event",

@@ -2,7 +2,7 @@ import { resolve } from "node:path";
 
 import { getAgentMeta } from "./agent-registry.js";
 import { loadHarnessCase } from "./case-loader.js";
-import { buildCaseOutputDir, runHarnessCase } from "./run-case.js";
+import { caseAppliesToAgent, runHarnessCase } from "./run-case.js";
 import { executeHarnessCaseOverStdio } from "./stdio-executor.js";
 
 function getArg(flag: string): string | undefined {
@@ -26,7 +26,18 @@ async function main(): Promise<void> {
   const meta = await getAgentMeta(agentId);
   const agent = { id: agentId, displayName: meta.name };
   const testCase = await loadHarnessCase(resolve(casePath));
-  const outputDir = buildCaseOutputDir(resolve(outputRoot), agent.id);
+  const outputDir = resolve(outputRoot);
+
+  if (!caseAppliesToAgent(testCase, agentId)) {
+    console.log(JSON.stringify({
+      status: "not-applicable",
+      agentId,
+      caseId: testCase.id,
+      outputDir,
+      notes: [`Case ${testCase.id} does not apply to ${agentId}.`],
+    }, null, 2));
+    return;
+  }
 
   const result = await runHarnessCase({
     agent,

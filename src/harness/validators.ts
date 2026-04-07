@@ -1,6 +1,7 @@
 import type {
   CoverageStatus,
   HarnessAssertion,
+  HarnessAgentFilter,
   HarnessCase,
   HarnessCaseKind,
   HarnessCaseLevel,
@@ -21,6 +22,12 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isHarnessAgentFilter(value: unknown): value is HarnessAgentFilter {
+  return isPlainObject(value) &&
+    (value.include === undefined || isStringArray(value.include)) &&
+    (value.exclude === undefined || isStringArray(value.exclude));
 }
 
 function isCoverageStatus(value: unknown): value is CoverageStatus {
@@ -79,6 +86,7 @@ function isHarnessStep(value: unknown): value is HarnessStep {
       return value.authMethod === undefined || typeof value.authMethod === "string";
     case "session-load":
     case "session-resume":
+    case "session-fork":
       return typeof value.sessionRef === "string";
     case "session-prompt":
       return typeof value.prompt === "string" &&
@@ -328,6 +336,7 @@ export function isHarnessCase(value: unknown): value is HarnessCase {
     typeof value.id === "string" &&
     isHarnessCaseKind(value.kind) &&
     typeof value.title === "string" &&
+    (value.agents === undefined || isHarnessAgentFilter(value.agents)) &&
     (value.level === undefined || isHarnessCaseLevel(value.level)) &&
     isStringArray(value.protocolDependencies) &&
     (value.capabilities === undefined || isStringArray(value.capabilities)) &&

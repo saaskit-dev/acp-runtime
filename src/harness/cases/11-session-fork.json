@@ -6,6 +6,10 @@
     "opencode": {
       "executionErrorStatus": "not-observed",
       "timeoutStatus": "not-observed"
+    },
+    "claude-acp": {
+      "executionErrorStatus": "not-observed",
+      "assertionFailureStatus": "not-observed"
     }
   },
   "title": "Session Fork",

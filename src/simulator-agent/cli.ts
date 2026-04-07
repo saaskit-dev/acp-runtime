@@ -6,10 +6,10 @@ import { join } from "node:path";
 
 import { AgentSideConnection, ndJsonStream } from "@agentclientprotocol/sdk";
 
-import { createSimulatorAgent, type SimulatorAgentOptions } from "./simulator-agent.js";
+import { createSimulatorAgentAcp, type SimulatorAgentAcpOptions } from "./simulator-agent.js";
 
-function parseArgs(argv: string[]): SimulatorAgentOptions & { authHelper: boolean } {
-  const options: SimulatorAgentOptions & { authHelper: boolean } = {
+function parseArgs(argv: string[]): SimulatorAgentAcpOptions & { authHelper: boolean } {
+  const options: SimulatorAgentAcpOptions & { authHelper: boolean } = {
     authHelper: false,
   };
 
@@ -52,7 +52,7 @@ function parseArgs(argv: string[]): SimulatorAgentOptions & { authHelper: boolea
 }
 
 async function runAuthHelper(): Promise<void> {
-  process.stdout.write("ACP Simulator Agent terminal authentication helper\n");
+  process.stdout.write("Simulator Agent ACP terminal authentication helper\n");
   process.stdout.write("Authentication is simulated. Close this helper and call authenticate.\n");
 }
 
@@ -64,7 +64,7 @@ async function run(): Promise<void> {
     return;
   }
 
-  const storageDir = options.storageDir ?? join(process.cwd(), ".acp-simulator-agent");
+  const storageDir = options.storageDir ?? join(process.cwd(), ".simulator-agent-acp");
   await mkdir(storageDir, { recursive: true });
 
   const stream = ndJsonStream(
@@ -73,7 +73,14 @@ async function run(): Promise<void> {
   );
 
   const connection = new AgentSideConnection(
-    (conn) => createSimulatorAgent(conn, { ...options, storageDir }),
+    (conn) =>
+      createSimulatorAgentAcp(conn, {
+        ...options,
+        storageDir,
+        onFatalExit: (code) => {
+          process.exit(code);
+        },
+      }),
     stream,
   );
 

@@ -3,6 +3,9 @@
   "id": "scenario.run-command",
   "kind": "scenario",
   "probes": {
+    "simulator-agent-acp-local": {
+      "prompt": "/bash pwd"
+    },
     "opencode": {
       "prompt": "Use the execute tool to run `pwd`. Wait for the command output, then answer with only the resulting path."
     }
@@ -22,6 +25,10 @@
       "type": "session-new"
     },
     {
+      "type": "permission-decision",
+      "decision": "allow"
+    },
+    {
       "type": "session-prompt",
       "prompt": "$probe-prompt",
       "defaultPrompt": "Run `pwd` and tell me the resulting path.",
@@ -37,6 +44,10 @@
     {
       "type": "transcript-has-method",
       "method": "session/prompt"
+    },
+    {
+      "type": "transcript-has-method",
+      "method": "terminal/create"
     },
     {
       "type": "transcript-has-event",

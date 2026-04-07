@@ -14,6 +14,9 @@ describe("harness validators", () => {
       id: "protocol.initialize",
       kind: "protocol",
       title: "initialize",
+      agents: {
+        include: ["simulator-agent-acp-local"],
+      },
       protocolDependencies: ["initialize"],
       retries: {
         count: 2,

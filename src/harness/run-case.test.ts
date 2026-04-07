@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { runHarnessCase } from "./run-case.js";
+import { caseAppliesToAgent, runHarnessCase } from "./run-case.js";
 
 describe("runHarnessCase", () => {
   it("writes transcript to <caseId>.jsonl", async () => {
@@ -91,5 +91,33 @@ describe("runHarnessCase", () => {
     });
 
     expect(result.status).toBe("not-observed");
+  });
+
+  it("supports agent include and exclude filters", () => {
+    expect(caseAppliesToAgent({
+      version: 1,
+      id: "simulator.only",
+      kind: "protocol",
+      title: "Simulator only",
+      agents: {
+        include: ["simulator-agent-acp-local"],
+      },
+      protocolDependencies: ["initialize"],
+      steps: [],
+      assertions: [],
+    }, "simulator-agent-acp-local")).toBe(true);
+
+    expect(caseAppliesToAgent({
+      version: 1,
+      id: "simulator.excluded",
+      kind: "protocol",
+      title: "Excluded",
+      agents: {
+        exclude: ["simulator-agent-acp-local"],
+      },
+      protocolDependencies: ["initialize"],
+      steps: [],
+      assertions: [],
+    }, "simulator-agent-acp-local")).toBe(false);
   });
 });

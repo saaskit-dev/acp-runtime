@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { Writable, Readable } from "node:stream";
 
 import * as acp from "@agentclientprotocol/sdk";
@@ -48,6 +50,18 @@ import type { HarnessCaseExecutor } from "./run-case.js";
 type PermissionDecisionQueue = Array<"allow" | "deny">;
 const STEP_TIMEOUT_MS = 30_000;
 
+type HarnessTerminalState = {
+  id: string;
+  command: string;
+  args: string[];
+  cwd: string;
+  output: string;
+  exitCode: number | null;
+  waitMs: number;
+  createdAt: number;
+  killed: boolean;
+};
+
 type RuntimeClientState = {
   sessionId?: string;
   lastListedSessions?: ListSessionsResponse["sessions"];
@@ -61,6 +75,9 @@ type RuntimeClientState = {
   availableAuthMethods?: InitializeResponse["authMethods"];
   lastSessionUpdateAt?: number;
   summaryPatch: Partial<HarnessSummary>;
+  virtualFiles: Map<string, string>;
+  terminals: Map<string, HarnessTerminalState>;
+  nextTerminalId: number;
 };
 
 function mergeSummaryPatch(
@@ -245,6 +262,10 @@ class HarnessClient implements acp.Client {
       sessionId: params.sessionId,
       payload: params,
     });
+    const absolutePath = resolve(params.path);
+    this.state.virtualFiles.set(absolutePath, params.content);
+    await mkdir(dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, params.content, "utf8");
     return {};
   }
 
@@ -256,7 +277,17 @@ class HarnessClient implements acp.Client {
       sessionId: params.sessionId,
       payload: params,
     });
-    return { content: "Harness placeholder content" };
+    const absolutePath = resolve(params.path);
+    const overridden = this.state.virtualFiles.get(absolutePath);
+    if (overridden !== undefined) {
+      return { content: overridden };
+    }
+
+    try {
+      return { content: await readFile(absolutePath, "utf8") };
+    } catch {
+      return { content: "Harness placeholder content" };
+    }
   }
 
   async createTerminal(params: CreateTerminalRequest): Promise<CreateTerminalResponse> {
@@ -267,7 +298,20 @@ class HarnessClient implements acp.Client {
       sessionId: params.sessionId,
       payload: params,
     });
-    return { terminalId: "harness-terminal-1" };
+    const terminalId = `harness-terminal-${this.state.nextTerminalId}`;
+    this.state.nextTerminalId += 1;
+    this.state.terminals.set(terminalId, {
+      id: terminalId,
+      command: params.command,
+      args: params.args ?? [],
+      cwd: params.cwd ?? process.cwd(),
+      output: simulateTerminalOutput(params.command, params.args ?? [], params.cwd ?? process.cwd()),
+      exitCode: 0,
+      waitMs: params.command === "sleep" ? Math.min(Number(params.args?.[0] ?? "0") * 1000, STEP_TIMEOUT_MS) : 0,
+      createdAt: Date.now(),
+      killed: false,
+    });
+    return { terminalId };
   }
 
   async terminalOutput(params: TerminalOutputRequest): Promise<TerminalOutputResponse> {
@@ -278,8 +322,9 @@ class HarnessClient implements acp.Client {
       sessionId: params.sessionId,
       payload: params,
     });
+    const terminal = this.requireTerminal(params.terminalId);
     return {
-      output: "",
+      output: terminal.output,
       truncated: false,
     };
   }
@@ -292,7 +337,15 @@ class HarnessClient implements acp.Client {
       sessionId: params.sessionId,
       payload: params,
     });
-    return { exitCode: 0, signal: null };
+    const terminal = this.requireTerminal(params.terminalId);
+    const remainingWaitMs = Math.max(0, terminal.waitMs - (Date.now() - terminal.createdAt));
+    if (remainingWaitMs > 0 && !terminal.killed) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, remainingWaitMs));
+    }
+    return {
+      exitCode: terminal.killed ? 130 : (terminal.exitCode ?? 0),
+      signal: terminal.killed ? "SIGTERM" : null,
+    };
   }
 
   async killTerminal(params: KillTerminalRequest): Promise<KillTerminalResponse> {
@@ -303,6 +356,8 @@ class HarnessClient implements acp.Client {
       sessionId: params.sessionId,
       payload: params,
     });
+    const terminal = this.requireTerminal(params.terminalId);
+    terminal.killed = true;
     return {};
   }
 
@@ -314,8 +369,41 @@ class HarnessClient implements acp.Client {
       sessionId: params.sessionId,
       payload: params,
     });
+    this.state.terminals.delete(params.terminalId);
     return {};
   }
+
+  private requireTerminal(terminalId: string): HarnessTerminalState {
+    const terminal = this.state.terminals.get(terminalId);
+    if (!terminal) {
+      throw new Error(`Unknown harness terminal: ${terminalId}`);
+    }
+    return terminal;
+  }
+}
+
+function simulateTerminalOutput(command: string, args: string[], cwd: string): string {
+  if (command === "pwd") {
+    return `${cwd}\n`;
+  }
+
+  if (command === "git" && args[0] === "status") {
+    return "On branch harness-simulator\nnothing to commit, working tree clean\n";
+  }
+
+  if (command === "git" && args[0] === "diff" && args[1] === "--stat") {
+    return "README.md | 2 +-\n1 file changed, 1 insertion(+), 1 deletion(-)\n";
+  }
+
+  if (command === "pnpm" && args[0] === "test") {
+    return " PASS  harness simulation\n";
+  }
+
+  return `Simulated command output: ${[command, ...args].join(" ")}\n`;
+}
+
+function interpolatePrompt(prompt: string): string {
+  return prompt.replaceAll("$cwd", process.cwd());
 }
 
 function buildClientCapabilities(): ClientCapabilities {
@@ -392,6 +480,8 @@ function evaluateSkipCondition(expr: string, state: RuntimeClientState): boolean
       return !state.availableModes || state.availableModes.length === 0;
     case "!authMethods":
       return !state.availableAuthMethods || state.availableAuthMethods.length === 0;
+    case "!configOptions":
+      return !state.configOptions || state.configOptions.length === 0;
     default:
       // Unknown expression → don't skip (safe default)
       return false;
@@ -863,6 +953,8 @@ async function executeStep(
         prompt = step.prompt;
       }
 
+      prompt = interpolatePrompt(prompt);
+
       const request = {
         sessionId: context.state.sessionId,
         prompt: [
@@ -975,17 +1067,35 @@ async function executeStep(
         throw new Error("set-config-option requires an active session");
       }
 
-      const request = typeof step.value === "boolean"
+      let configId = step.key;
+      let configValue = step.value;
+
+      if (step.key === "$first") {
+        const firstOption = context.state.configOptions?.[0];
+        if (!firstOption) {
+          throw new Error("set-config-option $first: no configOptions available");
+        }
+        configId = firstOption.id;
+        if (firstOption.type === "select" && Array.isArray((firstOption as any).options)) {
+          configValue = (firstOption as any).options[0]?.value ?? firstOption.currentValue;
+        } else if (firstOption.type === "boolean") {
+          configValue = !(firstOption.currentValue as boolean);
+        } else {
+          configValue = firstOption.currentValue;
+        }
+      }
+
+      const request = typeof configValue === "boolean"
         ? {
             sessionId: context.state.sessionId,
-            configId: step.key,
+            configId,
             type: "boolean" as const,
-            value: step.value,
+            value: configValue,
           }
         : {
             sessionId: context.state.sessionId,
-            configId: step.key,
-            value: String(step.value),
+            configId,
+            value: String(configValue),
           };
       context.emitWireEntry({
         direction: "outbound",
@@ -1034,10 +1144,29 @@ async function executeStep(
     case "close-session":
       return;
     case "terminal-output":
+      await new HarnessClient(context.state, context.emitWireEntry).terminalOutput({
+        sessionId: context.state.sessionId ?? "",
+        terminalId: step.terminalRef,
+      });
+      return;
     case "terminal-wait-for-exit":
+      await new HarnessClient(context.state, context.emitWireEntry).waitForTerminalExit({
+        sessionId: context.state.sessionId ?? "",
+        terminalId: step.terminalRef,
+      });
+      return;
     case "terminal-kill":
+      await new HarnessClient(context.state, context.emitWireEntry).killTerminal({
+        sessionId: context.state.sessionId ?? "",
+        terminalId: step.terminalRef,
+      });
+      return;
     case "terminal-release":
-      throw new Error(`Step not implemented yet: ${step.type}`);
+      await new HarnessClient(context.state, context.emitWireEntry).releaseTerminal({
+        sessionId: context.state.sessionId ?? "",
+        terminalId: step.terminalRef,
+      });
+      return;
     default: {
       const exhaustiveCheck: never = step;
       throw new Error(`Unsupported step: ${JSON.stringify(exhaustiveCheck)}`);
@@ -1052,6 +1181,9 @@ export const executeHarnessCaseOverStdio: HarnessCaseExecutor = async (context) 
     pendingPermissionDecisions: [],
     pendingSessionUpdates: [],
     summaryPatch: {},
+    virtualFiles: new Map(),
+    terminals: new Map(),
+    nextTerminalId: 1,
   };
 
   const launch = await resolveAgentLaunch(agent.id);

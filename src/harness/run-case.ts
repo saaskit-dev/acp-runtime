@@ -30,6 +30,20 @@ export type RunHarnessCaseOptions = {
   executor: HarnessCaseExecutor;
 };
 
+export function caseAppliesToAgent(testCase: HarnessCase, agentId: string): boolean {
+  const include = testCase.agents?.include;
+  if (include && include.length > 0 && !include.includes(agentId)) {
+    return false;
+  }
+
+  const exclude = testCase.agents?.exclude;
+  if (exclude && exclude.includes(agentId)) {
+    return false;
+  }
+
+  return true;
+}
+
 function mapRunStatusToCoverageStatus(status: HarnessRunResult["status"]): "PASS" | "FAIL" | "N/A" | "MISMATCH" | "NOT_OBSERVED" {
   switch (status) {
     case "passed":

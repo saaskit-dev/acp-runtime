@@ -3,13 +3,25 @@
   "id": "protocol.plan-update",
   "kind": "protocol",
   "probes": {
+    "simulator-agent-acp-local": {
+      "modeId": "accept-edits",
+      "prompt": "/plan inspect prompt | publish plan update | confirm completion"
+    },
     "opencode": {
       "modeId": "Prometheus (Plan Builder)",
       "prompt": "Before answering, emit a plan update with at least three steps that tracks your work. Keep the plan current while you work, then answer with the single word DONE."
+    },
+    "claude-acp": {
+      "modeId": "plan",
+      "prompt": "You MUST use session/update to emit a plan with at least three steps before doing anything else. Each step must have a title and status. Emit the plan update immediately, then respond with the single word DONE."
     }
   },
   "classification": {
     "opencode": {
+      "assertionFailureStatus": "not-observed",
+      "timeoutStatus": "not-observed"
+    },
+    "claude-acp": {
       "assertionFailureStatus": "not-observed",
       "timeoutStatus": "not-observed"
     }
@@ -48,7 +60,7 @@
     },
     {
       "type": "wait-for-event",
-      "eventType": "plan",
+      "eventType": "completed",
       "timeoutMs": 60000
     }
   ],
@@ -56,6 +68,18 @@
     {
       "type": "transcript-has-event",
       "eventType": "plan"
+    },
+    {
+      "type": "transcript-event-field",
+      "eventType": "plan",
+      "path": "update.entries.0.content",
+      "notEmpty": true
+    },
+    {
+      "type": "transcript-event-field",
+      "eventType": "plan",
+      "path": "update.entries.0.status",
+      "equals": "in_progress"
     }
   ]
 }

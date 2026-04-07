@@ -1,44 +1,58 @@
 {
-  "name": "acp-runtime",
+  "name": "simulator-agent-acp",
   "version": "0.1.0",
-  "description": "High-level runtime for ACP (Agent Client Protocol) agents. Lifecycle management, turn serialization, state persistence, and a clean three-layer API.",
+  "description": "Deterministic ACP simulator agent for client integration, protocol regression, and fault-injection testing.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "acp-simulator-agent": "dist/simulator-agent/cli.js"
+    "simulator-agent-acp": "dist/simulator-agent/cli.js"
   },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./simulator-agent": {
+    "./simulator-agent-acp": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
   },
   "files": [
-    "dist",
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/simulator-agent/cli.js",
+    "dist/simulator-agent/cli.d.ts",
+    "dist/simulator-agent/simulator-agent.js",
+    "dist/simulator-agent/simulator-agent.d.ts",
+    "dist/examples/client-sdk-smoke.js",
+    "dist/examples/client-sdk-smoke.d.ts",
     "README.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "harness:clean-outputs": "node dist/harness/clean-outputs.js",
     "harness:run-agent": "node dist/harness/run-agent-matrix.js",
-    "simulator-agent": "node dist/simulator-agent/cli.js",
+    "smoke:client-sdk": "node dist/examples/client-sdk-smoke.js",
+    "simulator-agent-acp": "node dist/simulator-agent/cli.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
     "acp",
     "agent-client-protocol",
     "ai-agent",
-    "runtime",
+    "simulator-agent",
+    "testing",
+    "regression",
+    "fault-injection",
     "session",
     "claude",
     "codex",
@@ -48,11 +62,7 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "peerDependencies": {
-    "@agentclientprotocol/sdk": ">=0.18.0"
-  },
   "devDependencies": {
-    "@agentclientprotocol/sdk": "^0.18.0",
     "@types/node": "^22.15.3",
     "@types/tar": "^7.0.87",
     "@types/unzipper": "^0.10.11",
@@ -60,7 +70,16 @@
     "vitest": "^3.0.0"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^0.18.0",
     "tar": "^7.5.13",
     "unzipper": "^0.12.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saaskit-dev/acp-runtime.git"
+  },
+  "homepage": "https://github.com/saaskit-dev/acp-runtime#readme",
+  "bugs": {
+    "url": "https://github.com/saaskit-dev/acp-runtime/issues"
   }
 }

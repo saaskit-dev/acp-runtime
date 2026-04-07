@@ -3,6 +3,11 @@
   "id": "protocol.session-cancel",
   "kind": "protocol",
   "classification": {
+    "simulator-agent-acp-local": {
+      "executionErrorStatus": "not-observed",
+      "timeoutStatus": "not-observed",
+      "assertionFailureStatus": "not-observed"
+    },
     "opencode": {
       "timeoutStatus": "mismatch"
     }

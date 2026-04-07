@@ -4,6 +4,7 @@ import { resolve, join, basename } from "node:path";
 
 import { getAgentMeta } from "./agent-registry.js";
 import { loadHarnessCase } from "./case-loader.js";
+import { caseAppliesToAgent } from "./run-case.js";
 import type { HarnessRunStatus } from "./types.js";
 
 const CASE_TIMEOUT_MS = 45_000;
@@ -49,6 +50,14 @@ async function runSingleCase(
       caseId: basename(casePath, ".json"),
       status: "failed",
       notes: [`Failed to load case ${casePath}: ${error instanceof Error ? error.message : String(error)}`],
+    };
+  }
+
+  if (!caseAppliesToAgent(testCase, agentId)) {
+    return {
+      caseId: testCase.id,
+      status: "not-applicable",
+      notes: [`Case ${testCase.id} does not apply to ${agentId}.`],
     };
   }
 

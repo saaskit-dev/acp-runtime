@@ -17,8 +17,9 @@
     },
     {
       "type": "set-config-option",
-      "key": "verbose",
-      "value": true
+      "key": "$first",
+      "value": "$first-value",
+      "skipIf": "!configOptions"
     }
   ],
   "assertions": [

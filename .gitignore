@@ -7,3 +7,4 @@ tmp-output.txt
 
 # Harness outputs (regenerated, never committed)
 harness-outputs/
+.simulator-agent-acp*/
