@@ -1,3 +1,30 @@
+# Agent Admission Checklist
+
+Language:
+- English (default)
+- [简体中文](#简体中文)
+
+## Summary
+
+This checklist defines the minimum evidence and pass criteria required before a new agent can be admitted into `acp-runtime`.
+
+It requires:
+
+- protocol coverage review
+- project-scenario regression review
+- permission and mode research
+- durable artifacts such as transcripts, summaries, and notes
+
+Artifacts should now be stored under:
+
+```text
+harness-outputs/<agent>/<timestamp>/
+```
+
+## Simplified Chinese
+
+[Back to English](#agent-admission-checklist)
+
 # Agent 接入门禁清单
 
 - 状态：Draft
@@ -57,7 +84,7 @@
 每次验收至少应产出：
 
 ```text
-research/harness/outputs/<agent>/<timestamp>/
+harness-outputs/<agent>/<timestamp>/
   transcript.jsonl
   summary.json
   notes.md

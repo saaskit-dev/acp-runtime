@@ -1,3 +1,23 @@
+# RFC-0006: Observability and Error Model
+
+Language:
+- English (default)
+- [简体中文](#简体中文)
+
+## Summary
+
+This RFC defines the observability layers and error model for `acp-runtime`.
+
+It recommends:
+
+- a three-layer model of `logger`, `hooks`, and `event sink`
+- structured classification of runtime, protocol, transport, and agent failures
+- enough observability to support debugging and testing before introducing full tracing
+
+## Simplified Chinese
+
+[Back to English](#rfc-0006-observability-and-error-model)
+
 # RFC-0006：可观测性与错误模型
 
 - 状态：Proposed

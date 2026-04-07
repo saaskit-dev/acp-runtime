@@ -1,3 +1,22 @@
+# RFC-0007: Host Integration Model
+
+Language:
+- English (default)
+- [简体中文](#简体中文)
+
+## Summary
+
+This RFC explains how external hosts should integrate `acp-runtime`.
+
+It separates:
+
+- runtime responsibilities such as ACP transport, session lifecycle, turn execution, recovery, and permission coordination
+- host responsibilities such as product session lists, UI, persistence, and business fallback logic
+
+## Simplified Chinese
+
+[Back to English](#rfc-0007-host-integration-model)
+
 # RFC-0007：宿主接入模型
 
 - 状态：Proposed

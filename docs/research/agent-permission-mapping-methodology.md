@@ -1,3 +1,23 @@
+# Agent Permission Mapping Methodology
+
+Language:
+- English (default)
+- [简体中文](#简体中文)
+
+## Summary
+
+This document defines how `acp-runtime` should gather real ACP evidence for permission and mode mapping across agents.
+
+It focuses on:
+
+- collecting repeatable protocol data
+- observing real permission requests and mode behavior
+- deriving runtime `permissionPolicy` mappings from evidence instead of guesswork
+
+## Simplified Chinese
+
+[Back to English](#agent-permission-mapping-methodology)
+
 # Agent 权限映射调研方法
 
 - 状态：Draft

@@ -1,3 +1,24 @@
+# RFC-0002: Session Lifecycle
+
+Language:
+- English (default)
+- [简体中文](#简体中文)
+
+## Summary
+
+This RFC defines precise semantics for `create`, `load`, `resume`, and `close`.
+
+The core distinction is:
+
+- `create` is a runtime action that starts a new ACP session
+- `load` is a protocol action that restores a specific ACP session
+- `resume` is a runtime recovery action that may map to `session/resume` or `session/load`
+- `close` is an explicit lifecycle boundary rather than an implicit disconnect
+
+## Simplified Chinese
+
+[Back to English](#rfc-0002-session-lifecycle)
+
 # RFC-0002：Session 生命周期
 
 - 状态：Proposed

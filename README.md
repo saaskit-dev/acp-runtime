@@ -1,5 +1,49 @@
 # acp-runtime
 
+Language:
+- English (default)
+- [简体中文](#简体中文)
+
+## Overview
+
+`acp-runtime` is a product-facing, product-agnostic ACP runtime and simulator workspace.
+
+This repository currently centers on:
+
+- `simulator-agent-acp` as a deterministic ACP agent
+- harness-driven protocol and scenario validation
+- RFCs that define the runtime model for sessions, turns, permissions, recovery, and host integration
+
+Protocol alignment for the simulator is tracked with explicit metadata:
+
+- ACP protocol version: `1`
+- ACP source repo: `https://github.com/agentclientprotocol/agent-client-protocol`
+- ACP source ref: `v0.11.4`
+- Last verified against upstream docs: `2026-04-08`
+
+Key entry points:
+
+- [Client Integration Guide](docs/client-integration-guide.md)
+- [RFC-0008: Simulator Agent ACP](docs/rfcs/0008-simulator-agent.md)
+- [Protocol Coverage Matrix](docs/research/protocol-coverage-matrix.md)
+
+Simulator highlights:
+
+- stdio ACP agent process
+- deterministic slash-command surface
+- permission, file, terminal, and plan flows
+- MCP server config validation for `stdio` / `http` / `sse`
+- local harness baseline via `simulator-agent-acp-local`
+
+Language note:
+
+- The English section is the default entry point.
+- Full Chinese content is available below.
+
+## 简体中文
+
+[Back to English](#acp-runtime)
+
 `acp-runtime` 是一个面向产品接入的、产品无关的 ACP 运行时。
 
 它的目标不是“把 ACP SDK 包一层”，而是定义一套稳定的运行时原语：

@@ -1,3 +1,23 @@
+# ACP Registry Agent Launch Catalog
+
+Language:
+- English (default)
+- [简体中文](#简体中文)
+
+## Summary
+
+This document records how ACP registry agents are launched and how those launch details map into the local harness registry.
+
+It is used to:
+
+- normalize launch commands and environment variables
+- keep startup metadata separate from capability and permission conclusions
+- feed the harness registry implementation rather than ad hoc JSON lists
+
+## Simplified Chinese
+
+[Back to English](#acp-registry-agent-launch-catalog)
+
 # ACP Registry Agent 启动接入清单
 
 - 状态：Draft
@@ -8,7 +28,7 @@
 
 这份文档根据 ACP 官方 registry 记录每个 agent 的启动分发方式，用于：
 
-- 生成 harness `agents/*.json`
+- 生成 harness agent registry 条目
 - 统一“这个 agent 怎么启动”
 - 避免把启动信息和 capability / permission 结论混在一起
 
@@ -143,7 +163,7 @@ uvx <package> ...
 
 这份 catalog 可以直接驱动：
 
-- `research/harness/agents/*.json`
+- `src/harness/registry-client.ts` / `src/harness/agent-registry.ts`
 - 后续“从 registry 自动生成本地 agent registry”的脚本
 
 但它不能替代：

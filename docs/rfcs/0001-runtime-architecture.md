@@ -1,3 +1,23 @@
+# RFC-0001: Runtime Architecture
+
+Language:
+- English (default)
+- [简体中文](#简体中文)
+
+## Summary
+
+This RFC defines `acp-runtime` as a host-facing ACP runtime rather than a thin SDK wrapper.
+
+Key points:
+
+- the runtime owns ACP connections, agent process lifecycle, sessions, turns, recovery, and observability
+- the host owns product state, UI, storage, and business decisions
+- the runtime should present a stable abstraction over ACP rather than leaking protocol details into every product
+
+## Simplified Chinese
+
+[Back to English](#rfc-0001-runtime-architecture)
+
 # RFC-0001：acp-runtime 总体架构
 
 - 状态：Proposed

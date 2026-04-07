@@ -1,3 +1,25 @@
+# RFC-0000: Glossary and Core Types
+
+Language:
+- English (default)
+- [简体中文](#简体中文)
+
+## Summary
+
+This RFC defines the shared vocabulary and core runtime types used across `acp-runtime`.
+
+It standardizes:
+
+- host, runtime, agent, session, turn, mode, model/profile, and permission terminology
+- the runtime event model and state model
+- shared type contracts referenced by later RFCs
+
+This document is a glossary and type index rather than a feature proposal.
+
+## Simplified Chinese
+
+[Back to English](#rfc-0000-glossary-and-core-types)
+
 # RFC-0000：术语与核心类型索引
 
 - 状态：Proposed

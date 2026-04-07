@@ -1,3 +1,23 @@
+# <agent-name> Research Template
+
+Language:
+- English (default)
+- [简体中文](#简体中文)
+
+## Summary
+
+Use this template to record launch, capability, mode, permission, and scenario findings for a real ACP agent.
+
+The output should be evidence-driven and suitable for:
+
+- protocol coverage decisions
+- scenario admission decisions
+- permission-policy mapping
+
+## Simplified Chinese
+
+[Back to English](#agent-name-research-template)
+
 # <agent-name> 调研模板
 
 - 状态：Draft
