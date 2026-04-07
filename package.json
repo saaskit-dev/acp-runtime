@@ -1,5 +1,5 @@
 {
-  "name": "simulator-agent-acp",
+  "name": "@saaskit-dev/simulator-agent-acp",
   "version": "0.1.0",
   "description": "Deterministic ACP simulator agent for client integration, protocol regression, and fault-injection testing.",
   "type": "module",

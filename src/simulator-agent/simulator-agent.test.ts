@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TransformStream } from "node:stream/web";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ClientSideConnection,
@@ -181,6 +181,14 @@ async function createTestRig(
 }
 
 describe("SimulatorAgentAcp", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("initializes and creates a fully-capable session", async () => {
     const { clientConnection, memoryClient } = await createTestRig({
       fs: {

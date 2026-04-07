@@ -117,14 +117,14 @@ pnpm simulator-agent-acp
 发布到 npm registry 后，对外安装方式是：
 
 ```bash
-npm install -g simulator-agent-acp
+npm install -g @saaskit-dev/simulator-agent-acp
 simulator-agent-acp
 ```
 
 或者：
 
 ```bash
-npx simulator-agent-acp@latest
+npx @saaskit-dev/simulator-agent-acp@latest
 ```
 
 ## Simulator Agent ACP

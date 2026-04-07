@@ -76,7 +76,7 @@ pnpm simulator-agent-acp
 或者：
 
 ```bash
-simulator-agent-acp
+npx @saaskit-dev/simulator-agent-acp@latest
 ```
 
 常用参数：
