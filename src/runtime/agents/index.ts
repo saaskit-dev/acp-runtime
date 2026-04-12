@@ -1,0 +1,22 @@
+export {
+  CLAUDE_CODE_ACP_COMMAND,
+  CLAUDE_CODE_ACP_PACKAGE,
+  CLAUDE_CODE_ACP_REGISTRY_ID,
+  createClaudeCodeAcpAgent,
+} from "./claude-code-acp.js";
+export type {
+  ClaudeCodeAcpAgentOptions,
+  ClaudeCodeAcpLaunchMode,
+} from "./claude-code-acp.js";
+
+export {
+  LOCAL_SIMULATOR_AGENT_ACP_REGISTRY_ID,
+  SIMULATOR_AGENT_ACP_COMMAND,
+  SIMULATOR_AGENT_ACP_PACKAGE,
+  SIMULATOR_AGENT_ACP_REGISTRY_ID,
+  createSimulatorAgentAcpAgent,
+} from "./simulator-agent-acp.js";
+export type {
+  SimulatorAgentAcpAgentOptions,
+  SimulatorAgentAcpLaunchMode,
+} from "./simulator-agent-acp.js";

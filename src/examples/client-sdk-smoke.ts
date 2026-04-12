@@ -1,7 +1,6 @@
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 
@@ -28,6 +27,7 @@ import {
   type WriteTextFileRequest,
   type WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
+import { SIMULATOR_AGENT_ACP_PACKAGE } from "../index.js";
 
 type MemoryTerminal = {
   exitCode: number;
@@ -111,15 +111,16 @@ class SmokeClient implements Client {
 }
 
 async function main(): Promise<void> {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const repoRoot = dirname(dirname(here));
-  const simulatorCliPath = join(repoRoot, "dist", "simulator-agent", "cli.js");
   const simulatorStorageDir = await mkdtemp(join(tmpdir(), "simulator-agent-acp-smoke-"));
 
-  const child = spawn(process.execPath, [simulatorCliPath, "--storage-dir", simulatorStorageDir], {
-    cwd: repoRoot,
-    stdio: ["pipe", "pipe", "inherit"],
-  });
+  const child = spawn(
+    "npx",
+    ["--yes", SIMULATOR_AGENT_ACP_PACKAGE, "--storage-dir", simulatorStorageDir],
+    {
+      cwd: process.cwd(),
+      stdio: ["pipe", "pipe", "inherit"],
+    },
+  );
 
   const stream = ndJsonStream(
     Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,

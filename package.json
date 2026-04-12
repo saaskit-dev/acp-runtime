@@ -1,19 +1,12 @@
 {
-  "name": "@saaskit-dev/simulator-agent-acp",
+  "name": "@saaskit-dev/acp-runtime",
   "version": "0.1.1",
-  "description": "Deterministic ACP simulator agent for client integration, protocol regression, and fault-injection testing.",
+  "description": "Product-facing, product-agnostic ACP runtime with runtime agent launch helpers.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "bin": {
-    "simulator-agent-acp": "dist/simulator-agent/cli.js"
-  },
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    },
-    "./simulator-agent-acp": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
@@ -21,12 +14,15 @@
   "files": [
     "dist/index.js",
     "dist/index.d.ts",
-    "dist/simulator-agent/cli.js",
-    "dist/simulator-agent/cli.d.ts",
-    "dist/simulator-agent/simulator-agent.js",
-    "dist/simulator-agent/simulator-agent.d.ts",
+    "dist/runtime",
     "dist/examples/client-sdk-smoke.js",
     "dist/examples/client-sdk-smoke.d.ts",
+    "dist/examples/runtime-smoke-all.js",
+    "dist/examples/runtime-smoke-all.d.ts",
+    "dist/examples/runtime-claude-smoke.js",
+    "dist/examples/runtime-claude-smoke.d.ts",
+    "dist/examples/runtime-simulator-smoke.js",
+    "dist/examples/runtime-simulator-smoke.d.ts",
     "README.md",
     "LICENSE"
   ],
@@ -34,13 +30,18 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
+    "build": "pnpm --filter @saaskit-dev/simulator-agent-acp build && pnpm run build:self",
+    "build:self": "tsc -p tsconfig.json",
+    "dev": "pnpm run build:self -- --watch",
     "harness:clean-outputs": "node dist/harness/clean-outputs.js",
     "harness:run-agent": "node dist/harness/run-agent-matrix.js",
+    "presmoke:client-sdk": "pnpm run build",
     "smoke:client-sdk": "node dist/examples/client-sdk-smoke.js",
-    "simulator-agent-acp": "node dist/simulator-agent/cli.js",
-    "test": "vitest run",
+    "presmoke:runtime:claude": "pnpm run build",
+    "smoke:runtime:claude": "node dist/examples/runtime-claude-smoke.js",
+    "presmoke:runtime": "pnpm run build",
+    "smoke:runtime": "node dist/examples/runtime-smoke-all.js",
+    "test": "pnpm --filter @saaskit-dev/simulator-agent-acp test && vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
     "prepublishOnly": "npm run build && npm test"
@@ -49,7 +50,7 @@
     "acp",
     "agent-client-protocol",
     "ai-agent",
-    "simulator-agent",
+    "runtime",
     "testing",
     "regression",
     "fault-injection",

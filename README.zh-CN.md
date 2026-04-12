@@ -8,6 +8,12 @@
 
 `acp-runtime` 是一个面向产品接入的、产品无关的 ACP 运行时。
 
+## 仓库全局目标
+
+这个仓库的主线目标，是把 `acp-runtime` 做成产品宿主侧的 ACP runtime 层，让未来接入真实 ACP agent 时，可以复用同一套 session、turn、permission、recovery 和 observability 模型。
+
+`simulator-agent-acp` 的定位不是最终产品主线，而是站在 ACP agent 位置上的确定性测试替身。它用于在开发和回归测试阶段验证 runtime、本地宿主接入流程和协议行为，而不依赖真实 agent。
+
 它的目标不是“把 ACP SDK 包一层”，而是定义一套稳定的运行时原语：
 
 - agent 进程生命周期
@@ -31,23 +37,18 @@
 
 ## RFC 导航
 
-- [RFC-0000：术语与核心类型索引](docs/rfcs/0000-glossary-and-types.md)
-- [RFC-0001：总体架构](docs/rfcs/0001-runtime-architecture.md)
-- [RFC-0002：Session 生命周期](docs/rfcs/0002-session-lifecycle.md)
-- [RFC-0003：Turn 执行模型](docs/rfcs/0003-turn-model.md)
-- [RFC-0004：状态模型与恢复](docs/rfcs/0004-state-and-recovery.md)
-- [RFC-0005：权限与 Client-Authority 方法](docs/rfcs/0005-permissions-and-client-authority.md)
-- [RFC-0006：可观测性与错误模型](docs/rfcs/0006-observability-and-errors.md)
-- [RFC-0007：宿主接入模型](docs/rfcs/0007-host-integration.md)
-- [RFC-0008：Simulator Agent ACP](docs/rfcs/0008-simulator-agent.md)
+- [RFC-0001：acp-runtime 公共抽象与实现分层](docs/rfcs/0001-runtime-public-abstraction.md)
+- [RFC-0002：Runtime 执行生命周期与 Authority 编排](docs/rfcs/0002-runtime-execution-and-authority.md)
+- [RFC-0003：Runtime Snapshot、Policy 与 Recovery](docs/rfcs/0003-runtime-snapshot-policy-and-recovery.md)
+- [RFC-0004：Runtime Diagnostics 与 Host Integration](docs/rfcs/0004-runtime-diagnostics-and-host-integration.md)
+- [RFC-0005：Simulator Agent ACP](docs/rfcs/0005-simulator-agent.md)
 
 ## 建议阅读顺序
 
-1. 先看术语与核心类型索引
-2. 再看总体架构，理解包边界与分层
-3. 再看 session / turn / state 三个主干 RFC
-4. 然后看权限、观测、错误
-5. 最后看宿主接入模型
+1. 先看 `RFC-0001`，理解公共抽象与实现边界
+2. 再看 `RFC-0002`，理解执行生命周期、operation 和 authority
+3. 再看 `RFC-0003`，理解 snapshot、policy 和 recovery
+4. 最后看 `RFC-0004`，理解 diagnostics 和宿主接入边界
 
 ## 参考资料
 
@@ -88,6 +89,41 @@ simulator-agent-acp
 ```bash
 npx @saaskit-dev/simulator-agent-acp@latest
 ```
+
+## Runtime SDK 当前形态
+
+当前 runtime 对外已经收敛成三个核心概念：
+
+- `AcpRuntime`：宿主侧入口，负责 `create` / `load` / `resume` / session list
+- `AcpRuntimeSession`：统一的 session 对象模型，承载 policy、turn、snapshot 和关闭/取消/配置能力
+- `AcpSessionDriver`：内部 driver 边界，用来抹平不同 ACP agent 的行为差异
+
+内部的 ACP 实现分成三块：
+
+- `acp/session-service.ts`：负责 ACP session 的创建、加载、恢复、列举
+- `acp/profiles/`：按 `agent.type` 选择的 agent 差异归一化策略
+- `acp/driver.ts`：基于 ACP SDK 的 session driver
+
+这里不是“为了抽象而抽象”的多协议框架。runtime 仍然是 ACP-focused，只是把不同 ACP agent 的差异收敛进统一对象模型。
+
+## 当前验证状态
+
+仓库现在已经对两个已接入 agent 做了 runtime 级验证：
+
+- `simulator-agent-acp`
+  - 对应测试：[src/runtime/runtime-simulator.test.ts](src/runtime/runtime-simulator.test.ts)
+  - 覆盖 `create`、`send`、`configure`、`snapshot`、`resume`
+- `Claude Code ACP`
+  - 对应测试：[src/runtime/runtime-claude-code.test.ts](src/runtime/runtime-claude-code.test.ts)
+  - 覆盖真实 stdio 启动、session 创建和 prompt 执行
+
+其中 Claude Code contract test 默认不进常规测试集，因为它依赖外部 `npx @agentclientprotocol/claude-agent-acp` 和本机 Claude 认证状态。需要时手动执行：
+
+```bash
+ACP_RUNTIME_RUN_CLAUDE_CODE_TEST=1 pnpm test -- --run src/runtime/runtime-claude-code.test.ts
+```
+
+默认 `pnpm test` 仍然会跑 deterministic 的 simulator runtime 集成测试。
 
 ## Simulator Agent ACP
 
@@ -211,7 +247,7 @@ pnpm smoke:client-sdk
 
 行为特性：
 
-- Claude Code 风格三档权限模式：`read-only` / `accept-edits` / `yolo`
+- 三档权限模式：`read-only` / `accept-edits` / `yolo`
 - 普通聊天 prompt 默认只走描述路径，不自动触发工具
 - 工具与场景主要通过 slash command 触发，自然语言只保留少量明确模式
 - 多步工具编排：plan -> read -> run -> write -> summarize

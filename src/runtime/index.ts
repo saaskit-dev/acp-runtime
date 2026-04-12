@@ -1,11 +1,19 @@
-// Public API — host-facing runtime surface plus runtime-facing ACP agent launch helpers.
-// Internal driver/session-service/transport implementation details are intentionally not re-exported here.
+export { AcpRuntime } from "./runtime.js";
+export { AcpRuntimeSession } from "./session.js";
+export { AcpRuntimeSessionRegistry } from "./session-registry.js";
+export { AcpRuntimeJsonSessionRegistryStore } from "./session-registry-store.js";
+export { ACP_RUNTIME_SNAPSHOT_VERSION } from "./constants.js";
 export {
-  AcpRuntime,
-  AcpRuntimeSession,
-  AcpRuntimeSessionRegistry,
-  AcpRuntimeJsonSessionRegistryStore,
-  ACP_RUNTIME_SNAPSHOT_VERSION,
+  ACP_PROTOCOL_ALIGNMENT_VERIFIED_AT,
+  ACP_PROTOCOL_DOCS_SCHEMA_URL,
+  ACP_PROTOCOL_DOCS_URL,
+  ACP_PROTOCOL_SOURCE_REF,
+  ACP_PROTOCOL_SOURCE_REPO,
+  ACP_PROTOCOL_VERSION,
+} from "./protocol.js";
+export * from "./agents/index.js";
+export { createStdioAcpConnectionFactory } from "./acp/stdio-connection.js";
+export {
   AcpAuthenticationError,
   AcpCreateError,
   AcpError,
@@ -18,17 +26,7 @@ export {
   AcpResumeError,
   AcpTurnCancelledError,
   AcpTurnTimeoutError,
-  createStdioAcpConnectionFactory,
-} from "./runtime/index.js";
-export * from "./runtime/agents/index.js";
-export {
-  ACP_PROTOCOL_ALIGNMENT_VERIFIED_AT,
-  ACP_PROTOCOL_DOCS_SCHEMA_URL,
-  ACP_PROTOCOL_DOCS_URL,
-  ACP_PROTOCOL_SOURCE_REF,
-  ACP_PROTOCOL_SOURCE_REPO,
-  ACP_PROTOCOL_VERSION,
-} from "./runtime/protocol.js";
+} from "./errors.js";
 export type {
   AcpRuntimeAgent,
   AcpRuntimeAgentConfigOption,
@@ -74,6 +72,7 @@ export type {
   AcpRuntimePrompt,
   AcpRuntimePromptMessage,
   AcpRuntimePromptPart,
+  AcpRuntimeRegistryListOptions,
   AcpRuntimeReasoningLevel,
   AcpRuntimeResumeOptions,
   AcpRuntimeSessionList,
@@ -98,7 +97,9 @@ export type {
   AcpRuntimeTurnThinkingEvent,
   AcpRuntimeUsage,
   AcpRuntimeUsageUpdatedEvent,
+} from "./types.js";
+export type {
   AcpRuntimeSessionRegistryState,
   AcpRuntimeSessionRegistryStore,
-  StdioFactoryOptions,
-} from "./runtime/index.js";
+} from "./session-registry.js";
+export type { StdioFactoryOptions } from "./acp/stdio-connection.js";
