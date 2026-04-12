@@ -28,7 +28,20 @@ describe("harness validators", () => {
           timeoutStatus: "mismatch",
         },
       },
-      steps: [{ type: "initialize" }],
+      probes: {
+        "codex-acp": {
+          modeId: "read-only",
+          prompt: "Write ./tmp-output.txt",
+        },
+      },
+      steps: [
+        { type: "initialize" },
+        {
+          type: "session-prompt",
+          prompt: "$probe-prompt",
+          defaultPrompt: "Write ./tmp-output.txt",
+        },
+      ],
       assertions: [{ type: "transcript-has-method", method: "initialize" }],
     };
 

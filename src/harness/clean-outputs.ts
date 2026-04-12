@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 type AgentCleanResult = {
-  agentId: string;
+  agentType: string;
   removed: string[];
   kept: string[];
 };
@@ -26,7 +26,7 @@ async function listAgentDirs(outputsRoot: string): Promise<string[]> {
 }
 
 export async function cleanAgentOutputs(agentDir: string, dryRun: boolean): Promise<AgentCleanResult> {
-  const agentId = agentDir.split("/").at(-1) ?? agentDir;
+  const agentType = agentDir.split("/").at(-1) ?? agentDir;
   const entries = await readdir(agentDir, { withFileTypes: true });
 
   const toRemove = entries
@@ -40,7 +40,7 @@ export async function cleanAgentOutputs(agentDir: string, dryRun: boolean): Prom
   }
 
   return {
-    agentId,
+    agentType,
     removed: toRemove,
     kept: [],
   };
@@ -48,7 +48,7 @@ export async function cleanAgentOutputs(agentDir: string, dryRun: boolean): Prom
 
 async function main(): Promise<void> {
   const outputsRoot = resolve(getArg("--outputs-dir") ?? "./harness-outputs");
-  const agentFilter = getArg("--agent");
+  const agentFilter = getArg("--type") ?? getArg("--agent");
   const dryRun = process.argv.includes("--dry-run");
 
   const agentDirs = await listAgentDirs(outputsRoot);
@@ -57,7 +57,7 @@ async function main(): Promise<void> {
     : agentDirs;
 
   if (selectedAgentDirs.length === 0) {
-    throw new Error(`No agent outputs found under ${outputsRoot}${agentFilter ? ` for agent ${agentFilter}` : ""}`);
+    throw new Error(`No agent outputs found under ${outputsRoot}${agentFilter ? ` for type ${agentFilter}` : ""}`);
   }
 
   const results: AgentCleanResult[] = [];

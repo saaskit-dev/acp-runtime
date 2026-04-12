@@ -10,6 +10,6 @@ export async function writeTranscript(path: string, entries: TranscriptEntry[]):
   await writeFile(path, body.length > 0 ? `${body}\n` : "", "utf8");
 }
 
-export function buildTranscriptPath(baseDir: string, agentId: string, caseId: string): string {
-  return join(baseDir, agentId, `${caseId}.jsonl`);
+export function buildTranscriptPath(baseDir: string, agentType: string, caseId: string): string {
+  return join(baseDir, agentType, `${caseId}.jsonl`);
 }

@@ -6,9 +6,14 @@ import { spawnSync } from "node:child_process";
 import { Extract } from "unzipper";
 import { extract as tarExtract } from "tar";
 
+import {
+  LOCAL_SIMULATOR_AGENT_ACP_REGISTRY_ID,
+} from "../runtime/agents/index.js";
+import { resolveBuiltSimulatorWorkspaceCliPath } from "../internal/simulator-workspace.js";
+
 const REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-export const LOCAL_SIMULATOR_AGENT_ID = "simulator-agent-acp-local";
+export const LOCAL_SIMULATOR_AGENT_ID = LOCAL_SIMULATOR_AGENT_ACP_REGISTRY_ID;
 
 type BinaryTarget = {
   archive: string;
@@ -67,14 +72,14 @@ function isLocalSimulatorAgent(agentId: string): boolean {
 
 function resolveLocalSimulatorLaunch(): AgentLaunchConfig {
   return {
-    command: process.execPath,
     args: [
-      resolve(process.cwd(), "dist/simulator-agent/cli.js"),
+      resolveBuiltSimulatorWorkspaceCliPath(),
       "--auth-mode",
       "none",
       "--storage-dir",
       resolve(process.cwd(), ".simulator-agent-acp-harness"),
     ],
+    command: process.execPath,
     env: {},
   };
 }
@@ -276,7 +281,7 @@ export async function getAgentMeta(agentId: string): Promise<{ name: string; ver
     return {
       name: "Simulator Agent ACP (Local)",
       version: "0.1.0",
-      description: "Launches the local simulator-agent-acp build from dist/ for harness baseline validation.",
+      description: "Launches the local simulator-agent-acp workspace build for harness baseline validation.",
     };
   }
 

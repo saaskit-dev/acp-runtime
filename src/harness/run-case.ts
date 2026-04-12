@@ -30,14 +30,14 @@ export type RunHarnessCaseOptions = {
   executor: HarnessCaseExecutor;
 };
 
-export function caseAppliesToAgent(testCase: HarnessCase, agentId: string): boolean {
+export function caseAppliesToAgent(testCase: HarnessCase, agentType: string): boolean {
   const include = testCase.agents?.include;
-  if (include && include.length > 0 && !include.includes(agentId)) {
+  if (include && include.length > 0 && !include.includes(agentType)) {
     return false;
   }
 
   const exclude = testCase.agents?.exclude;
-  if (exclude && exclude.includes(agentId)) {
+  if (exclude && exclude.includes(agentType)) {
     return false;
   }
 
@@ -122,7 +122,7 @@ export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<Ha
   emitRuntimeEvent({
     type: "run-started",
     caseId: options.testCase.id,
-    agentId: options.agent.id,
+    agentType: options.agent.type,
   });
 
   const execution = await options.executor({
@@ -137,7 +137,7 @@ export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<Ha
   const result: HarnessRunResult = {
     status: execution.status,
     caseId: options.testCase.id,
-    agentId: options.agent.id,
+    agentType: options.agent.type,
     transcript,
     summaryPatch: execution.summaryPatch,
     notes: execution.notes ?? [],
@@ -145,7 +145,7 @@ export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<Ha
 
   await mkdir(options.outputDir, { recursive: true });
 
-  const classification = options.testCase.classification?.[options.agent.id];
+  const classification = options.testCase.classification?.[options.agent.type];
 
   for (const assertion of options.testCase.assertions) {
     let passed = false;
@@ -166,7 +166,11 @@ export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<Ha
         );
         if (responseEntry) {
           const value = getValueAtPath(responseEntry.payload, assertion.path);
-          passed = assertion.notEmpty ? value != null && value !== "" : value !== undefined;
+          if (assertion.equals !== undefined) {
+            passed = value === assertion.equals;
+          } else {
+            passed = assertion.notEmpty ? value != null && value !== "" : value !== undefined;
+          }
         }
         break;
       }
@@ -207,14 +211,14 @@ export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<Ha
       emitRuntimeEvent({
         type: "assertion-passed",
         caseId: options.testCase.id,
-        agentId: options.agent.id,
+        agentType: options.agent.type,
         details: { assertionType: assertion.type },
       });
     } else {
       emitRuntimeEvent({
         type: "assertion-failed",
         caseId: options.testCase.id,
-        agentId: options.agent.id,
+        agentType: options.agent.type,
         details: { assertionType: assertion.type, assertion },
       });
       assertionNotes.push(`Assertion failed: ${JSON.stringify(assertion)}`);
@@ -256,7 +260,7 @@ export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<Ha
   emitRuntimeEvent({
     type: "run-completed",
     caseId: options.testCase.id,
-    agentId: options.agent.id,
+    agentType: options.agent.type,
     details: { status: result.status },
   });
 
@@ -265,6 +269,6 @@ export async function runHarnessCase(options: RunHarnessCaseOptions): Promise<Ha
   return result;
 }
 
-export function buildCaseOutputDir(baseDir: string, agentId: string): string {
-  return join(baseDir, agentId);
+export function buildCaseOutputDir(baseDir: string, agentType: string): string {
+  return join(baseDir, agentType);
 }

@@ -90,6 +90,7 @@ function isHarnessStep(value: unknown): value is HarnessStep {
       return typeof value.sessionRef === "string";
     case "session-prompt":
       return typeof value.prompt === "string" &&
+        (value.defaultPrompt === undefined || typeof value.defaultPrompt === "string") &&
         (value.turnRef === undefined || typeof value.turnRef === "string");
     case "session-cancel":
       return typeof value.turnRef === "string";
@@ -110,6 +111,12 @@ function isHarnessStep(value: unknown): value is HarnessStep {
     default:
       return false;
   }
+}
+
+function isHarnessProbeProfile(value: unknown): boolean {
+  return isPlainObject(value) &&
+    (value.modeId === undefined || typeof value.modeId === "string") &&
+    (value.prompt === undefined || typeof value.prompt === "string");
 }
 
 function isHarnessAssertion(value: unknown): value is HarnessAssertion {
@@ -355,6 +362,9 @@ export function isHarnessCase(value: unknown): value is HarnessCase {
           (entry.timeoutStatus === undefined || isHarnessFailureStatus(entry.timeoutStatus)) &&
           (entry.executionErrorStatus === undefined || isHarnessFailureStatus(entry.executionErrorStatus))
         ))) &&
+    (value.probes === undefined ||
+      (isPlainObject(value.probes) &&
+        Object.values(value.probes).every((entry) => isHarnessProbeProfile(entry)))) &&
     Array.isArray(value.steps) &&
     value.steps.every(isHarnessStep) &&
     Array.isArray(value.assertions) &&

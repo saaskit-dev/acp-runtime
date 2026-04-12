@@ -12,7 +12,16 @@
       "timeoutStatus": "not-observed"
     }
   },
-  "title": "Permission Denied",
+  "probes": {
+    "simulator-agent-acp-local": {
+      "prompt": "/write /tmp/acp-harness-test.txt hello world"
+    },
+    "codex-acp": {
+      "modeId": "read-only",
+      "prompt": "Write the exact text 'hello world' into $cwd/.acp-harness-permission-denied.txt and then tell me whether the write succeeded."
+    }
+  },
+  "title": "Permission Denied Path",
   "level": "P1",
   "protocolDependencies": [
     "session/new",
@@ -28,12 +37,18 @@
       "type": "session-new"
     },
     {
+      "type": "set-mode",
+      "modeId": "$probe-mode",
+      "skipIf": "!probe.modeId"
+    },
+    {
       "type": "permission-decision",
       "decision": "deny"
     },
     {
       "type": "session-prompt",
-      "prompt": "/write /tmp/acp-harness-test.txt hello world",
+      "prompt": "$probe-prompt",
+      "defaultPrompt": "Write the exact text 'hello world' into $cwd/.acp-harness-permission-denied.txt and then tell me whether the write succeeded.",
       "turnRef": "turn-deny"
     },
     {

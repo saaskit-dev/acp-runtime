@@ -23,12 +23,14 @@ export type HarnessAgentFilter = {
 /**
  * `skipIf` — optional condition to skip a step at runtime.
  *
- * Supported expressions (evaluated against capabilities discovered during initialize):
+ * Supported expressions (evaluated against discovered capabilities and probe data):
  *   "!capabilities.setMode"       — skip if setMode is not supported
  *   "!capabilities.sessionLoad"   — skip if sessionLoad is not supported
  *   "!capabilities.sessionResume" — skip if sessionResume is not supported
  *   "!modes"                      — skip if no modes were discovered
  *   "!authMethods"                — skip if no auth methods were returned
+ *   "!probe.modeId"               — skip if the current agent has no probe mode
+ *   "!probe.prompt"               — skip if the current agent has no probe prompt
  *
  * When a step is skipped, it emits a "step-skipped" runtime event and does not
  * count as a failure. The case continues with the next step.
@@ -65,8 +67,8 @@ export type HarnessAssertion =
   | { type: "transcript-has-method"; method: string }
   | { type: "transcript-has-event"; eventType: string }
   | { type: "summary-status"; path: string; equals: CoverageStatus }
-  /** Check that a method's response contains a specific field (dot-path). */
-  | { type: "transcript-method-response-has"; method: string; path: string; notEmpty?: boolean }
+  /** Check that a method's response contains a specific field (dot-path) or equals a specific value. */
+  | { type: "transcript-method-response-has"; method: string; path: string; equals?: unknown; notEmpty?: boolean }
   /** Check that an event type appears at least `min` times (default 1). */
   | { type: "transcript-event-count"; eventType: string; min?: number; max?: number }
   /** Check that a specific field value exists in any event of the given type. */
@@ -100,7 +102,7 @@ export type HarnessClassification = {
 };
 
 export type HarnessAgentDefinition = {
-  id: string;
+  type: string;
   displayName: string;
 };
 
@@ -116,7 +118,7 @@ export type HarnessRuntimeEvent = {
     | "assertion-passed"
     | "assertion-failed";
   caseId: string;
-  agentId: string;
+  agentType: string;
   stepType?: string;
   details?: Record<string, unknown>;
 };
@@ -207,7 +209,7 @@ export type HarnessSummary = {
 export type HarnessRunResult = {
   status: HarnessRunStatus;
   caseId: string;
-  agentId: string;
+  agentType: string;
   transcript: TranscriptEntry[];
   summaryPatch: Partial<HarnessSummary>;
   notes: string[];

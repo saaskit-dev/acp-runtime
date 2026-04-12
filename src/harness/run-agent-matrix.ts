@@ -37,7 +37,7 @@ function cliEntrypoint(): string {
 }
 
 async function runSingleCase(
-  agentId: string,
+  agentType: string,
   casePath: string,
   outputDir: string,
   cwd: string,
@@ -53,11 +53,11 @@ async function runSingleCase(
     };
   }
 
-  if (!caseAppliesToAgent(testCase, agentId)) {
+  if (!caseAppliesToAgent(testCase, agentType)) {
     return {
       caseId: testCase.id,
       status: "not-applicable",
-      notes: [`Case ${testCase.id} does not apply to ${agentId}.`],
+      notes: [`Case ${testCase.id} does not apply to ${agentType}.`],
     };
   }
 
@@ -69,7 +69,7 @@ async function runSingleCase(
     try {
       const result = spawnSync(
         process.execPath,
-        [cliEntrypoint(), "--agent", agentId, "--case", casePath, "--output-dir", outputDir],
+        [cliEntrypoint(), "--type", agentType, "--case", casePath, "--output-dir", outputDir],
         {
           cwd,
           timeout: CASE_TIMEOUT_MS,
@@ -134,33 +134,33 @@ async function runSingleCase(
 }
 
 async function main(): Promise<void> {
-  const agentId = getArg("--agent");
+  const agentType = getArg("--type") ?? getArg("--agent");
   const caseFile = getArg("--case");
   const casesRoot = getArg("--cases-root") ?? "./src/harness/cases";
   const outputRoot = getArg("--output-dir") ?? "./harness-outputs";
 
-  if (!agentId) {
-    throw new Error("Usage: node dist/harness/run-agent-matrix.js --agent <agent-id> [--case <file>] [--cases-root <dir>] [--output-dir <dir>]");
+  if (!agentType) {
+    throw new Error("Usage: node dist/harness/run-agent-matrix.js --type <agent-type> [--case <file>] [--cases-root <dir>] [--output-dir <dir>]");
   }
 
-  const meta = await getAgentMeta(agentId);
-  const agent = { id: agentId, displayName: meta.name };
+  const meta = await getAgentMeta(agentType);
+  const agent = { type: agentType, displayName: meta.name };
   const caseFiles = caseFile
     ? [resolve(caseFile)]
     : await listCaseFiles(resolve(casesRoot));
 
-  const agentDir = resolve(outputRoot, agent.id);
+  const agentDir = resolve(outputRoot, agent.type);
   await mkdir(agentDir, { recursive: true });
 
   const results: MatrixCaseResult[] = [];
 
   for (const caseFile of caseFiles) {
-    const result = await runSingleCase(agentId, caseFile, agentDir, process.cwd());
+    const result = await runSingleCase(agentType, caseFile, agentDir, process.cwd());
     results.push(result);
   }
 
   const summary = {
-    agentId: agent.id,
+    agentType: agent.type,
     timestamp: new Date().toISOString(),
     totals: {
       total: results.length,

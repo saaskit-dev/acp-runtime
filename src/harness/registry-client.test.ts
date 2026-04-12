@@ -5,13 +5,14 @@ import {
   LOCAL_SIMULATOR_AGENT_ID,
   resolveAgentLaunch,
 } from "./registry-client.js";
+import { resolveSimulatorWorkspaceRoot } from "../internal/simulator-workspace.js";
 
 describe("harness registry client", () => {
   it("resolves the local simulator launch without hitting the ACP registry", async () => {
     const launch = await resolveAgentLaunch(LOCAL_SIMULATOR_AGENT_ID);
 
     expect(launch.command).toBe(process.execPath);
-    expect(launch.args[0]).toContain("dist/simulator-agent/cli.js");
+    expect(launch.args[0]).toContain(resolveSimulatorWorkspaceRoot());
     expect(launch.args).toContain("--auth-mode");
     expect(launch.args).toContain("none");
   });
@@ -20,6 +21,6 @@ describe("harness registry client", () => {
     const meta = await getAgentMeta(LOCAL_SIMULATOR_AGENT_ID);
 
     expect(meta.name).toContain("Simulator Agent ACP");
-    expect(meta.description).toContain("local simulator-agent-acp build");
+    expect(meta.description).toContain("local simulator-agent-acp workspace build");
   });
 });

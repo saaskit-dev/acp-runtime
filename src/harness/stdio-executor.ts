@@ -42,6 +42,7 @@ import type {
   HarnessAgentDefinition,
   HarnessCase,
   HarnessFailureStatus,
+  HarnessProbeProfile,
   HarnessSummary,
   TranscriptEntry,
 } from "./types.js";
@@ -174,6 +175,41 @@ function recordSessionUpdateSummary(state: RuntimeClientState, notification: Ses
   }
 }
 
+export function resolvePermissionDecisionResponse(
+  decision: "allow" | "deny",
+  options: RequestPermissionRequest["options"],
+): RequestPermissionResponse {
+  if (decision === "allow") {
+    const firstOption = options[0];
+    if (!firstOption) {
+      throw new Error("Permission request has no selectable options");
+    }
+
+    return {
+      outcome: {
+        outcome: "selected",
+        optionId: firstOption.optionId,
+      },
+    };
+  }
+
+  const rejectOption = options.find((option) => option.kind === "reject_once" || option.kind === "reject_always");
+  if (rejectOption) {
+    return {
+      outcome: {
+        outcome: "selected",
+        optionId: rejectOption.optionId,
+      },
+    };
+  }
+
+  return {
+    outcome: {
+      outcome: "cancelled",
+    },
+  };
+}
+
 class HarnessClient implements acp.Client {
   readonly state: RuntimeClientState;
   readonly emitWireEntry: (
@@ -200,35 +236,7 @@ class HarnessClient implements acp.Client {
     });
 
     const next = this.state.pendingPermissionDecisions.shift() ?? "deny";
-    if (next === "allow") {
-      const firstOption = params.options[0];
-      if (!firstOption) {
-        throw new Error("Permission request has no selectable options");
-      }
-
-      const response: RequestPermissionResponse = {
-        outcome: {
-          outcome: "selected",
-          optionId: firstOption.optionId,
-        },
-      };
-
-      this.emitWireEntry({
-        direction: "outbound",
-        type: "permission-decision",
-        method: "session/request_permission",
-        sessionId: params.sessionId,
-        payload: response,
-      });
-
-      return response;
-    }
-
-    const response: RequestPermissionResponse = {
-      outcome: {
-        outcome: "cancelled",
-      },
-    };
+    const response = resolvePermissionDecisionResponse(next, params.options);
 
     this.emitWireEntry({
       direction: "outbound",
@@ -456,8 +464,17 @@ function hasObservedEvent(state: RuntimeClientState, eventType: string): boolean
  * Evaluate a skipIf expression against current runtime state.
  * Returns true if the step should be SKIPPED.
  */
-function evaluateSkipCondition(expr: string, state: RuntimeClientState): boolean {
-  const capabilities = (state.summaryPatch.discovery?.initialize?.capabilities ?? {}) as Record<string, unknown>;
+export function shouldSkipHarnessStep(
+  expr: string,
+  context: {
+    capabilities?: Record<string, unknown>;
+    hasModes: boolean;
+    hasAuthMethods: boolean;
+    hasConfigOptions: boolean;
+    probeProfile?: HarnessProbeProfile;
+  },
+): boolean {
+  const capabilities = context.capabilities ?? {};
   const sessionCapabilities = (
     capabilities.sessionCapabilities &&
     typeof capabilities.sessionCapabilities === "object"
@@ -477,15 +494,33 @@ function evaluateSkipCondition(expr: string, state: RuntimeClientState): boolean
     case "!capabilities.sessionFork":
       return !sessionCapabilities.fork;
     case "!modes":
-      return !state.availableModes || state.availableModes.length === 0;
+      return !context.hasModes;
     case "!authMethods":
-      return !state.availableAuthMethods || state.availableAuthMethods.length === 0;
+      return !context.hasAuthMethods;
     case "!configOptions":
-      return !state.configOptions || state.configOptions.length === 0;
+      return !context.hasConfigOptions;
+    case "!probe.modeId":
+      return !context.probeProfile?.modeId;
+    case "!probe.prompt":
+      return !context.probeProfile?.prompt;
     default:
       // Unknown expression → don't skip (safe default)
       return false;
   }
+}
+
+function evaluateSkipCondition(
+  expr: string,
+  state: RuntimeClientState,
+  probeProfile?: HarnessProbeProfile,
+): boolean {
+  return shouldSkipHarnessStep(expr, {
+    capabilities: (state.summaryPatch.discovery?.initialize?.capabilities ?? {}) as Record<string, unknown>,
+    hasModes: !!state.availableModes?.length,
+    hasAuthMethods: !!state.availableAuthMethods?.length,
+    hasConfigOptions: !!state.configOptions?.length,
+    probeProfile,
+  });
 }
 
 function formatError(error: unknown): string {
@@ -517,8 +552,8 @@ function mapFailureStatusToCoverageStatus(status: HarnessFailureStatus): "FAIL" 
   }
 }
 
-function classifyExecutionFailure(testCase: HarnessCase, agentId: string, error: unknown): HarnessFailureStatus {
-  const caseDefault = testCase.classification?.[agentId];
+function classifyExecutionFailure(testCase: HarnessCase, agentType: string, error: unknown): HarnessFailureStatus {
+  const caseDefault = testCase.classification?.[agentType];
   const message = formatError(error);
 
   if (message.includes("timed out")) {
@@ -605,7 +640,7 @@ async function executeStep(
     agent: HarnessAgentDefinition;
   },
 ): Promise<void> {
-  const probeProfile = context.testCase.probes?.[context.agent.id];
+  const probeProfile = context.testCase.probes?.[context.agent.type];
   const resolveSessionId = (sessionRef: string): string => {
     if (sessionRef === "current") {
       if (!context.state.sessionId) {
@@ -1186,17 +1221,18 @@ export const executeHarnessCaseOverStdio: HarnessCaseExecutor = async (context) 
     nextTerminalId: 1,
   };
 
-  const launch = await resolveAgentLaunch(agent.id);
+  const launch = await resolveAgentLaunch(agent.type);
   const { connection, child } = await createConnection(launch, state, emitWireEntry);
+  const probeProfile = testCase.probes?.[agent.type];
 
   try {
     for (const step of testCase.steps) {
       // Check skipIf condition
-      if (step.skipIf && evaluateSkipCondition(step.skipIf, state)) {
+      if (step.skipIf && evaluateSkipCondition(step.skipIf, state, probeProfile)) {
         emitRuntimeEvent({
           type: "step-skipped",
           caseId: testCase.id,
-          agentId: agent.id,
+          agentType: agent.type,
           stepType: step.type,
           details: { skipIf: step.skipIf },
         });
@@ -1206,7 +1242,7 @@ export const executeHarnessCaseOverStdio: HarnessCaseExecutor = async (context) 
       emitRuntimeEvent({
         type: "step-started",
         caseId: testCase.id,
-        agentId: agent.id,
+        agentType: agent.type,
         stepType: step.type,
       });
       await withTimeout(
@@ -1223,7 +1259,7 @@ export const executeHarnessCaseOverStdio: HarnessCaseExecutor = async (context) 
       emitRuntimeEvent({
         type: "step-completed",
         caseId: testCase.id,
-        agentId: agent.id,
+        agentType: agent.type,
         stepType: step.type,
       });
     }
@@ -1236,7 +1272,7 @@ export const executeHarnessCaseOverStdio: HarnessCaseExecutor = async (context) 
       notes: [],
     };
   } catch (error) {
-    const failureStatus = classifyExecutionFailure(testCase, agent.id, error);
+    const failureStatus = classifyExecutionFailure(testCase, agent.type, error);
     const coverageStatus = mapFailureStatusToCoverageStatus(failureStatus);
     const failedProtocolCoverage = Object.fromEntries(
       testCase.protocolDependencies

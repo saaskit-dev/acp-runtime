@@ -12,7 +12,7 @@ describe("runHarnessCase", () => {
 
     const result = await runHarnessCase({
       agent: {
-        id: "claude",
+        type: "claude",
         displayName: "Claude ACP Adapter",
       },
       testCase: {
@@ -29,7 +29,7 @@ describe("runHarnessCase", () => {
         emitRuntimeEvent({
           type: "step-started",
           caseId: "protocol.initialize",
-          agentId: "claude",
+          agentType: "claude",
           stepType: "initialize",
         });
         emitWireEntry({
@@ -66,7 +66,7 @@ describe("runHarnessCase", () => {
 
     const result = await runHarnessCase({
       agent: {
-        id: "opencode",
+        type: "opencode",
         displayName: "OpenCode ACP Adapter",
       },
       testCase: {
@@ -119,5 +119,48 @@ describe("runHarnessCase", () => {
       steps: [],
       assertions: [],
     }, "simulator-agent-acp-local")).toBe(false);
+  });
+
+  it("supports equality assertions on method responses", async () => {
+    const outputDir = await mkdtemp(join(tmpdir(), "acp-runtime-harness-"));
+
+    const result = await runHarnessCase({
+      agent: {
+        type: "codex-acp",
+        displayName: "Codex ACP",
+      },
+      testCase: {
+        version: 1,
+        id: "scenario.permission-denied-cancelled",
+        kind: "scenario",
+        title: "Permission denied outcome",
+        protocolDependencies: ["session/prompt"],
+        steps: [],
+        assertions: [{
+          type: "transcript-method-response-has",
+          method: "session/prompt",
+          path: "stopReason",
+          equals: "cancelled",
+        }],
+      },
+      outputDir,
+      executor: async ({ emitWireEntry }) => {
+        emitWireEntry({
+          direction: "inbound",
+          type: "response",
+          method: "session/prompt",
+          payload: {
+            stopReason: "cancelled",
+          },
+        });
+
+        return {
+          status: "passed",
+          summaryPatch: {},
+        };
+      },
+    });
+
+    expect(result.status).toBe("passed");
   });
 });

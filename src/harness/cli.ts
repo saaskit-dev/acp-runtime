@@ -15,26 +15,26 @@ function getArg(flag: string): string | undefined {
 }
 
 async function main(): Promise<void> {
-  const agentId = getArg("--agent");
+  const agentType = getArg("--type") ?? getArg("--agent");
   const casePath = getArg("--case");
   const outputRoot = getArg("--output-dir") ?? "./harness-outputs";
 
-  if (!agentId || !casePath) {
-    throw new Error("Usage: node dist/harness/cli.js --agent <agent-id> --case <case.json> [--output-dir <dir>]");
+  if (!agentType || !casePath) {
+    throw new Error("Usage: node dist/harness/cli.js --type <agent-type> --case <case.json> [--output-dir <dir>]");
   }
 
-  const meta = await getAgentMeta(agentId);
-  const agent = { id: agentId, displayName: meta.name };
+  const meta = await getAgentMeta(agentType);
+  const agent = { type: agentType, displayName: meta.name };
   const testCase = await loadHarnessCase(resolve(casePath));
   const outputDir = resolve(outputRoot);
 
-  if (!caseAppliesToAgent(testCase, agentId)) {
+  if (!caseAppliesToAgent(testCase, agentType)) {
     console.log(JSON.stringify({
       status: "not-applicable",
-      agentId,
+      agentType,
       caseId: testCase.id,
       outputDir,
-      notes: [`Case ${testCase.id} does not apply to ${agentId}.`],
+      notes: [`Case ${testCase.id} does not apply to ${agentType}.`],
     }, null, 2));
     return;
   }
@@ -48,7 +48,7 @@ async function main(): Promise<void> {
 
   console.log(JSON.stringify({
     status: result.status,
-    agentId: result.agentId,
+    agentType: result.agentType,
     caseId: result.caseId,
     outputDir,
     notes: result.notes,
