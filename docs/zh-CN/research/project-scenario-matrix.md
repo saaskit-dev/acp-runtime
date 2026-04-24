@@ -44,7 +44,10 @@
 | `scenario.read-file` | P0 | 读取文件并完成回答 | `session/request_permission` `fs/read_text_file` | 文件读主路径 |
 | `scenario.write-file` | P0 | 写文件并验证结果 | `session/request_permission` `fs/write_text_file` | 文件写主路径 |
 | `scenario.run-command` | P0 | 执行命令并读取输出 | `terminal/create` `terminal/output` `terminal/wait_for_exit` `terminal/release` | terminal 主路径 |
-| `scenario.permission-denied` | P0 | 权限被拒绝后 agent 行为稳定 | `session/request_permission` | 权限拒绝分支 |
+| `scenario.permission-denied` | P0 | 权限请求路径存在且顺序正确 | `session/request_permission` | 只验证拒绝路径，不绑定最终 stopReason |
+| `scenario.permission-denied-cancelled` | P1 | 权限被拒绝后 turn 以 `cancelled` 结束 | `session/set_mode` `session/request_permission` `session/prompt` | 适用于 `codex-acp` 一类行为 |
+| `scenario.permission-denied-end-turn` | P1 | 权限被拒绝后 turn 仍以 `end_turn` 结束 | `session/request_permission` `session/prompt` | 适用于 simulator 基线 |
+| `scenario.permission-mode-denied` | P1 | agent 不请求权限，由 mode 直接拒绝工具执行 | `session/set_mode` `session/prompt` `tool_call_update` | 适用于 `claude-acp` 的 `dontAsk` 一类行为 |
 | `scenario.non-interactive` | P1 | 无 TTY / 无交互权限条件下的行为 | permission / terminal / fs | 自动化环境关键 |
 | `scenario.long-running-terminal` | P1 | 长命令执行、输出轮询、收尾 | `terminal/create` `terminal/output` `terminal/kill` `terminal/release` | terminal 完整语义 |
 | `scenario.tool-call-stream` | P1 | 工具调用与更新事件流 | `tool_call` `tool_call_update` | tool reporting |

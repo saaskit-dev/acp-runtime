@@ -1,4 +1,8 @@
-import type { AcpRuntimeAgent } from "../types.js";
+import type { AcpRuntimeAgent } from "../core/types.js";
+import {
+  createNpxCommandLaunch,
+  resolvePackageSpec,
+} from "../../internal/launch-config.js";
 
 export const CLAUDE_CODE_ACP_REGISTRY_ID = "claude-acp";
 export const CLAUDE_CODE_ACP_PACKAGE = "@agentclientprotocol/claude-agent-acp";
@@ -14,13 +18,6 @@ export type ClaudeCodeAcpAgentOptions = {
   via?: ClaudeCodeAcpLaunchMode;
 };
 
-function resolvePackageSpec(packageName: string, version?: string): string {
-  if (!version || version.trim().length === 0) {
-    return packageName;
-  }
-  return `${packageName}@${version}`;
-}
-
 export function createClaudeCodeAcpAgent(
   options: ClaudeCodeAcpAgentOptions = {},
 ): AcpRuntimeAgent {
@@ -34,9 +31,12 @@ export function createClaudeCodeAcpAgent(
 
   if (via === "npx") {
     return {
-      args: ["--yes", resolvePackageSpec(packageName, version), ...args],
-      command: "npx",
-      env,
+      ...createNpxCommandLaunch({
+        args,
+        env,
+        executable: CLAUDE_CODE_ACP_COMMAND,
+        packageSpec: resolvePackageSpec(packageName, version),
+      }),
       type: CLAUDE_CODE_ACP_REGISTRY_ID,
     };
   }

@@ -29,7 +29,13 @@ describe("createSimulatorAgentAcpAgent", () => {
         via: "npx",
       }),
     ).toEqual({
-      args: ["--yes", `${SIMULATOR_AGENT_ACP_PACKAGE}@0.1.1`, "--verbose"],
+      args: [
+        "--yes",
+        "-p",
+        `${SIMULATOR_AGENT_ACP_PACKAGE}@0.1.1`,
+        SIMULATOR_AGENT_ACP_COMMAND,
+        "--verbose",
+      ],
       command: "npx",
       env: {
         DEBUG: "1",

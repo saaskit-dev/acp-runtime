@@ -17,7 +17,7 @@ import {
   AcpProtocolError,
   AcpTurnCancelledError,
   AcpTurnTimeoutError,
-} from "../errors.js";
+} from "../core/errors.js";
 import type {
   AcpRuntimeDiagnostics,
   AcpRuntimeOperation,
@@ -28,11 +28,10 @@ import type {
   AcpRuntimePermissionRequest,
   AcpRuntimePlanItem,
   AcpRuntimeSessionMetadata,
-  AcpRuntimeTurnCompletedEvent,
   AcpRuntimeTurnEvent,
   AcpRuntimeTurnFailedEvent,
   AcpRuntimeUsage,
-} from "../types.js";
+} from "../core/types.js";
 import type { AcpAgentProfile } from "./profiles/index.js";
 import {
   nextOperationId,
@@ -162,7 +161,7 @@ export function mapSessionUpdateToRuntimeEvents(input: {
         },
       ];
     case "tool_call_update":
-      return mapToolCallUpdateToRuntimeEvents(update, input.turn);
+      return mapToolCallUpdateToRuntimeEvents(update, input.metadata, input.profile, input.turn);
     case "user_message_chunk":
       return [];
     default:
@@ -200,10 +199,37 @@ export function mapPermissionRequest(input: {
   };
   input.turn.permissionRequests.set(request.id, request);
 
+  const storedOperation = getStoredOperation(input.turn, operation.id);
+  storedOperation.phase = "awaiting_permission";
+  storedOperation.permission = {
+    ...storedOperation.permission,
+    requestId: request.id,
+    requested: true,
+  };
+  storedOperation.updatedAt = new Date().toISOString();
+
   return {
-    operation: cloneOperation(operation),
+    operation: cloneOperation(storedOperation),
     request,
   };
+}
+
+export function applyPermissionDecision(input: {
+  decision: AcpRuntimePermissionDecision;
+  operationId: string;
+  turn: AcpRuntimeTurnState;
+}): AcpRuntimeOperation {
+  const operation = getStoredOperation(input.turn, input.operationId);
+  operation.permission = {
+    ...operation.permission,
+    decision: input.decision.decision === "allow" ? "allowed" : "denied",
+    requested: true,
+  };
+  if (input.decision.decision === "deny") {
+    operation.failureReason = "permission_denied";
+  }
+  operation.updatedAt = new Date().toISOString();
+  return cloneOperation(operation);
 }
 
 export function mapPermissionDecisionToAcp(
@@ -256,37 +282,51 @@ export function mapPermissionDecisionToAcp(
 export function finalizePromptResponse(input: {
   response: PromptResponse;
   turn: AcpRuntimeTurnState;
-}): AcpRuntimeTurnCompletedEvent | AcpRuntimeTurnFailedEvent {
+}): AcpRuntimeTurnEvent[] {
+  const trailingOperationEvents = finalizeDeniedOperations(input);
+
   if (input.turn.deniedOperationIds.size > 0) {
-    return {
-      error: new AcpPermissionDeniedError("Permission denied."),
-      turnId: input.turn.turnId,
-      type: "failed",
-    };
+    return [
+      ...trailingOperationEvents,
+      {
+        error: new AcpPermissionDeniedError("Permission denied."),
+        turnId: input.turn.turnId,
+        type: "failed",
+      },
+    ];
   }
 
   if (input.turn.timedOut) {
-    return {
-      error: new AcpTurnTimeoutError("Turn timed out."),
-      turnId: input.turn.turnId,
-      type: "failed",
-    };
+    return [
+      ...trailingOperationEvents,
+      {
+        error: new AcpTurnTimeoutError("Turn timed out."),
+        turnId: input.turn.turnId,
+        type: "failed",
+      },
+    ];
   }
 
   if (input.response.stopReason === "cancelled") {
-    return {
-      error: new AcpTurnCancelledError("Turn cancelled."),
-      turnId: input.turn.turnId,
-      type: "failed",
-    };
+    return [
+      ...trailingOperationEvents,
+      {
+        error: new AcpTurnCancelledError("Turn cancelled."),
+        turnId: input.turn.turnId,
+        type: "failed",
+      },
+    ];
   }
 
-  return {
-    output: [...input.turn.output],
-    outputText: input.turn.outputTextChunks.join(""),
-    turnId: input.turn.turnId,
-    type: "completed",
-  };
+  return [
+    ...trailingOperationEvents,
+    {
+      output: [...input.turn.output],
+      outputText: input.turn.outputTextChunks.join(""),
+      turnId: input.turn.turnId,
+      type: "completed",
+    },
+  ];
 }
 
 export function createProtocolFailure(
@@ -316,6 +356,8 @@ export function mapUsage(
 
 function mapToolCallUpdateToRuntimeEvents(
   update: ToolCallUpdate & { sessionUpdate: "tool_call_update" },
+  metadata: AcpRuntimeSessionMetadata,
+  profile: AcpAgentProfile,
   turn: AcpRuntimeTurnState,
 ): AcpRuntimeTurnEvent[] {
   const operationId = turn.vendorToolCallToOperationId.get(update.toolCallId);
@@ -340,6 +382,29 @@ function mapToolCallUpdateToRuntimeEvents(
       outputText: collectToolCallContentText(update.content),
     };
   }
+  if (existing.phase === "failed" && existing.permission?.decision === "denied") {
+    existing.failureReason = "permission_denied";
+    existing.permission = {
+      ...existing.permission,
+      family: existing.permission.family ?? "permission_request_end_turn",
+      requested: true,
+    };
+    turn.deniedOperationIds.add(existing.id);
+  } else if (existing.phase === "failed") {
+    const family = profile.inferDeniedOperationFamily({
+      metadata,
+      operation: existing,
+    });
+    if (family === "mode_denied") {
+      existing.failureReason = "permission_denied";
+      existing.permission = {
+        decision: "denied",
+        family,
+        requested: false,
+      };
+      turn.deniedOperationIds.add(existing.id);
+    }
+  }
   existing.updatedAt = new Date().toISOString();
 
   if (existing.phase === "completed") {
@@ -355,7 +420,10 @@ function mapToolCallUpdateToRuntimeEvents(
   if (existing.phase === "failed") {
     return [
       {
-        error: new AcpProtocolError(existing.title),
+        error:
+          existing.failureReason === "permission_denied"
+            ? new AcpPermissionDeniedError(existing.title)
+            : new AcpProtocolError(existing.title),
         operation: cloneOperation(existing),
         turnId: turn.turnId,
         type: "operation_failed",
@@ -607,6 +675,7 @@ function cloneMetadata(
 function cloneOperation(operation: AcpRuntimeOperation): AcpRuntimeOperation {
   return {
     ...operation,
+    permission: operation.permission ? { ...operation.permission } : undefined,
     progress: operation.progress ? { ...operation.progress } : undefined,
     result: operation.result
       ? {
@@ -618,6 +687,74 @@ function cloneOperation(operation: AcpRuntimeOperation): AcpRuntimeOperation {
       : undefined,
     target: operation.target ? { ...operation.target } : undefined,
   };
+}
+
+function finalizeDeniedOperations(input: {
+  response: PromptResponse;
+  turn: AcpRuntimeTurnState;
+}): AcpRuntimeTurnEvent[] {
+  const events: AcpRuntimeTurnEvent[] = [];
+
+  for (const operation of input.turn.operations.values()) {
+    if (operation.permission?.decision !== "denied" || !operation.permission.requested) {
+      continue;
+    }
+
+    const family =
+      input.response.stopReason === "cancelled"
+        ? "permission_request_cancelled"
+        : "permission_request_end_turn";
+    const nextPhase =
+      family === "permission_request_cancelled"
+        ? "cancelled"
+        : operation.phase === "awaiting_permission"
+          ? "failed"
+          : operation.phase;
+
+    let changed = false;
+    if (operation.permission.family !== family) {
+      operation.permission = {
+        ...operation.permission,
+        family,
+        requested: true,
+      };
+      changed = true;
+    }
+    if (operation.failureReason !== "permission_denied") {
+      operation.failureReason = "permission_denied";
+      changed = true;
+    }
+    if (operation.phase !== nextPhase) {
+      operation.phase = nextPhase;
+      changed = true;
+    }
+
+    if (!changed) {
+      continue;
+    }
+
+    operation.updatedAt = new Date().toISOString();
+    events.push({
+      operation: cloneOperation(operation),
+      turnId: input.turn.turnId,
+      type: "operation_updated",
+    });
+  }
+
+  return events;
+}
+
+function getStoredOperation(
+  turn: AcpRuntimeTurnState,
+  operationId: string,
+): AcpRuntimeOperation {
+  const operation = turn.operations.get(operationId);
+  if (!operation) {
+    throw new AcpProtocolError(
+      `Runtime operation "${operationId}" is missing from the active turn state.`,
+    );
+  }
+  return operation;
 }
 
 function assertNever(value: never): never {

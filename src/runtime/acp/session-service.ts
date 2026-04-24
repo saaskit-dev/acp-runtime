@@ -1,7 +1,7 @@
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 
-import { AcpAuthenticationError, AcpProtocolError } from "../errors.js";
-import type { AcpSessionDriver, AcpSessionService } from "../session-driver.js";
+import { AcpAuthenticationError, AcpProtocolError } from "../core/errors.js";
+import type { AcpSessionDriver, AcpSessionService } from "../core/session-driver.js";
 import type {
   AcpRuntimeAuthorityHandlers,
   AcpRuntimeConfigValue,
@@ -10,7 +10,7 @@ import type {
   AcpRuntimeLoadOptions,
   AcpRuntimeResumeOptions,
   AcpRuntimeSessionList,
-} from "../types.js";
+} from "../core/types.js";
 import { AcpClientBridge } from "./authority-bridge.js";
 import type {
   AcpClientInfo,
@@ -189,7 +189,7 @@ export function createAcpSessionService(
 async function bootstrapAcpSession(input: {
   connectionFactory: AcpConnectionFactory;
   connectionOptions: AcpOptions;
-  agent: import("../types.js").AcpRuntimeAgent;
+  agent: import("../core/types.js").AcpRuntimeAgent;
   cwd: string;
   handlers?: AcpRuntimeAuthorityHandlers;
 }) {

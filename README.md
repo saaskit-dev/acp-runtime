@@ -29,7 +29,7 @@ Protocol alignment for the simulator is tracked with explicit metadata:
 
 ## Entry Points
 
-- [Client Integration Guide](docs/client-integration-guide.md)
+- [Client Integration Guide](docs/guides/client-integration-guide.md)
 - [RFC-0001: Runtime Public Abstraction](docs/rfcs/0001-runtime-public-abstraction.md)
 - [RFC-0002: Runtime Execution and Authority](docs/rfcs/0002-runtime-execution-and-authority.md)
 - [RFC-0003: Runtime Snapshot, Policy, and Recovery](docs/rfcs/0003-runtime-snapshot-policy-and-recovery.md)
@@ -46,6 +46,13 @@ This repository now follows a cleaner open source documentation layout:
 - Simplified Chinese lives in dedicated translation files
 - package and install instructions use the published scoped package name
 - contributor and security policy files live at the repository root
+
+## Repository Layout
+
+- `src/`: runtime library source only
+- `examples/`: runnable smoke and demo entry points
+- `harness/`: repository-level validation tooling and case definitions
+- `packages/simulator-agent/`: independently published simulator agent package
 
 ## Installation
 
@@ -83,10 +90,15 @@ npx @saaskit-dev/simulator-agent-acp@latest
 ## Development
 
 ```bash
+pnpm clean
 pnpm build
 pnpm test
-pnpm smoke:client-sdk
+pnpm demo:client-sdk
+pnpm harness:check-admission -- --type codex-acp
+pnpm harness:run-agent -- --type codex-acp
 ```
+
+Generated runtime state now defaults to `./.tmp/` so the repository root stays clean.
 
 ## Runtime SDK Status
 
@@ -104,24 +116,66 @@ Internally, ACP-specific behavior is split into:
 
 This is intentionally not a generic multi-protocol abstraction. The runtime is ACP-focused, but still normalizes behavioral differences across ACP agents.
 
+For registry-backed startup, the runtime now exposes first-class helpers.
+Hosts can ask the runtime to resolve launch config from the ACP registry instead of hard-coding `command` / `args`:
+
+```ts
+const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
+const session = await runtime.createFromRegistry({
+  agentId: "claude-acp",
+  cwd: process.cwd(),
+});
+```
+
+If you need the resolved launch config before creating a session, use `resolveRuntimeAgentFromRegistry(agentId)`.
+
 ## Runtime Validation
 
-The repository now has runtime-level validation for both currently integrated ACP agents:
+The repository now has runtime-level validation for the currently integrated ACP agents:
 
 - `simulator-agent-acp`
   - validated by [src/runtime/runtime-simulator.test.ts](src/runtime/runtime-simulator.test.ts)
   - covers `create`, `send`, `configure`, `snapshot`, and `resume`
 - `Claude Code ACP`
   - validated by [src/runtime/runtime-claude-code.test.ts](src/runtime/runtime-claude-code.test.ts)
-  - covers real stdio startup, session creation, and prompt execution through `npx @agentclientprotocol/claude-agent-acp`
+  - covers real stdio startup, session creation, and prompt execution against `claude-agent-acp`
+- `Codex ACP`
+  - validated by [src/runtime/runtime-codex.test.ts](src/runtime/runtime-codex.test.ts)
+  - covers real stdio startup, session creation, and prompt execution against `codex-acp`
 
-The Claude Code contract test is opt-in because it depends on external package startup and local Claude authentication state:
+The Claude Code contract test now resolves launch config from the ACP registry by default.
+If `claude-agent-acp` is already on `PATH`, it uses the local binary.
+Otherwise it falls back to the registry-defined distribution, which currently means `npx @agentclientprotocol/claude-agent-acp`.
+
+If you want to force the legacy direct `npx` path without consulting the registry first, set:
 
 ```bash
 ACP_RUNTIME_RUN_CLAUDE_CODE_TEST=1 pnpm test -- --run src/runtime/runtime-claude-code.test.ts
 ```
 
-The default test suite skips that contract test and still runs the deterministic simulator-backed runtime integration test.
+If you want to skip the real-environment contract test even when the binary is installed, set:
+
+```bash
+ACP_RUNTIME_SKIP_CLAUDE_CODE_TEST=1 pnpm test
+```
+
+The Codex contract test also resolves launch config from the ACP registry by default.
+If `codex-acp` is already on `PATH`, it uses the local binary.
+Otherwise it falls back to the registry-defined distribution, which currently means `npx @zed-industries/codex-acp`.
+
+If you want to force the direct `npx` path for Codex, set:
+
+```bash
+ACP_RUNTIME_RUN_CODEX_TEST=1 pnpm test -- --run src/runtime/runtime-codex.test.ts
+```
+
+If you want to skip the real-environment Codex contract test, set:
+
+```bash
+ACP_RUNTIME_SKIP_CODEX_TEST=1 pnpm test
+```
+
+If the registry launch cannot be resolved, the default test suite skips that contract test and still runs the deterministic simulator-backed runtime integration test.
 
 ## Additional Docs
 

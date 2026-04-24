@@ -1,6 +1,6 @@
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 
-import type { AcpRuntimePrompt } from "../types.js";
+import type { AcpRuntimePrompt } from "../core/types.js";
 
 export function mapPromptToAcp(prompt: AcpRuntimePrompt): ContentBlock[] {
   if (typeof prompt === "string") {
@@ -38,12 +38,12 @@ export function mapPromptToAcp(prompt: AcpRuntimePrompt): ContentBlock[] {
     return blocks;
   }
 
-  const parts = prompt as readonly import("../types.js").AcpRuntimePromptPart[];
+  const parts = prompt as readonly import("../core/types.js").AcpRuntimePromptPart[];
   return parts.flatMap((part) => mapPromptPartToAcp(part));
 }
 
 function mapPromptPartToAcp(
-  part: import("../types.js").AcpRuntimePromptPart,
+  part: import("../core/types.js").AcpRuntimePromptPart,
 ): ContentBlock[] {
   switch (part.type) {
     case "text":
@@ -105,9 +105,9 @@ function mapPromptPartToAcp(
 
 function isPromptMessage(
   value:
-    | import("../types.js").AcpRuntimePromptPart
-    | import("../types.js").AcpRuntimePromptMessage,
-): value is import("../types.js").AcpRuntimePromptMessage {
+    | import("../core/types.js").AcpRuntimePromptPart
+    | import("../core/types.js").AcpRuntimePromptMessage,
+): value is import("../core/types.js").AcpRuntimePromptMessage {
   return "role" in value;
 }
 

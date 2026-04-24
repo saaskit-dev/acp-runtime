@@ -4,12 +4,18 @@ Language:
 - English (default)
 - [简体中文](zh-CN/README.md)
 
+## Layout
+
+- `guides/`: integration and SDK usage
+- `rfcs/`: architecture and design decisions
+- `research/`: validation matrices and background analysis
+
 ## Guides
 
-- [Client Integration Guide](client-integration-guide.md)
-- [Runtime SDK API](runtime-sdk-api.md)
-- [Runtime SDK Minimal Demo](runtime-sdk-minimal-demo.md)
-- [Runtime SDK Demo](runtime-sdk-demo.md)
+- [Client Integration Guide](guides/client-integration-guide.md)
+- [Runtime SDK API](guides/runtime-sdk-api.md)
+- [Runtime SDK Minimal Demo](guides/runtime-sdk-minimal-demo.md)
+- [Runtime SDK Demo](guides/runtime-sdk-demo.md)
 
 ## Active RFCs
 

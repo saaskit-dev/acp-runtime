@@ -12,10 +12,10 @@ import type {
   AcpRuntimeCapabilities,
   AcpRuntimeConfigValue,
   AcpRuntimeSessionMetadata,
-} from "../types.js";
+} from "../core/types.js";
 
 export function mapInitializeResponseToCapabilities(input: {
-  handlers?: import("../types.js").AcpRuntimeAuthorityHandlers;
+  handlers?: import("../core/types.js").AcpRuntimeAuthorityHandlers;
   response: InitializeResponse;
 }): AcpRuntimeCapabilities {
   const agentCapabilities = input.response.agentCapabilities;

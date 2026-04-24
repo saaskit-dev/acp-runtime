@@ -18,8 +18,24 @@ It requires:
 Artifacts should now be stored under:
 
 ```text
-harness-outputs/<agent>/<timestamp>/
+.tmp/harness-outputs/<agent>/<timestamp>/
 ```
+
+When reviewing scenario evidence, `matrix-summary.json` should now be treated as the first-pass gate summary.
+At minimum it should expose:
+
+- whether all applicable `P0` scenarios passed
+- which required `P0` scenarios failed
+- which permission behavior families were observed
+- which expected permission behavior families are still missing from evidence
+
+`pnpm harness:check-admission -- --type <agent>` should now fail with a non-zero exit code only when admission blockers remain.
+At minimum, blockers include:
+
+- any applicable `P0` scenario failure
+- missing evidence for any permission family that has an applicable scenario case for that agent
+
+`pnpm harness:run-agent -- --type <agent>` remains the stricter full-matrix command and may still fail when non-admission protocol or lifecycle cases remain red.
 ## Translation
 
 - [简体中文](zh-CN/research/agent-admission-checklist.md)

@@ -20,7 +20,7 @@ import type {
   SetSessionModeRequest,
   SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
-import type { AcpRuntimeAgent } from "../types.js";
+import type { AcpRuntimeAgent } from "../core/types.js";
 
 export type AcpConnection = {
   readonly closed: Promise<void>;
@@ -72,17 +72,17 @@ export type AcpSessionResponse =
   | ResumeSessionResponse;
 
 export type AcpSessionBootstrap = {
-  agent: import("../types.js").AcpRuntimeAgent;
+  agent: import("../core/types.js").AcpRuntimeAgent;
   connection: AcpConnection;
   cwd: string;
   dispose?: (() => Promise<void> | void) | undefined;
-  mcpServers: readonly import("../types.js").AcpRuntimeMcpServer[];
+  mcpServers: readonly import("../core/types.js").AcpRuntimeMcpServer[];
   response: AcpSessionResponse;
   sessionId: string;
 };
 
 export function mapMcpServersToAcp(
-  servers: readonly import("../types.js").AcpRuntimeMcpServer[],
+  servers: readonly import("../core/types.js").AcpRuntimeMcpServer[],
 ): McpServer[] {
   return servers.map<McpServer>((server) => {
     if (server.transport.type === "stdio") {

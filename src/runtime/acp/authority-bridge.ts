@@ -19,7 +19,7 @@ import type {
   WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
 
-import type { AcpRuntimeAuthorityHandlers } from "../types.js";
+import type { AcpRuntimeAuthorityHandlers } from "../core/types.js";
 
 export class AcpClientBridge implements Client {
   private bufferedUpdates: SessionNotification[] = [];

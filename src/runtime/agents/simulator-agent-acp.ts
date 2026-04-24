@@ -1,4 +1,8 @@
-import type { AcpRuntimeAgent } from "../types.js";
+import type { AcpRuntimeAgent } from "../core/types.js";
+import {
+  createNpxCommandLaunch,
+  resolvePackageSpec,
+} from "../../internal/launch-config.js";
 
 export const SIMULATOR_AGENT_ACP_COMMAND = "simulator-agent-acp";
 export const SIMULATOR_AGENT_ACP_REGISTRY_ID = "simulator-agent-acp";
@@ -29,13 +33,12 @@ export function createSimulatorAgentAcpAgent(
 
   if (via === "npx") {
     return {
-      args: [
-        "--yes",
-        version ? `${packageName}@${version}` : packageName,
-        ...args,
-      ],
-      command: "npx",
-      env,
+      ...createNpxCommandLaunch({
+        args,
+        env,
+        executable: SIMULATOR_AGENT_ACP_COMMAND,
+        packageSpec: resolvePackageSpec(packageName, version),
+      }),
       type: SIMULATOR_AGENT_ACP_REGISTRY_ID,
     };
   }

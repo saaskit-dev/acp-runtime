@@ -3,9 +3,18 @@ import type { ToolCallLocation, ToolKind } from "@agentclientprotocol/sdk";
 import type {
   AcpRuntimeOperation,
   AcpRuntimeOperationKind,
-} from "../../types.js";
+  AcpRuntimeSessionMetadata,
+} from "../../core/types.js";
 
 export type AcpAgentProfile = {
+  inferDeniedOperationFamily(input: {
+    metadata: AcpRuntimeSessionMetadata;
+    operation: AcpRuntimeOperation;
+  }):
+    | "mode_denied"
+    | "permission_request_cancelled"
+    | "permission_request_end_turn"
+    | undefined;
   inferOperationTarget(input: {
     kind: ToolKind | null | undefined;
     locations: ToolCallLocation[] | null | undefined;
@@ -20,9 +29,22 @@ export function createAgentProfile(
   overrides: AgentProfileOverrides,
 ): AcpAgentProfile {
   return {
+    inferDeniedOperationFamily:
+      overrides.inferDeniedOperationFamily ?? inferDeniedOperationFamily,
     inferOperationTarget: overrides.inferOperationTarget ?? inferOperationTarget,
     mapOperationKind: overrides.mapOperationKind ?? mapOperationKind,
   };
+}
+
+function inferDeniedOperationFamily(_input: {
+  metadata: AcpRuntimeSessionMetadata;
+  operation: AcpRuntimeOperation;
+}):
+  | "mode_denied"
+  | "permission_request_cancelled"
+  | "permission_request_end_turn"
+  | undefined {
+  return undefined;
 }
 
 function inferOperationTarget(input: {

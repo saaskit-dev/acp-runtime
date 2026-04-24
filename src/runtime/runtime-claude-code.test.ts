@@ -5,10 +5,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  AcpPermissionDeniedError,
   AcpRuntime,
   type AcpRuntimeTurnEvent,
   createClaudeCodeAcpAgent,
   createStdioAcpConnectionFactory,
+  resolveRuntimeAgentFromRegistry,
 } from "../index.js";
 
 const tempDirs: string[] = [];
@@ -21,8 +23,45 @@ afterEach(async () => {
   );
 });
 
-const shouldRunClaudeCodeContract =
-  process.env.ACP_RUNTIME_RUN_CLAUDE_CODE_TEST === "1";
+function shouldSkipClaudeCodeContract(): boolean {
+  return process.env.ACP_RUNTIME_SKIP_CLAUDE_CODE_TEST === "1";
+}
+
+async function resolveClaudeCodeContractAgent() {
+  if (shouldSkipClaudeCodeContract()) {
+    return {
+      skipReason: "ACP_RUNTIME_SKIP_CLAUDE_CODE_TEST=1",
+    } as const;
+  }
+
+  if (process.env.ACP_RUNTIME_RUN_CLAUDE_CODE_TEST === "1") {
+    return {
+      createSession(runtime: AcpRuntime, cwd: string) {
+        return runtime.create({
+          agent: createClaudeCodeAcpAgent({ via: "npx" }),
+          cwd,
+        });
+      },
+    } as const;
+  }
+
+  try {
+    await resolveRuntimeAgentFromRegistry("claude-acp");
+    return {
+      createSession(runtime: AcpRuntime, cwd: string) {
+        return runtime.createFromRegistry({
+          agentId: "claude-acp",
+          cwd,
+        });
+      },
+    } as const;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      skipReason: `failed to resolve claude-acp launch from ACP registry: ${message}`,
+    } as const;
+  }
+}
 
 function isClaudeInternalError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -48,9 +87,14 @@ async function retryClaudeLifecycle<T>(
 }
 
 describe("AcpRuntime x Claude Code ACP", () => {
-  it.skipIf(!shouldRunClaudeCodeContract)(
+  it(
     "creates a Claude Code ACP session over stdio",
-    async () => {
+    async (context) => {
+      const resolution = await resolveClaudeCodeContractAgent();
+      if ("skipReason" in resolution) {
+        context.skip(resolution.skipReason);
+      }
+
       await retryClaudeLifecycle(async (attempt) => {
         const cwd = await mkdtemp(join(tmpdir(), "acp-runtime-claude-"));
         tempDirs.push(cwd);
@@ -70,10 +114,7 @@ describe("AcpRuntime x Claude Code ACP", () => {
 
         try {
           trace.push(`attempt=${attempt} stage=${stage}`);
-          session = await runtime.create({
-            agent: createClaudeCodeAcpAgent({ via: "npx" }),
-            cwd,
-          });
+          session = await resolution.createSession(runtime, cwd);
 
           expect(session.metadata.id).toBeTruthy();
           expect(
@@ -96,10 +137,65 @@ describe("AcpRuntime x Claude Code ACP", () => {
           expect(firstEvents.some((event) => event.type === "started")).toBe(true);
           expect(firstEvents.some((event) => event.type === "completed")).toBe(true);
 
+          const defaultDeniedEvents: AcpRuntimeTurnEvent[] = [];
+          stage = "default-permission-denied";
+          trace.push(`attempt=${attempt} stage=${stage}`);
+          await expect(
+            session.send(
+              "Write the exact text 'denied' into ./claude-default-denied.txt using tools, then report success.",
+              {
+                onEvent(event) {
+                  defaultDeniedEvents.push(event);
+                  trace.push(`event: ${JSON.stringify(event)}`);
+                },
+              },
+            ),
+          ).rejects.toBeInstanceOf(AcpPermissionDeniedError);
+          expect(
+            defaultDeniedEvents.some((event) => event.type === "permission_requested"),
+          ).toBe(true);
+          expect(
+            defaultDeniedEvents.some(
+              (event) =>
+                event.type === "operation_failed" &&
+                event.operation.permission?.family === "permission_request_end_turn",
+            ),
+          ).toBe(true);
+
           stage = "set-raw-mode";
           trace.push(`attempt=${attempt} stage=${stage}`);
           await session.setAgentMode("plan");
           expect(session.metadata.currentModeId).toBe("plan");
+
+          stage = "set-dontask-mode";
+          trace.push(`attempt=${attempt} stage=${stage}`);
+          await session.setAgentMode("dontAsk");
+          expect(session.metadata.currentModeId).toBe("dontAsk");
+
+          const modeDeniedEvents: AcpRuntimeTurnEvent[] = [];
+          stage = "mode-denied";
+          trace.push(`attempt=${attempt} stage=${stage}`);
+          await expect(
+            session.send(
+              "Write the exact text 'denied' into ./claude-dontask-denied.txt using tools, then report success.",
+              {
+                onEvent(event) {
+                  modeDeniedEvents.push(event);
+                  trace.push(`event: ${JSON.stringify(event)}`);
+                },
+              },
+            ),
+          ).rejects.toBeInstanceOf(AcpPermissionDeniedError);
+          expect(
+            modeDeniedEvents.some((event) => event.type === "permission_requested"),
+          ).toBe(false);
+          expect(
+            modeDeniedEvents.some(
+              (event) =>
+                event.type === "operation_failed" &&
+                event.operation.permission?.family === "mode_denied",
+            ),
+          ).toBe(true);
 
           stage = "set-bypass-mode";
           trace.push(`attempt=${attempt} stage=${stage}`);

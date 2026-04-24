@@ -1,8 +1,9 @@
-export { AcpRuntime } from "./runtime.js";
-export { AcpRuntimeSession } from "./session.js";
-export { AcpRuntimeSessionRegistry } from "./session-registry.js";
-export { AcpRuntimeJsonSessionRegistryStore } from "./session-registry-store.js";
-export { ACP_RUNTIME_SNAPSHOT_VERSION } from "./constants.js";
+export { AcpRuntime } from "./core/runtime.js";
+export { AcpRuntimeSession } from "./core/session.js";
+export { AcpRuntimeSessionRegistry } from "./registry/session-registry.js";
+export { AcpRuntimeJsonSessionRegistryStore } from "./registry/session-registry-store.js";
+export { resolveRuntimeAgentFromRegistry } from "./registry/agent-resolver.js";
+export { ACP_RUNTIME_SNAPSHOT_VERSION } from "./core/constants.js";
 export {
   ACP_PROTOCOL_ALIGNMENT_VERIFIED_AT,
   ACP_PROTOCOL_DOCS_SCHEMA_URL,
@@ -26,9 +27,10 @@ export {
   AcpResumeError,
   AcpTurnCancelledError,
   AcpTurnTimeoutError,
-} from "./errors.js";
+} from "./core/errors.js";
 export type {
   AcpRuntimeAgent,
+  AcpRuntimeAgentResolver,
   AcpRuntimeAgentConfigOption,
   AcpRuntimeAgentConfigOptionChoice,
   AcpRuntimeAgentCapabilities,
@@ -43,16 +45,20 @@ export type {
   AcpRuntimeConfigValue,
   AcpRuntimeContentPart,
   AcpRuntimeCreateOptions,
+  AcpRuntimeCreateFromRegistryOptions,
   AcpRuntimeDiagnostics,
   AcpRuntimeFilesystemHandler,
   AcpRuntimeListAgentSessionsOptions,
+  AcpRuntimeListAgentSessionsFromRegistryOptions,
   AcpRuntimeLoadOptions,
+  AcpRuntimeLoadFromRegistryOptions,
   AcpRuntimeMcpServer,
   AcpRuntimeOperation,
   AcpRuntimeOperationCompletedEvent,
   AcpRuntimeOperationFailureReason,
   AcpRuntimeOperationFailedEvent,
   AcpRuntimeOperationKind,
+  AcpRuntimeOperationPermission,
   AcpRuntimeOperationPhase,
   AcpRuntimeOperationProgress,
   AcpRuntimeOperationResult,
@@ -97,9 +103,9 @@ export type {
   AcpRuntimeTurnThinkingEvent,
   AcpRuntimeUsage,
   AcpRuntimeUsageUpdatedEvent,
-} from "./types.js";
+} from "./core/types.js";
 export type {
   AcpRuntimeSessionRegistryState,
   AcpRuntimeSessionRegistryStore,
-} from "./session-registry.js";
+} from "./registry/session-registry.js";
 export type { StdioFactoryOptions } from "./acp/stdio-connection.js";

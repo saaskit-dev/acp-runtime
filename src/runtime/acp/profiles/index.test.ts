@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { CODEX_ACP_REGISTRY_ID } from "../../agents/codex-acp.js";
 import { CLAUDE_CODE_ACP_REGISTRY_ID } from "../../agents/claude-code-acp.js";
 import {
   LOCAL_SIMULATOR_AGENT_ACP_REGISTRY_ID,
@@ -29,5 +30,14 @@ describe("resolveAcpAgentProfile", () => {
     });
 
     expect(profile.mapOperationKind("fetch")).toBe("network_request");
+  });
+
+  it("resolves Codex profiles", () => {
+    const profile = resolveAcpAgentProfile({
+      command: "codex-acp",
+      type: CODEX_ACP_REGISTRY_ID,
+    });
+
+    expect(profile.mapOperationKind("execute")).toBe("execute_command");
   });
 });

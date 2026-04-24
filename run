@@ -1,0 +1,63 @@
+#!/bin/zsh
+set -euo pipefail
+
+if [[ $# -eq 0 ]]; then
+  exec make help
+fi
+
+target="$1"
+shift
+
+case "$target" in
+  runtime)
+    if [[ $# -eq 0 ]]; then
+      echo 'usage: ./run runtime <agent-id> [--prompt TEXT] [--log-file PATH] [prompt...]' >&2
+      exit 2
+    fi
+
+    agent="$1"
+    shift
+    prompt=""
+    log_file="${ACP_RUNTIME_LOG_FILE:-}"
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --prompt=*)
+          prompt="${1#--prompt=}"
+          ;;
+        --prompt)
+          shift
+          prompt="${1:-}"
+          ;;
+        --log-file=*|--log=*)
+          log_file="${1#*=}"
+          ;;
+        --log-file|--log)
+          shift
+          log_file="${1:-}"
+          ;;
+        *)
+          if [[ -n "$prompt" ]]; then
+            prompt="$prompt $1"
+          else
+            prompt="$1"
+          fi
+          ;;
+      esac
+      shift
+    done
+
+    if [[ -n "$log_file" ]]; then
+      export ACP_RUNTIME_LOG_FILE="$log_file"
+    fi
+
+    if [[ -n "$prompt" ]]; then
+      exec make runtime "$agent" PROMPT="$prompt"
+    fi
+
+    exec make runtime "$agent"
+    ;;
+  *)
+    exec make "$target" "$@"
+    ;;
+esac

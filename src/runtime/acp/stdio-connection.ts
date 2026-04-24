@@ -23,6 +23,11 @@ export type StdioFactoryOptions = {
     | undefined;
 };
 
+type NodeReadableLike = AsyncIterable<Buffer | Uint8Array | string> &
+  Pick<Readable, "destroy" | "off" | "on">;
+
+type NodeWritableLike = Pick<Writable, "destroy" | "end" | "write">;
+
 type AgentProcess = ChildProcess & {
   stdin: Writable;
   stdout: Readable;
@@ -61,8 +66,8 @@ export function createStdioAcpConnectionFactory(
     const stream = createTappedStream(
       createNdJsonMessageStream(
         input.agent.command,
-        Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
-        Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
+        nodeWritableToWeb(child.stdin),
+        nodeReadableToWeb(child.stdout),
       ),
       options.onAcpMessage,
     );
@@ -90,6 +95,115 @@ export function createStdioAcpConnectionFactory(
       },
     };
   };
+}
+
+export function nodeReadableToWeb(
+  stream: NodeReadableLike,
+  options: { preferNative?: boolean } = {},
+): ReadableStream<Uint8Array> {
+  if (options.preferNative !== false) {
+    const nativeToWeb = (
+      Readable as typeof Readable & {
+        toWeb?: ((stream: Readable) => ReadableStream<Uint8Array>) | undefined;
+      }
+    ).toWeb;
+    if (typeof nativeToWeb === "function" && stream instanceof Readable) {
+      try {
+        return nativeToWeb(stream) as unknown as ReadableStream<Uint8Array>;
+      } catch {
+        // Bun exposes the static bridge but can fail at runtime. Fall back to a
+        // portable wrapper so the runtime can still operate under Bun.
+      }
+    }
+  }
+
+  let cancelled = false;
+  let onError: ((error: unknown) => void) | undefined;
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      onError = (error: unknown) => {
+        controller.error(error);
+      };
+
+      stream.on("error", onError);
+
+      void (async () => {
+        try {
+          for await (const chunk of stream) {
+            if (cancelled) {
+              break;
+            }
+            controller.enqueue(normalizeReadableChunk(chunk));
+          }
+          if (!cancelled) {
+            controller.close();
+          }
+        } catch (error) {
+          if (!cancelled) {
+            controller.error(error);
+          }
+        } finally {
+          stream.off("error", onError);
+        }
+      })();
+    },
+    cancel(reason) {
+      cancelled = true;
+      if (onError) {
+        stream.off("error", onError);
+      }
+      stream.destroy(toError(reason));
+    },
+  });
+}
+
+export function nodeWritableToWeb(
+  stream: NodeWritableLike,
+  options: { preferNative?: boolean } = {},
+): WritableStream<Uint8Array> {
+  if (options.preferNative !== false) {
+    const nativeToWeb = (
+      Writable as typeof Writable & {
+        toWeb?: ((stream: Writable) => WritableStream<Uint8Array>) | undefined;
+      }
+    ).toWeb;
+    if (typeof nativeToWeb === "function" && stream instanceof Writable) {
+      try {
+        return nativeToWeb(stream);
+      } catch {
+        // Bun can surface a partially implemented bridge here.
+      }
+    }
+  }
+
+  return new WritableStream<Uint8Array>({
+    async write(chunk) {
+      await new Promise<void>((resolve, reject) => {
+        stream.write(chunk, (error?: Error | null) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    },
+    async close() {
+      await new Promise<void>((resolve, reject) => {
+        stream.end((error?: Error | null) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    },
+    abort(reason) {
+      stream.destroy(toError(reason));
+    },
+  });
 }
 
 function wrapConnectionWithExit(
@@ -465,4 +579,26 @@ function basenameToken(command: string): string {
   const normalized = command.replaceAll("\\", "/");
   const index = normalized.lastIndexOf("/");
   return index >= 0 ? normalized.slice(index + 1) : normalized;
+}
+
+function normalizeReadableChunk(
+  chunk: Buffer | Uint8Array | string,
+): Uint8Array {
+  if (typeof chunk === "string") {
+    return new TextEncoder().encode(chunk);
+  }
+
+  return chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+}
+
+function toError(reason: unknown): Error | undefined {
+  if (reason instanceof Error) {
+    return reason;
+  }
+
+  if (reason === undefined) {
+    return undefined;
+  }
+
+  return new Error(String(reason));
 }

@@ -145,7 +145,7 @@ uvx <package> ...
 
 这份 catalog 可以直接驱动：
 
-- `src/harness/registry-client.ts` / `src/harness/agent-registry.ts`
+- `harness/registry-client.ts` / `harness/agent-registry.ts`
 - 后续“从 registry 自动生成本地 agent registry”的脚本
 
 但它不能替代：

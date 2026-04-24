@@ -1,8 +1,14 @@
+import { Readable, Writable } from "node:stream";
+
 import { describe, expect, it } from "vitest";
 
 import type { AnyMessage } from "@agentclientprotocol/sdk";
 
-import { normalizeInboundAcpMessage } from "./stdio-connection.js";
+import {
+  nodeReadableToWeb,
+  nodeWritableToWeb,
+  normalizeInboundAcpMessage,
+} from "./stdio-connection.js";
 
 describe("stdio ACP inbound normalization", () => {
   it("rewrites Claude Code usage_update messages with used=null", () => {
@@ -66,5 +72,41 @@ describe("stdio ACP inbound normalization", () => {
     } as AnyMessage;
 
     expect(normalizeInboundAcpMessage(message)).toBe(message);
+  });
+});
+
+describe("stdio stream bridges", () => {
+  it("bridges node readable streams without native adapters", async () => {
+    const readable = nodeReadableToWeb(Readable.from(["hello\n"]), {
+      preferNative: false,
+    });
+    const reader = readable.getReader();
+    const first = await reader.read();
+
+    expect(first.done).toBe(false);
+    expect(new TextDecoder().decode(first.value)).toBe("hello\n");
+
+    const second = await reader.read();
+    expect(second.done).toBe(true);
+  });
+
+  it("bridges node writable streams without native adapters", async () => {
+    const chunks: Uint8Array[] = [];
+    const writable = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(
+          chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk),
+        );
+        callback();
+      },
+    });
+
+    const stream = nodeWritableToWeb(writable, { preferNative: false });
+    const writer = stream.getWriter();
+    await writer.write(new TextEncoder().encode("ping"));
+    await writer.close();
+
+    expect(new TextDecoder().decode(chunks[0])).toBe("ping");
+    expect(writable.writableEnded).toBe(true);
   });
 });

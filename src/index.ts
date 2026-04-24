@@ -19,6 +19,7 @@ export {
   AcpTurnCancelledError,
   AcpTurnTimeoutError,
   createStdioAcpConnectionFactory,
+  resolveRuntimeAgentFromRegistry,
 } from "./runtime/index.js";
 export * from "./runtime/agents/index.js";
 export {
@@ -31,6 +32,7 @@ export {
 } from "./runtime/protocol.js";
 export type {
   AcpRuntimeAgent,
+  AcpRuntimeAgentResolver,
   AcpRuntimeAgentConfigOption,
   AcpRuntimeAgentConfigOptionChoice,
   AcpRuntimeAgentCapabilities,
@@ -45,16 +47,20 @@ export type {
   AcpRuntimeConfigValue,
   AcpRuntimeContentPart,
   AcpRuntimeCreateOptions,
+  AcpRuntimeCreateFromRegistryOptions,
   AcpRuntimeDiagnostics,
   AcpRuntimeFilesystemHandler,
   AcpRuntimeListAgentSessionsOptions,
+  AcpRuntimeListAgentSessionsFromRegistryOptions,
   AcpRuntimeLoadOptions,
+  AcpRuntimeLoadFromRegistryOptions,
   AcpRuntimeMcpServer,
   AcpRuntimeOperation,
   AcpRuntimeOperationCompletedEvent,
   AcpRuntimeOperationFailureReason,
   AcpRuntimeOperationFailedEvent,
   AcpRuntimeOperationKind,
+  AcpRuntimeOperationPermission,
   AcpRuntimeOperationPhase,
   AcpRuntimeOperationProgress,
   AcpRuntimeOperationResult,

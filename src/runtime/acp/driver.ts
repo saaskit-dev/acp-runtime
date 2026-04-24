@@ -5,8 +5,8 @@ import type {
   SessionNotification,
 } from "@agentclientprotocol/sdk";
 
-import { AcpProcessError, AcpProtocolError } from "../errors.js";
-import type { AcpSessionDriver } from "../session-driver.js";
+import { AcpProcessError, AcpProtocolError } from "../core/errors.js";
+import type { AcpSessionDriver } from "../core/session-driver.js";
 import {
   type AcpRuntimeDiagnostics,
   type AcpRuntimePrompt,
@@ -16,8 +16,8 @@ import {
   type AcpRuntimeStreamOptions,
   type AcpRuntimeTurnEvent,
   type AcpRuntimeAuthorityHandlers,
-} from "../types.js";
-import { ACP_RUNTIME_SNAPSHOT_VERSION } from "../constants.js";
+} from "../core/types.js";
+import { ACP_RUNTIME_SNAPSHOT_VERSION } from "../core/constants.js";
 import type { AcpSessionBootstrap } from "./connection-types.js";
 import { AcpClientBridge } from "./authority-bridge.js";
 import {
@@ -28,6 +28,7 @@ import {
 } from "./capability-mapper.js";
 import type { AcpAgentProfile } from "./profiles/index.js";
 import {
+  applyPermissionDecision,
   finalizePromptResponse,
   mapPermissionDecisionToAcp,
   mapPermissionRequest,
@@ -286,10 +287,15 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     if (decision.decision === "deny") {
       this.currentTurn.state.deniedOperationIds.add(mapped.operation.id);
     }
+    const resolvedOperation = applyPermissionDecision({
+      decision,
+      operationId: mapped.operation.id,
+      turn: this.currentTurn.state,
+    });
 
     this.currentTurn.queue.push({
       decision: decision.decision === "allow" ? "allowed" : "denied",
-      operation: mapped.operation,
+      operation: resolvedOperation,
       request: mapped.request,
       turnId: this.currentTurn.state.turnId,
       type: "permission_resolved",
@@ -402,18 +408,18 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
       this.diagnosticsValue.lastUsage = usage;
     }
 
-    activeTurn.queue.push(
-      finalizePromptResponse({
-        response,
-        turn: activeTurn.state,
-      }),
-    );
+    for (const event of finalizePromptResponse({
+      response,
+      turn: activeTurn.state,
+    })) {
+      activeTurn.queue.push(event);
+    }
     activeTurn.queue.close();
   }
 
   private async resolvePermissionDecision(
-    request: import("../types.js").AcpRuntimePermissionRequest,
-  ): Promise<import("../types.js").AcpRuntimePermissionDecision> {
+    request: import("../core/types.js").AcpRuntimePermissionRequest,
+  ): Promise<import("../core/types.js").AcpRuntimePermissionDecision> {
     if (this.bootstrap.handlers?.permission) {
       return this.bootstrap.handlers.permission(request);
     }

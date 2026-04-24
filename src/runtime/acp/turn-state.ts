@@ -4,7 +4,7 @@ import type {
   AcpRuntimeOperation,
   AcpRuntimeOutputPart,
   AcpRuntimePermissionRequest,
-} from "../types.js";
+} from "../core/types.js";
 
 export type AcpRuntimeTurnState = {
   deniedOperationIds: Set<string>;

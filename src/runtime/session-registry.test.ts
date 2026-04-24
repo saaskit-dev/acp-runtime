@@ -8,7 +8,7 @@ import {
   AcpRuntimeJsonSessionRegistryStore,
   AcpRuntimeSessionRegistry,
 } from "./index.js";
-import type { AcpRuntimeSnapshot } from "./types.js";
+import type { AcpRuntimeSnapshot } from "./core/types.js";
 
 const tempDirs: string[] = [];
 

@@ -2,12 +2,18 @@
 
 [English](../README.md)
 
+## 目录结构
+
+- `guides/`：接入指南与 SDK 用法
+- `rfcs/`：架构与设计决策
+- `research/`：验证矩阵与调研材料
+
 ## 指南
 
-- [客户端接入指南](client-integration-guide.md)
-- [Runtime SDK API](runtime-sdk-api.md)
-- [Runtime SDK Minimal Demo](runtime-sdk-minimal-demo.md)
-- [Runtime SDK Demo](runtime-sdk-demo.md)
+- [客户端接入指南](guides/client-integration-guide.md)
+- [Runtime SDK API](guides/runtime-sdk-api.md)
+- [Runtime SDK Minimal Demo](guides/runtime-sdk-minimal-demo.md)
+- [Runtime SDK Demo](guides/runtime-sdk-demo.md)
 
 ## Active RFC
 

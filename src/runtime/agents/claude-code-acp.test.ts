@@ -28,7 +28,13 @@ describe("createClaudeCodeAcpAgent", () => {
         via: "npx",
       }),
     ).toEqual({
-      args: ["--yes", `${CLAUDE_CODE_ACP_PACKAGE}@0.26.0`, "--debug"],
+      args: [
+        "--yes",
+        "-p",
+        `${CLAUDE_CODE_ACP_PACKAGE}@0.26.0`,
+        CLAUDE_CODE_ACP_COMMAND,
+        "--debug",
+      ],
       command: "npx",
       env: {
         ANTHROPIC_API_KEY: "test-key",

@@ -9,20 +9,24 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./internal/agent-launch-registry": {
+      "types": "./dist/internal/agent-launch-registry.d.ts",
+      "import": "./dist/internal/agent-launch-registry.js"
+    },
+    "./internal/simulator-workspace": {
+      "types": "./dist/internal/simulator-workspace.d.ts",
+      "import": "./dist/internal/simulator-workspace.js"
     }
   },
   "files": [
     "dist/index.js",
     "dist/index.d.ts",
     "dist/runtime",
-    "dist/examples/client-sdk-smoke.js",
-    "dist/examples/client-sdk-smoke.d.ts",
-    "dist/examples/runtime-smoke-all.js",
-    "dist/examples/runtime-smoke-all.d.ts",
-    "dist/examples/runtime-claude-smoke.js",
-    "dist/examples/runtime-claude-smoke.d.ts",
-    "dist/examples/runtime-simulator-smoke.js",
-    "dist/examples/runtime-simulator-smoke.d.ts",
+    "dist/examples/client-sdk-demo.js",
+    "dist/examples/client-sdk-demo.d.ts",
+    "dist/examples/runtime-sdk-demo.js",
+    "dist/examples/runtime-sdk-demo.d.ts",
     "README.md",
     "LICENSE"
   ],
@@ -30,20 +34,25 @@
     "access": "public"
   },
   "scripts": {
+    "clean": "rm -rf dist packages/simulator-agent/dist .tmp harness-outputs .simulator-agent-acp-harness tmp-output.txt",
     "build": "pnpm --filter @saaskit-dev/simulator-agent-acp build && pnpm run build:self",
-    "build:self": "tsc -p tsconfig.json",
-    "dev": "pnpm run build:self -- --watch",
+    "build:self": "pnpm run build:lib && pnpm run build:examples && pnpm run build:harness",
+    "build:lib": "tsc -p tsconfig.json",
+    "build:examples": "tsc -p tsconfig.examples.json",
+    "build:harness": "tsc -p tsconfig.harness.json",
+    "dev": "pnpm run build:lib -- --watch",
     "harness:clean-outputs": "node dist/harness/clean-outputs.js",
-    "harness:run-agent": "node dist/harness/run-agent-matrix.js",
-    "presmoke:client-sdk": "pnpm run build",
-    "smoke:client-sdk": "node dist/examples/client-sdk-smoke.js",
-    "presmoke:runtime:claude": "pnpm run build",
-    "smoke:runtime:claude": "node dist/examples/runtime-claude-smoke.js",
-    "presmoke:runtime": "pnpm run build",
-    "smoke:runtime": "node dist/examples/runtime-smoke-all.js",
+    "harness:check-admission": "node dist/harness/run-agent-matrix.js --gate admission",
+    "harness:run-agent": "node dist/harness/run-agent-matrix.js --gate full",
+    "predemo:client-sdk": "pnpm run build",
+    "demo:client-sdk": "node dist/examples/client-sdk-demo.js",
+    "predemo:runtime:claude": "pnpm run build",
+    "demo:runtime:claude": "node dist/examples/runtime-sdk-demo.js claude-acp",
+    "predemo:runtime": "pnpm run build",
+    "demo:runtime": "node dist/examples/runtime-sdk-demo.js",
     "test": "pnpm --filter @saaskit-dev/simulator-agent-acp test && vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit -p tsconfig.json && pnpm run build:lib && tsc --noEmit -p tsconfig.examples.json && tsc --noEmit -p tsconfig.harness.json",
     "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [

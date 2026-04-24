@@ -59,7 +59,7 @@
 每次验收至少应产出：
 
 ```text
-harness-outputs/<agent>/<timestamp>/
+.tmp/harness-outputs/<agent>/<timestamp>/
   transcript.jsonl
   summary.json
   notes.md
@@ -70,6 +70,22 @@ harness-outputs/<agent>/<timestamp>/
 - `transcript.jsonl` 必须可追溯
 - `summary.json` 必须含协议覆盖与场景结果
 - `notes.md` 必须记录例外和人工判断
+
+做场景门禁判断时，`matrix-summary.json` 现在应作为第一层汇总结果。
+至少应直接给出：
+
+- 所有适用的 `P0` 场景是否已通过
+- 哪些必测 `P0` 场景未通过
+- 已观察到哪些权限行为 family
+- 还有哪些预期权限行为 family 尚未覆盖
+
+`pnpm harness:check-admission -- --type <agent>` 现在应只在仍存在准入阻断项时返回非零退出码。
+最少包括这两类阻断：
+
+- 任一适用的 `P0` 场景失败
+- 对该 agent 已适用的 permission family 场景，仍缺少对应证据
+
+`pnpm harness:run-agent -- --type <agent>` 仍保留为更严格的全量矩阵命令；即使 admission 已通过，它也可能因为非主线的 protocol 或 lifecycle case 失败而返回非零。
 
 ## 5. 通过标准
 

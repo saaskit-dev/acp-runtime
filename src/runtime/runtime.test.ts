@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { ACP_RUNTIME_SNAPSHOT_VERSION } from "./constants.js";
+import { ACP_RUNTIME_SNAPSHOT_VERSION } from "./core/constants.js";
 import {
   AcpCreateError,
   AcpListError,
@@ -12,7 +12,7 @@ import {
   AcpRuntimeSessionRegistry,
   AcpTurnCancelledError,
 } from "./index.js";
-import type { AcpSessionDriver, AcpSessionService } from "./session-driver.js";
+import type { AcpSessionDriver, AcpSessionService } from "./core/session-driver.js";
 import type {
   AcpRuntimeAgentConfigOption,
   AcpRuntimeAgentMode,
@@ -28,7 +28,7 @@ import type {
   AcpRuntimePrompt,
   AcpRuntimeSnapshot,
   AcpRuntimeTurnEvent,
-} from "./types.js";
+} from "./core/types.js";
 
 type AcpRuntimeBackendEventFactory = (
   prompt: AcpRuntimePrompt,
@@ -206,6 +206,9 @@ function createSnapshot(
 
 function createTestRuntime(
   sessionService: Partial<AcpSessionService>,
+  options?: {
+    agentResolver?: (agentId: string) => Promise<{ command: string; args?: string[]; env?: Record<string, string | undefined>; type?: string }>;
+  },
 ): AcpRuntime {
   return new AcpRuntime(
     async () => {
@@ -227,6 +230,7 @@ function createTestRuntime(
         },
         ...sessionService,
       },
+      ...options,
     },
   );
 }
@@ -264,6 +268,125 @@ describe("AcpRuntime public SDK", () => {
     expect(session.diagnostics.lastUsage).toBeUndefined();
     await expect(session.run("say hello")).resolves.toBe("hello");
     expect(session.status).toBe("ready");
+  });
+
+  it("creates sessions from registry-resolved agents", async () => {
+    const snapshot = createSnapshot();
+    const backend = new SpySessionBackend(snapshot, () => []);
+    let createOptions: AcpRuntimeCreateOptions | undefined;
+
+    const runtime = createTestRuntime(
+      {
+        async create(options: AcpRuntimeCreateOptions) {
+          createOptions = options;
+          return backend;
+        },
+      },
+      {
+        async agentResolver(agentId) {
+          return {
+            args: ["--flag"],
+            command: "resolved-agent",
+            env: { TOKEN: "1" },
+            type: agentId,
+          };
+        },
+      },
+    );
+
+    await runtime.createFromRegistry({
+      agentId: "claude-acp",
+      cwd: "/tmp/project",
+    });
+
+    expect(createOptions).toEqual({
+      agent: {
+        args: ["--flag"],
+        command: "resolved-agent",
+        env: { TOKEN: "1" },
+        type: "claude-acp",
+      },
+      cwd: "/tmp/project",
+    });
+  });
+
+  it("loads sessions from registry-resolved agents", async () => {
+    const snapshot = createSnapshot();
+    const backend = new SpySessionBackend(snapshot, () => []);
+    let loadOptions: AcpRuntimeLoadOptions | undefined;
+
+    const runtime = createTestRuntime(
+      {
+        async load(options: AcpRuntimeLoadOptions) {
+          loadOptions = options;
+          return backend;
+        },
+      },
+      {
+        async agentResolver(agentId) {
+          return {
+            command: "resolved-agent",
+            type: agentId,
+          };
+        },
+      },
+    );
+
+    await runtime.loadFromRegistry({
+      agentId: "simulator-agent-acp-local",
+      cwd: "/tmp/project",
+      sessionId: "session-1",
+    });
+
+    expect(loadOptions).toEqual({
+      agent: {
+        command: "resolved-agent",
+        type: "simulator-agent-acp-local",
+      },
+      cwd: "/tmp/project",
+      sessionId: "session-1",
+    });
+  });
+
+  it("lists sessions from registry-resolved agents", async () => {
+    const expectedList: AcpRuntimeSessionList = {
+      items: [],
+      nextCursor: undefined,
+    };
+    let listOptions: AcpRuntimeListAgentSessionsOptions | undefined;
+
+    const runtime = createTestRuntime(
+      {
+        async listAgentSessions(options: AcpRuntimeListAgentSessionsOptions) {
+          listOptions = options;
+          return expectedList;
+        },
+      },
+      {
+        async agentResolver(agentId) {
+          return {
+            command: "resolved-agent",
+            type: agentId,
+          };
+        },
+      },
+    );
+
+    const result = await runtime.listAgentSessionsFromRegistry({
+      agentId: "claude-acp",
+      cursor: "cursor-1",
+      cwd: "/tmp/project",
+    });
+
+    expect(result).toBe(expectedList);
+    expect(listOptions).toEqual({
+      agent: {
+        command: "resolved-agent",
+        type: "claude-acp",
+      },
+      cursor: "cursor-1",
+      cwd: "/tmp/project",
+    });
   });
 
   it("supports structured prompts and structured output through send()", async () => {

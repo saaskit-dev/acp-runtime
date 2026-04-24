@@ -55,7 +55,14 @@
 - ACP Session Setup: https://agentclientprotocol.com/protocol/session-setup
 - ACP Schema: https://agentclientprotocol.com/protocol/schema
 - ACP Session Resume RFD: https://agentclientprotocol.com/rfds/session-resume
-- [Client Integration Guide](docs/client-integration-guide.md)
+- [Client Integration Guide](docs/guides/client-integration-guide.md)
+
+## 仓库结构
+
+- `src/`：只放 runtime 库源码
+- `examples/`：可直接运行的 smoke / demo 入口
+- `harness/`：仓库级验证工具与 case 定义
+- `packages/simulator-agent/`：独立发布的 simulator agent 包
 
 ## Research 导航
 
@@ -106,9 +113,22 @@ npx @saaskit-dev/simulator-agent-acp@latest
 
 这里不是“为了抽象而抽象”的多协议框架。runtime 仍然是 ACP-focused，只是把不同 ACP agent 的差异收敛进统一对象模型。
 
+对于基于 registry 的 agent 启动，runtime 现在已经提供一等入口。
+宿主不需要再手写 `command` / `args`，可以直接让 runtime 从 ACP registry 解析启动配置：
+
+```ts
+const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
+const session = await runtime.createFromRegistry({
+  agentId: "claude-acp",
+  cwd: process.cwd(),
+});
+```
+
+如果只想先拿到解析后的启动配置而不立即创建 session，可以使用 `resolveRuntimeAgentFromRegistry(agentId)`。
+
 ## 当前验证状态
 
-仓库现在已经对两个已接入 agent 做了 runtime 级验证：
+仓库现在已经对当前已接入的 ACP agent 做了 runtime 级验证：
 
 - `simulator-agent-acp`
   - 对应测试：[src/runtime/runtime-simulator.test.ts](src/runtime/runtime-simulator.test.ts)
@@ -116,14 +136,43 @@ npx @saaskit-dev/simulator-agent-acp@latest
 - `Claude Code ACP`
   - 对应测试：[src/runtime/runtime-claude-code.test.ts](src/runtime/runtime-claude-code.test.ts)
   - 覆盖真实 stdio 启动、session 创建和 prompt 执行
+- `Codex ACP`
+  - 对应测试：[src/runtime/runtime-codex.test.ts](src/runtime/runtime-codex.test.ts)
+  - 覆盖真实 stdio 启动、session 创建和 prompt 执行
 
-其中 Claude Code contract test 默认不进常规测试集，因为它依赖外部 `npx @agentclientprotocol/claude-agent-acp` 和本机 Claude 认证状态。需要时手动执行：
+其中 Claude Code contract test 默认会先从 ACP registry 解析启动配置。
+如果 `PATH` 上已经有 `claude-agent-acp`，会优先使用本地 binary。
+否则会回退到 registry 里声明的分发方式，目前 Claude 对应的是 `npx @agentclientprotocol/claude-agent-acp`。
+
+如果希望跳过 registry 解析、强制直接走 `npx @agentclientprotocol/claude-agent-acp` 路径，可以手动执行：
 
 ```bash
 ACP_RUNTIME_RUN_CLAUDE_CODE_TEST=1 pnpm test -- --run src/runtime/runtime-claude-code.test.ts
 ```
 
-默认 `pnpm test` 仍然会跑 deterministic 的 simulator runtime 集成测试。
+如果希望即使本机已经安装了 `claude-agent-acp` 也跳过这条真实环境合同测试，可以执行：
+
+```bash
+ACP_RUNTIME_SKIP_CLAUDE_CODE_TEST=1 pnpm test
+```
+
+Codex contract test 也默认会先从 ACP registry 解析启动配置。
+如果 `PATH` 上已经有 `codex-acp`，会优先使用本地 binary。
+否则会回退到 registry 里声明的分发方式，目前 Codex 对应的是 `npx @zed-industries/codex-acp`。
+
+如果希望强制直接走 Codex 的 `npx` 路径，可以执行：
+
+```bash
+ACP_RUNTIME_RUN_CODEX_TEST=1 pnpm test -- --run src/runtime/runtime-codex.test.ts
+```
+
+如果希望跳过 Codex 这条真实环境合同测试，可以执行：
+
+```bash
+ACP_RUNTIME_SKIP_CODEX_TEST=1 pnpm test
+```
+
+如果 registry 启动配置解析失败，默认 `pnpm test` 仍然会跳过该合同测试，只跑 deterministic 的 simulator runtime 集成测试。
 
 ## Simulator Agent ACP
 
@@ -158,9 +207,12 @@ ACP_RUNTIME_RUN_CLAUDE_CODE_TEST=1 pnpm test -- --run src/runtime/runtime-claude
 仓库现在内置了一个可独立运行的 ACP simulator agent：
 
 ```bash
+pnpm clean
 pnpm build
 pnpm simulator-agent-acp
 ```
+
+运行时生成物现在默认落在 `./.tmp/` 下，避免仓库根目录堆积临时状态。
 
 或者直接作为 bin 使用：
 
@@ -168,11 +220,11 @@ pnpm simulator-agent-acp
 simulator-agent-acp
 ```
 
-也可以直接跑最小 ACP client smoke example：
+也可以直接跑最小 ACP client demo：
 
 ```bash
 pnpm build
-pnpm smoke:client-sdk
+pnpm demo:client-sdk
 ```
 
 它会：
@@ -204,7 +256,7 @@ pnpm smoke:client-sdk
 
 最小接入示例见：
 
-- `src/examples/client-sdk-smoke.ts`
+- `examples/client-sdk-demo.ts`
 
 它基于 ACP 官方 SDK 的 `Agent` 接口实现，能被任意 ACP Client 直接通过 stdio 拉起。
 
@@ -368,7 +420,7 @@ Session title behavior:
 
 harness 会直接启动本地构建产物：
 
-- `node dist/simulator-agent/cli.js --auth-mode none --storage-dir .simulator-agent-acp-harness`
+- `node dist/simulator-agent/cli.js --auth-mode none --storage-dir .tmp/simulator-agent-acp-harness`
 
 典型用法：
 

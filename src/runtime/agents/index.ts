@@ -1,4 +1,15 @@
 export {
+  CODEX_ACP_COMMAND,
+  CODEX_ACP_PACKAGE,
+  CODEX_ACP_REGISTRY_ID,
+  createCodexAcpAgent,
+} from "./codex-acp.js";
+export type {
+  CodexAcpAgentOptions,
+  CodexAcpLaunchMode,
+} from "./codex-acp.js";
+
+export {
   CLAUDE_CODE_ACP_COMMAND,
   CLAUDE_CODE_ACP_PACKAGE,
   CLAUDE_CODE_ACP_REGISTRY_ID,
