@@ -2,6 +2,8 @@ import type {
   AuthenticateRequest,
   AuthenticateResponse,
   Client,
+  CloseSessionRequest,
+  CloseSessionResponse,
   InitializeRequest,
   InitializeResponse,
   ListSessionsRequest,
@@ -40,8 +42,10 @@ export type AcpConnection = {
   setSessionMode?(
     params: SetSessionModeRequest,
   ): Promise<SetSessionModeResponse | void>;
-  unstable_closeSession?(params: { sessionId: string }): Promise<unknown>;
-  unstable_resumeSession?(
+  closeSession?(
+    params: CloseSessionRequest,
+  ): Promise<CloseSessionResponse | void>;
+  resumeSession?(
     params: ResumeSessionRequest,
   ): Promise<ResumeSessionResponse>;
 };

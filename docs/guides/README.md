@@ -7,6 +7,7 @@ Language:
 ## SDK Guides
 
 - [Client Integration Guide](client-integration-guide.md)
+- [Runtime Agent Compatibility](runtime-agent-compatibility.md)
 - [Runtime SDK API](runtime-sdk-api.md)
 - [Runtime SDK Minimal Demo](runtime-sdk-minimal-demo.md)
 - [Runtime SDK Demo](runtime-sdk-demo.md)

@@ -905,7 +905,7 @@ async function executeStep(
         sessionId,
         payload: request,
       });
-      const response: ResumeSessionResponse = await context.connection.unstable_resumeSession(request);
+      const response: ResumeSessionResponse = await context.connection.resumeSession(request);
       context.state.sessionId = sessionId;
       context.state.availableModes = response.modes?.availableModes ?? undefined;
       context.state.currentModeId = response.modes?.currentModeId ?? undefined;

@@ -17,6 +17,14 @@ import type {
   AcpRuntimeAgentConfigOption,
   AcpRuntimeAgentMode,
   AcpRuntimeCreateOptions,
+  AcpRuntimeHistoryEntry,
+  AcpRuntimeOperation,
+  AcpRuntimeOperationBundle,
+  AcpRuntimeOperationBundleWatcher,
+  AcpRuntimeOperationWatcher,
+  AcpRuntimePermissionRequest,
+  AcpRuntimePermissionRequestWatcher,
+  AcpRuntimeProjectionWatcher,
   AcpRuntimeLoadOptions,
   AcpRuntimeListAgentSessionsOptions,
   AcpRuntimeSessionList,
@@ -26,7 +34,10 @@ import type {
   AcpRuntimeStreamOptions,
   AcpRuntimeResumeOptions,
   AcpRuntimePrompt,
+  AcpRuntimeReadModelWatcher,
   AcpRuntimeSnapshot,
+  AcpRuntimeToolCallWatcher,
+  AcpRuntimeThreadEntry,
   AcpRuntimeTurnEvent,
 } from "./core/types.js";
 
@@ -71,6 +82,7 @@ class SpySessionBackend implements AcpSessionDriver {
       authMethods: [
         {
           id: "oauth",
+          type: "agent",
           title: "OAuth",
         },
       ],
@@ -121,6 +133,182 @@ class SpySessionBackend implements AcpSessionDriver {
 
   listAgentModes(): readonly AcpRuntimeAgentMode[] {
     return this.metadata.agentModes ?? [];
+  }
+
+  drainHistoryEntries(): readonly AcpRuntimeHistoryEntry[] {
+    return [];
+  }
+
+  diffPaths() {
+    return [];
+  }
+
+  diff(_path: string) {
+    return undefined;
+  }
+
+  diffs() {
+    return [];
+  }
+
+  operation(_operationId: string): AcpRuntimeOperation | undefined {
+    return undefined;
+  }
+
+  operationBundle(_operationId: string): AcpRuntimeOperationBundle | undefined {
+    return undefined;
+  }
+
+  operationBundles() {
+    return [];
+  }
+
+  operationIds() {
+    return [];
+  }
+
+  operationPermissionRequests(_operationId: string) {
+    return [];
+  }
+
+  operations() {
+    return [];
+  }
+
+  permissionRequest(
+    _requestId: string,
+  ): AcpRuntimePermissionRequest | undefined {
+    return undefined;
+  }
+
+  permissionRequestIds() {
+    return [];
+  }
+
+  permissionRequests() {
+    return [];
+  }
+
+  projectionMetadata() {
+    return undefined;
+  }
+
+  projectionUsage() {
+    return undefined;
+  }
+
+  async killTerminal() {
+    return undefined;
+  }
+
+  terminal(_terminalId: string) {
+    return undefined;
+  }
+
+  terminals() {
+    return [];
+  }
+
+  toolCall(_toolCallId: string) {
+    return undefined;
+  }
+
+  toolCalls() {
+    return [];
+  }
+
+  toolCallBundles() {
+    return [];
+  }
+
+  toolCallBundle(_toolCallId: string) {
+    return undefined;
+  }
+
+  toolCallDiffs(_toolCallId: string) {
+    return [];
+  }
+
+  toolCallIds() {
+    return [];
+  }
+
+  toolCallTerminals(_toolCallId: string) {
+    return [];
+  }
+
+  terminalIds() {
+    return [];
+  }
+
+  watchReadModel(_watcher: AcpRuntimeReadModelWatcher) {
+    return () => {};
+  }
+
+  watchProjection(_watcher: AcpRuntimeProjectionWatcher) {
+    return () => {};
+  }
+
+  watchOperation(
+    _operationId: string,
+    _watcher: AcpRuntimeOperationWatcher,
+  ) {
+    return () => {};
+  }
+
+  watchOperationBundle(
+    _operationId: string,
+    _watcher: AcpRuntimeOperationBundleWatcher,
+  ) {
+    return () => {};
+  }
+
+  watchPermissionRequest(
+    _requestId: string,
+    _watcher: AcpRuntimePermissionRequestWatcher,
+  ) {
+    return () => {};
+  }
+
+  watchDiff(_path: string, _watcher: import("./core/types.js").AcpRuntimeDiffWatcher) {
+    return () => {};
+  }
+
+  watchTerminal(
+    _terminalId: string,
+    _watcher: import("./core/types.js").AcpRuntimeTerminalWatcher,
+  ) {
+    return () => {};
+  }
+
+  watchToolCallObjects(
+    _toolCallId: string,
+    _watcher: import("./core/types.js").AcpRuntimeToolObjectWatcher,
+  ) {
+    return () => {};
+  }
+
+  watchToolCall(
+    _toolCallId: string,
+    _watcher: AcpRuntimeToolCallWatcher,
+  ) {
+    return () => {};
+  }
+
+  async refreshTerminal() {
+    return undefined;
+  }
+
+  async releaseTerminal() {
+    return undefined;
+  }
+
+  threadEntries(): readonly AcpRuntimeThreadEntry[] {
+    return [];
+  }
+
+  async waitForTerminal() {
+    return undefined;
   }
 
   async setAgentConfigOption(
@@ -208,6 +396,7 @@ function createTestRuntime(
   sessionService: Partial<AcpSessionService>,
   options?: {
     agentResolver?: (agentId: string) => Promise<{ command: string; args?: string[]; env?: Record<string, string | undefined>; type?: string }>;
+    registry?: AcpRuntimeSessionRegistry;
   },
 ): AcpRuntime {
   return new AcpRuntime(
@@ -618,12 +807,28 @@ describe("AcpRuntime public SDK", () => {
   });
 
   it("forwards create, load, and resume options to the implementation", async () => {
-    const snapshot = createSnapshot();
+    const createSnapshotValue = createSnapshot({
+      session: { id: "session-create" },
+    });
+    const loadSnapshotValue = createSnapshot({
+      session: { id: "session-load" },
+    });
+    const resumeSnapshotValue = createSnapshot({
+      session: { id: "session-resume" },
+    });
     let createOptions: AcpRuntimeCreateOptions | undefined;
     let loadOptions: AcpRuntimeLoadOptions | undefined;
     let resumeOptions: AcpRuntimeResumeOptions | undefined;
 
-    const loadedBackend = new SpySessionBackend(snapshot, () => [
+    const createdBackend = new SpySessionBackend(createSnapshotValue, () => [
+      {
+        output: [{ text: "created", type: "text" }],
+        outputText: "created",
+        turnId: "turn-create",
+        type: "completed",
+      },
+    ]);
+    const loadedBackend = new SpySessionBackend(loadSnapshotValue, () => [
       {
         output: [{ text: "loaded", type: "text" }],
         outputText: "loaded",
@@ -631,7 +836,7 @@ describe("AcpRuntime public SDK", () => {
         type: "completed",
       },
     ]);
-    const resumedBackend = new SpySessionBackend(snapshot, () => [
+    const resumedBackend = new SpySessionBackend(resumeSnapshotValue, () => [
       {
         output: [{ text: "resumed", type: "text" }],
         outputText: "resumed",
@@ -643,7 +848,7 @@ describe("AcpRuntime public SDK", () => {
     const runtime = createTestRuntime({
       async create(options) {
         createOptions = options;
-        return loadedBackend;
+        return createdBackend;
       },
       async load(options) {
         loadOptions = options;
@@ -681,7 +886,7 @@ describe("AcpRuntime public SDK", () => {
     });
     await loadCall.send("loaded");
     const resumeCall = await runtime.resume({
-      snapshot,
+      snapshot: resumeSnapshotValue,
       handlers: {},
     });
     await resumeCall.send("resumed");
@@ -702,7 +907,7 @@ describe("AcpRuntime public SDK", () => {
       sessionId: "session-1",
     });
     expect(resumeOptions).toMatchObject({
-      snapshot,
+      snapshot: resumeSnapshotValue,
       handlers: {},
     });
   });
@@ -1042,5 +1247,220 @@ describe("AcpRuntime public SDK", () => {
       },
       currentModeId: "plan",
     });
+  });
+
+  it("exposes registry-backed stored session list/watch/delete/refresh through runtime", async () => {
+    const registry = new AcpRuntimeSessionRegistry();
+    await registry.rememberSnapshot(
+      createSnapshot({
+        session: {
+          id: "session-a",
+        },
+      }),
+      {
+        title: "Session A",
+      },
+    );
+    await registry.rememberSnapshot(
+      createSnapshot({
+        agent: {
+          command: "mock-agent",
+          type: "mock-agent",
+        },
+        session: {
+          id: "session-b",
+        },
+      }),
+      {
+        title: "Session B",
+      },
+    );
+
+    const runtime = createTestRuntime(
+      {
+        async listAgentSessions() {
+          return { sessions: [] };
+        },
+      },
+      { registry },
+    );
+
+    const updates: string[] = [];
+    const stopWatching = runtime.watchStoredSessions((update) => {
+      updates.push(update.type === "session_deleted" ? `${update.type}:${update.sessionId}` : update.type);
+    });
+
+    expect(await runtime.listStoredSessions()).toEqual({
+      nextCursor: undefined,
+      sessions: [
+        {
+          agentType: "mock-agent",
+          cwd: "/tmp/project",
+          id: "session-b",
+          title: "Session B",
+          updatedAt: expect.any(String),
+        },
+        {
+          agentType: "mock-agent",
+          cwd: "/tmp/project",
+          id: "session-a",
+          title: "Session A",
+          updatedAt: expect.any(String),
+        },
+      ],
+    });
+
+    expect(await runtime.deleteStoredSession("session-a")).toBe(true);
+    runtime.refreshStoredSessions();
+    stopWatching();
+
+    expect(await runtime.listStoredSessions()).toEqual({
+      nextCursor: undefined,
+      sessions: [
+        {
+          agentType: "mock-agent",
+          cwd: "/tmp/project",
+          id: "session-b",
+          title: "Session B",
+          updatedAt: expect.any(String),
+        },
+      ],
+    });
+    expect(updates).toEqual(["session_deleted:session-a", "refresh"]);
+  });
+
+  it("deduplicates concurrent load calls for the same session id", async () => {
+    const snapshot = createSnapshot();
+    const backend = new SpySessionBackend(snapshot, () => []);
+    let resolveLoad: ((driver: AcpSessionDriver) => void) | undefined;
+    let loadCalls = 0;
+
+    const runtime = createTestRuntime({
+      async load() {
+        loadCalls += 1;
+        return await new Promise<AcpSessionDriver>((resolve) => {
+          resolveLoad = resolve;
+        });
+      },
+    });
+
+    const firstPromise = runtime.load({
+      agent: { command: "mock-agent" },
+      cwd: "/tmp/project",
+      sessionId: "session-1",
+    });
+    const secondPromise = runtime.load({
+      agent: { command: "mock-agent" },
+      cwd: "/tmp/project",
+      sessionId: "session-1",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(loadCalls).toBe(1);
+    resolveLoad?.(backend);
+
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+    expect(first.metadata.id).toBe("session-1");
+    expect(second.metadata.id).toBe("session-1");
+
+    await first.close();
+    expect(backend.status).toBe("ready");
+    await second.close();
+    expect(backend.status).toBe("closed");
+  });
+
+  it("reuses an active loaded session and closes the driver only after the final handle closes", async () => {
+    const snapshot = createSnapshot();
+    const backend = new SpySessionBackend(snapshot, () => []);
+    let loadCalls = 0;
+
+    const runtime = createTestRuntime({
+      async load() {
+        loadCalls += 1;
+        return backend;
+      },
+    });
+
+    const first = await runtime.load({
+      agent: { command: "mock-agent" },
+      cwd: "/tmp/project",
+      sessionId: "session-1",
+    });
+    const second = await runtime.load({
+      agent: { command: "mock-agent" },
+      cwd: "/tmp/project",
+      sessionId: "session-1",
+    });
+
+    expect(loadCalls).toBe(1);
+
+    await first.close();
+    expect(first.status).toBe("closed");
+    expect(second.status).toBe("ready");
+    expect(backend.status).toBe("ready");
+
+    await second.close();
+    expect(backend.status).toBe("closed");
+  });
+
+  it("deduplicates concurrent resume calls for the same session id and shares the underlying driver", async () => {
+    const snapshot = createSnapshot();
+    const backend = new SpySessionBackend(snapshot, () => []);
+    let resolveResume: ((driver: AcpSessionDriver) => void) | undefined;
+    let resumeCalls = 0;
+
+    const runtime = createTestRuntime({
+      async resume() {
+        resumeCalls += 1;
+        return await new Promise<AcpSessionDriver>((resolve) => {
+          resolveResume = resolve;
+        });
+      },
+    });
+
+    const firstPromise = runtime.resume({ snapshot });
+    const secondPromise = runtime.resume({ snapshot });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(resumeCalls).toBe(1);
+    resolveResume?.(backend);
+
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+    await first.close();
+    expect(backend.status).toBe("ready");
+    await second.close();
+    expect(backend.status).toBe("closed");
+  });
+
+  it("exposes thread-first read models from the active session handle", async () => {
+    const snapshot = createSnapshot();
+    const backend = new SpySessionBackend(snapshot, () => []);
+
+    const runtime = createTestRuntime({
+      async create() {
+        return backend;
+      },
+    });
+
+    const session = await runtime.create({
+      agent: { command: "mock-agent" },
+      cwd: "/tmp/project",
+    });
+
+    expect(session.diffPaths()).toEqual([]);
+    expect(session.diff("/tmp/file.txt")).toBeUndefined();
+    expect(session.diffs()).toEqual([]);
+    expect(session.terminalIds()).toEqual([]);
+    expect(session.terminal("term-1")).toBeUndefined();
+    expect(session.terminals()).toEqual([]);
+    expect(session.toolCall("tool-1")).toBeUndefined();
+    expect(session.toolCallBundles()).toEqual([]);
+    expect(session.toolCallBundle("tool-1")).toBeUndefined();
+    expect(session.toolCallDiffs("tool-1")).toEqual([]);
+    expect(session.toolCallIds()).toEqual([]);
+    expect(session.toolCalls()).toEqual([]);
+    expect(session.toolCallTerminals("tool-1")).toEqual([]);
+    expect(session.threadEntries()).toEqual([]);
+    await session.close();
   });
 });

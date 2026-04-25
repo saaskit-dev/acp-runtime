@@ -3,11 +3,20 @@ import type {
   AcpRuntimeSessionList,
   AcpRuntimeSessionReference,
   AcpRuntimeSnapshot,
+  AcpRuntimeStoredSessionListUpdate,
+  AcpRuntimeStoredSessionWatcher,
 } from "../core/types.js";
 
 export type AcpRuntimeSessionRegistryState = {
-  sessions: readonly AcpRuntimeSnapshot[];
+  sessions: readonly AcpRuntimeSessionRegistryEntry[];
   version: 1;
+};
+
+export type AcpRuntimeSessionRegistryEntry = {
+  createdAt: string;
+  snapshot: AcpRuntimeSnapshot;
+  title?: string;
+  updatedAt: string;
 };
 
 export type AcpRuntimeSessionRegistryStore = {
@@ -18,7 +27,9 @@ export type AcpRuntimeSessionRegistryStore = {
 export class AcpRuntimeSessionRegistry {
   private hydrated = false;
   private persistQueue: Promise<void> = Promise.resolve();
-  private readonly sessions = new Map<string, AcpRuntimeSnapshot>();
+  private readonly sessions = new Map<string, AcpRuntimeSessionRegistryEntry>();
+  private readonly watchers = new Set<AcpRuntimeStoredSessionWatcher>();
+  private lastUpdatedAtMs = 0;
 
   constructor(
     private readonly options: {
@@ -27,8 +38,8 @@ export class AcpRuntimeSessionRegistry {
   ) {}
 
   getSnapshot(sessionId: string): AcpRuntimeSnapshot | undefined {
-    const snapshot = this.sessions.get(sessionId);
-    return snapshot ? this.cloneSnapshot(snapshot) : undefined;
+    const entry = this.sessions.get(sessionId);
+    return entry ? this.cloneSnapshot(entry.snapshot) : undefined;
   }
 
   async hydrate(): Promise<void> {
@@ -43,8 +54,12 @@ export class AcpRuntimeSessionRegistry {
     }
 
     this.sessions.clear();
-    for (const snapshot of state.sessions) {
-      this.sessions.set(snapshot.session.id, this.cloneSnapshot(snapshot));
+    for (const entry of state.sessions) {
+      this.sessions.set(entry.snapshot.session.id, this.cloneEntry(entry));
+      const updatedAtMs = Date.parse(entry.updatedAt);
+      if (Number.isFinite(updatedAtMs)) {
+        this.lastUpdatedAtMs = Math.max(this.lastUpdatedAtMs, updatedAtMs);
+      }
     }
   }
 
@@ -56,11 +71,16 @@ export class AcpRuntimeSessionRegistry {
       ? Number.parseInt(options.cursor, 10) || 0
       : 0;
     const filtered = [...this.sessions.values()]
-      .filter((snapshot) =>
-        options.agentType ? snapshot.agent.type === options.agentType : true,
+      .filter((entry) =>
+        options.agentType ? entry.snapshot.agent.type === options.agentType : true,
       )
-      .filter((snapshot) => (options.cwd ? snapshot.cwd === options.cwd : true))
-      .sort((left, right) => right.session.id.localeCompare(left.session.id));
+      .filter((entry) => (options.cwd ? entry.snapshot.cwd === options.cwd : true))
+      .sort((left, right) => {
+        const time = right.updatedAt.localeCompare(left.updatedAt);
+        return time !== 0
+          ? time
+          : right.snapshot.session.id.localeCompare(left.snapshot.session.id);
+      });
 
     const page = filtered.slice(startIndex, startIndex + limit);
     const nextCursor =
@@ -69,7 +89,7 @@ export class AcpRuntimeSessionRegistry {
         : undefined;
     return {
       nextCursor,
-      sessions: page.map((snapshot) => this.toSessionReference(snapshot)),
+      sessions: page.map((entry) => this.toSessionReference(entry)),
     };
   }
 
@@ -80,14 +100,95 @@ export class AcpRuntimeSessionRegistry {
     },
   ): Promise<AcpRuntimeSessionReference> {
     await this.hydrate();
-    this.sessions.set(snapshot.session.id, this.cloneSnapshot(snapshot));
+    const existing = this.sessions.get(snapshot.session.id);
+    const now = this.nextTimestamp(existing?.updatedAt);
+    const entry: AcpRuntimeSessionRegistryEntry = {
+      createdAt: existing?.createdAt ?? now,
+      snapshot: this.cloneSnapshot(snapshot),
+      title: metadata?.title ?? existing?.title,
+      updatedAt: now,
+    };
+    this.sessions.set(snapshot.session.id, entry);
     await this.persist();
-    return this.toSessionReference(snapshot, metadata);
+    const reference = this.toSessionReference(entry);
+    this.emit({
+      session: reference,
+      type: "session_saved",
+    });
+    return reference;
+  }
+
+  async deleteSession(sessionId: string): Promise<boolean> {
+    await this.hydrate();
+    const deleted = this.sessions.delete(sessionId);
+    if (!deleted) {
+      return false;
+    }
+    await this.persist();
+    this.emit({
+      sessionId,
+      type: "session_deleted",
+    });
+    return true;
+  }
+
+  async deleteSessions(options: AcpRuntimeRegistryListOptions = {}): Promise<number> {
+    await this.hydrate();
+    const matches = this.listSessions(options).sessions.map((session) => session.id);
+    if (matches.length === 0) {
+      return 0;
+    }
+
+    for (const sessionId of matches) {
+      this.sessions.delete(sessionId);
+    }
+    await this.persist();
+    for (const sessionId of matches) {
+      this.emit({
+        sessionId,
+        type: "session_deleted",
+      });
+    }
+    return matches.length;
+  }
+
+  notifyRefresh(): void {
+    this.emit({ type: "refresh" });
+  }
+
+  watch(watcher: AcpRuntimeStoredSessionWatcher): () => void {
+    this.watchers.add(watcher);
+    return () => {
+      this.watchers.delete(watcher);
+    };
+  }
+
+  private nextTimestamp(previous?: string): string {
+    const now = Date.now();
+    const previousMs = previous ? Date.parse(previous) : Number.NaN;
+    const floor = Math.max(
+      this.lastUpdatedAtMs,
+      Number.isFinite(previousMs) ? previousMs : 0,
+    );
+    const nextMs = floor >= now ? floor + 1 : now;
+    this.lastUpdatedAtMs = nextMs;
+    return new Date(nextMs).toISOString();
   }
 
   async save(): Promise<void> {
     await this.hydrate();
     await this.persist();
+  }
+
+  private cloneEntry(
+    entry: AcpRuntimeSessionRegistryEntry,
+  ): AcpRuntimeSessionRegistryEntry {
+    return {
+      createdAt: entry.createdAt,
+      snapshot: this.cloneSnapshot(entry.snapshot),
+      title: entry.title,
+      updatedAt: entry.updatedAt,
+    };
   }
 
   private cloneSnapshot(snapshot: AcpRuntimeSnapshot): AcpRuntimeSnapshot {
@@ -117,8 +218,8 @@ export class AcpRuntimeSessionRegistry {
       .then(
         () =>
           this.options.store?.save({
-            sessions: [...this.sessions.values()].map((snapshot) =>
-              this.cloneSnapshot(snapshot),
+            sessions: [...this.sessions.values()].map((entry) =>
+              this.cloneEntry(entry),
             ),
             version: 1,
           }) ?? Promise.resolve(),
@@ -127,16 +228,20 @@ export class AcpRuntimeSessionRegistry {
   }
 
   private toSessionReference(
-    snapshot: AcpRuntimeSnapshot,
-    metadata?: {
-      title?: string;
-    },
+    entry: AcpRuntimeSessionRegistryEntry,
   ): AcpRuntimeSessionReference {
     return {
-      agentType: snapshot.agent.type,
-      cwd: snapshot.cwd,
-      id: snapshot.session.id,
-      title: metadata?.title,
+      agentType: entry.snapshot.agent.type,
+      cwd: entry.snapshot.cwd,
+      id: entry.snapshot.session.id,
+      title: entry.title,
+      updatedAt: entry.updatedAt,
     };
+  }
+
+  private emit(update: AcpRuntimeStoredSessionListUpdate): void {
+    for (const watcher of this.watchers) {
+      watcher(update);
+    }
   }
 }

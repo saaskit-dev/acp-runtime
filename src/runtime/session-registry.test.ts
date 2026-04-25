@@ -89,12 +89,14 @@ describe("AcpRuntimeSessionRegistry persistence", () => {
         cwd: "/tmp/project-beta",
         id: "session-beta",
         title: undefined,
+        updatedAt: expect.any(String),
       },
       {
         agentType: "agent-alpha",
         cwd: "/tmp/project-alpha",
         id: "session-alpha",
         title: undefined,
+        updatedAt: expect.any(String),
       },
     ]);
   });
@@ -139,8 +141,9 @@ describe("AcpRuntimeSessionRegistry persistence", () => {
         {
           agentType: "agent-gamma",
           cwd: "/tmp/project-gamma",
-          id: "session-gamma-2",
+          id: "session-gamma-1",
           title: undefined,
+          updatedAt: expect.any(String),
         },
       ],
     });
@@ -152,10 +155,44 @@ describe("AcpRuntimeSessionRegistry persistence", () => {
         {
           agentType: "agent-gamma",
           cwd: "/tmp/project-gamma",
-          id: "session-gamma-1",
+          id: "session-gamma-2",
           title: undefined,
+          updatedAt: expect.any(String),
         },
       ],
     });
+  });
+
+  it("supports watch/delete/refresh on the host registry", async () => {
+    const registry = new AcpRuntimeSessionRegistry();
+    const updates: string[] = [];
+    const stop = registry.watch((update) => {
+      updates.push(
+        update.type === "session_saved"
+          ? `${update.type}:${update.session.id}`
+          : update.type === "session_deleted"
+            ? `${update.type}:${update.sessionId}`
+            : update.type,
+      );
+    });
+
+    await registry.rememberSnapshot(
+      createSnapshot({
+        agentType: "agent-delta",
+        cwd: "/tmp/project-delta",
+        sessionId: "session-delta",
+      }),
+      { title: "Delta" },
+    );
+    expect(await registry.deleteSession("session-delta")).toBe(true);
+    registry.notifyRefresh();
+    stop();
+
+    expect(updates).toEqual([
+      "session_saved:session-delta",
+      "session_deleted:session-delta",
+      "refresh",
+    ]);
+    expect(registry.listSessions().sessions).toEqual([]);
   });
 });

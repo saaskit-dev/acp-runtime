@@ -1,5 +1,4 @@
 import type {
-  AuthMethod,
   Implementation,
   InitializeResponse,
   SessionConfigOption,
@@ -8,11 +7,11 @@ import type {
 import type {
   AcpRuntimeAgentConfigOption,
   AcpRuntimeAgentMode,
-  AcpRuntimeAuthenticationMethod,
   AcpRuntimeCapabilities,
   AcpRuntimeConfigValue,
   AcpRuntimeSessionMetadata,
 } from "../core/types.js";
+import { mapRuntimeAuthMethods } from "./auth-methods.js";
 
 export function mapInitializeResponseToCapabilities(input: {
   handlers?: import("../core/types.js").AcpRuntimeAuthorityHandlers;
@@ -29,7 +28,9 @@ export function mapInitializeResponseToCapabilities(input: {
       sessionList: Boolean(agentCapabilities?.sessionCapabilities?.list),
     },
     agentInfo: mapImplementationInfo(input.response.agentInfo ?? undefined),
-    authMethods: mapAuthMethods(input.response.authMethods),
+    authMethods: mapRuntimeAuthMethods({
+      authMethods: input.response.authMethods ?? undefined,
+    }),
     client: {
       authentication: Boolean(input.handlers?.authentication),
       filesystem: input.handlers?.filesystem
@@ -80,16 +81,6 @@ function mapImplementationInfo(
     title: info.title ?? undefined,
     version: info.version ?? undefined,
   };
-}
-
-function mapAuthMethods(
-  methods: AuthMethod[] | undefined,
-): readonly AcpRuntimeAuthenticationMethod[] | undefined {
-  return methods?.map((method) => ({
-    description: method.description ?? undefined,
-    id: method.id,
-    title: method.name,
-  }));
 }
 
 export function extractRuntimeConfig(

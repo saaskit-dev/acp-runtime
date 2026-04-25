@@ -10,6 +10,17 @@ export type {
 } from "./codex-acp.js";
 
 export {
+  GEMINI_CLI_ACP_COMMAND,
+  GEMINI_CLI_ACP_PACKAGE,
+  GEMINI_CLI_ACP_REGISTRY_ID,
+  createGeminiCliAcpAgent,
+} from "./gemini-cli-acp.js";
+export type {
+  GeminiCliAcpAgentOptions,
+  GeminiCliAcpLaunchMode,
+} from "./gemini-cli-acp.js";
+
+export {
   CLAUDE_CODE_ACP_COMMAND,
   CLAUDE_CODE_ACP_PACKAGE,
   CLAUDE_CODE_ACP_REGISTRY_ID,

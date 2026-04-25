@@ -249,11 +249,11 @@ function wrapConnectionWithExit(
     setSessionMode: connection.setSessionMode
       ? (params) => withExit(connection.setSessionMode(params))
       : undefined,
-    unstable_closeSession: connection.unstable_closeSession
-      ? (params) => withExit(connection.unstable_closeSession(params))
+    closeSession: connection.closeSession
+      ? (params) => withExit(connection.closeSession(params))
       : undefined,
-    unstable_resumeSession: connection.unstable_resumeSession
-      ? (params) => withExit(connection.unstable_resumeSession(params))
+    resumeSession: connection.resumeSession
+      ? (params) => withExit(connection.resumeSession(params))
       : undefined,
   };
 }

@@ -17,6 +17,7 @@ import type {
   AcpConnectionFactory,
   AcpOptions,
 } from "./connection-types.js";
+import { mapInitializeResponseToCapabilities } from "./capability-mapper.js";
 import { mapMcpServersToAcp } from "./connection-types.js";
 import { AcpSdkSessionDriver } from "./driver.js";
 import { resolveAcpAgentProfile } from "./profiles/index.js";
@@ -130,6 +131,8 @@ export function createAcpSessionService(
         response,
         sessionId: input.sessionId,
       });
+      await bootstrap.bridge.waitForBufferedSessionUpdates();
+      driver.sealHistoryReplay();
       return driver;
     },
 
@@ -141,13 +144,13 @@ export function createAcpSessionService(
         cwd: input.snapshot.cwd,
         handlers: input.handlers,
       });
-      if (!bootstrap.connection.unstable_resumeSession) {
+      if (!bootstrap.connection.resumeSession) {
         throw new AcpProtocolError(
           "ACP agent does not support session/resume.",
         );
       }
 
-      const response = await bootstrap.connection.unstable_resumeSession({
+      const response = await bootstrap.connection.resumeSession({
         cwd: input.snapshot.cwd,
         mcpServers: mapMcpServersToAcp(input.snapshot.mcpServers ?? []),
         sessionId: input.snapshot.session.id,
@@ -194,6 +197,7 @@ async function bootstrapAcpSession(input: {
   handlers?: AcpRuntimeAuthorityHandlers;
 }) {
   const bridge = new AcpClientBridge(input.handlers);
+  const profile = resolveAcpAgentProfile(input.agent);
   const handle = await input.connectionFactory({
     agent: input.agent,
     client: bridge,
@@ -215,9 +219,20 @@ async function bootstrapAcpSession(input: {
     clientInfo: input.connectionOptions.clientInfo ?? DEFAULT_CLIENT_INFO,
     protocolVersion: PROTOCOL_VERSION,
   });
+  const normalizedInitializeResponse = {
+    ...initializeResponse,
+    authMethods: [
+      ...(
+        profile.normalizeInitializeAuthMethods?.({
+          agent: input.agent,
+          authMethods: initializeResponse.authMethods ?? undefined,
+        }) ?? initializeResponse.authMethods ?? []
+      ),
+    ],
+  };
 
   if (
-    initializeResponse.authMethods?.length &&
+    normalizedInitializeResponse.authMethods?.length &&
     input.handlers?.authentication
   ) {
     const selection = await input.handlers.authentication({
@@ -227,11 +242,10 @@ async function bootstrapAcpSession(input: {
         env: input.agent.env,
         type: input.agent.type,
       },
-      methods: initializeResponse.authMethods.map((method) => ({
-        description: method.description ?? undefined,
-        id: method.id,
-        title: method.name,
-      })),
+      methods: mapInitializeResponseToCapabilities({
+        handlers: input.handlers,
+        response: normalizedInitializeResponse,
+      }).authMethods ?? [],
     });
 
     if ("cancel" in selection) {
@@ -247,7 +261,7 @@ async function bootstrapAcpSession(input: {
     bridge,
     connection: handle.connection,
     dispose: handle.dispose,
-    initializeResponse,
+    initializeResponse: normalizedInitializeResponse,
   };
 }
 

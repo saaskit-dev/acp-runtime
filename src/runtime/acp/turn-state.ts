@@ -7,6 +7,7 @@ import type {
 } from "../core/types.js";
 
 export type AcpRuntimeTurnState = {
+  cancelRequested: boolean;
   deniedOperationIds: Set<string>;
   nextOperationId: number;
   nextPermissionId: number;
@@ -21,6 +22,7 @@ export type AcpRuntimeTurnState = {
 
 export function createTurnState(): AcpRuntimeTurnState {
   return {
+    cancelRequested: false,
     deniedOperationIds: new Set<string>(),
     nextOperationId: 1,
     nextPermissionId: 1,

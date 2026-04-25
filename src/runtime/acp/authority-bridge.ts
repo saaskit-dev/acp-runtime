@@ -23,6 +23,7 @@ import type { AcpRuntimeAuthorityHandlers } from "../core/types.js";
 
 export class AcpClientBridge implements Client {
   private bufferedUpdates: SessionNotification[] = [];
+  private bufferedUpdatesFlush: Promise<void> = Promise.resolve();
   private permissionHandler:
     | ((params: RequestPermissionRequest) => Promise<RequestPermissionResponse>)
     | undefined;
@@ -46,11 +47,15 @@ export class AcpClientBridge implements Client {
     this.sessionUpdateHandler = handler;
     const pending = this.bufferedUpdates;
     this.bufferedUpdates = [];
-    void (async () => {
+    this.bufferedUpdatesFlush = (async () => {
       for (const update of pending) {
         await handler(update);
       }
     })();
+  }
+
+  async waitForBufferedSessionUpdates(): Promise<void> {
+    await this.bufferedUpdatesFlush;
   }
 
   async requestPermission(

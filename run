@@ -11,7 +11,7 @@ shift
 case "$target" in
   runtime)
     if [[ $# -eq 0 ]]; then
-      echo 'usage: ./run runtime <agent-id> [--prompt TEXT] [--log-file PATH] [prompt...]' >&2
+      echo 'usage: ./run runtime <agent-id> [--sessions] [--load SESSION_ID] [--resume SESSION_ID] [--resume-last] [--resume-snapshot SNAPSHOT.json] [--prompt TEXT] [--log-file PATH] [prompt...]' >&2
       exit 2
     fi
 
@@ -19,9 +19,37 @@ case "$target" in
     shift
     prompt=""
     log_file="${ACP_RUNTIME_LOG_FILE:-}"
+    runtime_args=()
 
     while [[ $# -gt 0 ]]; do
       case "$1" in
+        --sessions)
+          runtime_args+=("$1")
+          ;;
+        --load=*)
+          runtime_args+=("$1")
+          ;;
+        --load)
+          shift
+          runtime_args+=("--load=${1:-}")
+          ;;
+        --resume=*)
+          runtime_args+=("$1")
+          ;;
+        --resume-last)
+          runtime_args+=("$1")
+          ;;
+        --resume)
+          shift
+          runtime_args+=("--resume=${1:-}")
+          ;;
+        --resume-snapshot=*)
+          runtime_args+=("$1")
+          ;;
+        --resume-snapshot)
+          shift
+          runtime_args+=("--resume-snapshot=${1:-}")
+          ;;
         --prompt=*)
           prompt="${1#--prompt=}"
           ;;
@@ -49,13 +77,25 @@ case "$target" in
 
     if [[ -n "$log_file" ]]; then
       export ACP_RUNTIME_LOG_FILE="$log_file"
+      runtime_args+=("--log-file=$log_file")
     fi
+
+    agent_id="$agent"
+    if [[ "$agent_id" == "claude" ]]; then
+      agent_id="claude-acp"
+    elif [[ "$agent_id" == "codex" ]]; then
+      agent_id="codex-acp"
+    elif [[ "$agent_id" == "simulator" ]]; then
+      agent_id="simulator-agent-acp-local"
+    fi
+
+    pnpm run build:self
 
     if [[ -n "$prompt" ]]; then
-      exec make runtime "$agent" PROMPT="$prompt"
+      exec node dist/examples/runtime-sdk-demo.js "$agent_id" "${runtime_args[@]}" "$prompt"
     fi
 
-    exec make runtime "$agent"
+    exec node dist/examples/runtime-sdk-demo.js "$agent_id" "${runtime_args[@]}"
     ;;
   *)
     exec make "$target" "$@"

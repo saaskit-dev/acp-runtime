@@ -1,10 +1,17 @@
-import type { ToolCallLocation, ToolKind } from "@agentclientprotocol/sdk";
+import type {
+  AuthMethod,
+  PromptResponse,
+  ToolCallLocation,
+  ToolKind,
+} from "@agentclientprotocol/sdk";
 
 import type {
   AcpRuntimeOperation,
   AcpRuntimeOperationKind,
   AcpRuntimeSessionMetadata,
 } from "../../core/types.js";
+import type { AcpRuntimeAgent } from "../../core/types.js";
+import type { AcpRuntimeTurnState } from "../turn-state.js";
 
 export type AcpAgentProfile = {
   inferDeniedOperationFamily(input: {
@@ -21,6 +28,17 @@ export type AcpAgentProfile = {
     rawInput: unknown;
   }): AcpRuntimeOperation["target"];
   mapOperationKind(kind: ToolKind | null | undefined): AcpRuntimeOperationKind;
+  // Profile-level compatibility policy for agents that omit or mis-shape
+  // initialize auth methods. This is a semantic fallback hook, not a host-side
+  // login execution strategy.
+  normalizeInitializeAuthMethods?(input: {
+    agent: AcpRuntimeAgent;
+    authMethods: readonly AuthMethod[] | undefined;
+  }): readonly AuthMethod[] | undefined;
+  normalizePromptError?(input: {
+    error: unknown;
+    turn: AcpRuntimeTurnState;
+  }): PromptResponse | undefined;
 };
 
 type AgentProfileOverrides = Partial<AcpAgentProfile>;
@@ -33,6 +51,10 @@ export function createAgentProfile(
       overrides.inferDeniedOperationFamily ?? inferDeniedOperationFamily,
     inferOperationTarget: overrides.inferOperationTarget ?? inferOperationTarget,
     mapOperationKind: overrides.mapOperationKind ?? mapOperationKind,
+    normalizeInitializeAuthMethods:
+      overrides.normalizeInitializeAuthMethods ?? normalizeInitializeAuthMethods,
+    normalizePromptError:
+      overrides.normalizePromptError ?? normalizePromptError,
   };
 }
 
@@ -108,6 +130,20 @@ function mapOperationKind(
     default:
       return "unknown";
   }
+}
+
+function normalizeInitializeAuthMethods(_input: {
+  agent: AcpRuntimeAgent;
+  authMethods: readonly AuthMethod[] | undefined;
+}): readonly AuthMethod[] | undefined {
+  return _input.authMethods;
+}
+
+function normalizePromptError(_input: {
+  error: unknown;
+  turn: AcpRuntimeTurnState;
+}): PromptResponse | undefined {
+  return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

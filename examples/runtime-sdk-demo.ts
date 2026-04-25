@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { cwd, stdin as input, stdout as output } from "node:process";
 import { dirname, join } from "node:path";
@@ -6,13 +6,23 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { createWriteStream } from "node:fs";
 
 import {
+  ACP_RUNTIME_SNAPSHOT_VERSION,
+  AcpProtocolError,
   AcpRuntime,
+  AcpRuntimeJsonSessionRegistryStore,
+  AcpRuntimeSessionRegistry,
   createStdioAcpConnectionFactory,
+  resolveRuntimeAgentFromRegistry,
+  type AcpRuntimeHistoryEntry,
+  type AcpRuntimeProjectionUpdate,
+  type AcpRuntimeSnapshot,
   type AcpRuntimeAuthorityHandlers,
   type AcpRuntimeOperation,
   type AcpRuntimePermissionRequest,
+  type AcpRuntimeThreadEntry,
   type AcpRuntimeTurnEvent,
 } from "@saaskit-dev/acp-runtime";
+import { promptForDemoAuthentication } from "./runtime-demo-auth-adapter.js";
 
 type TimelineRenderer = {
   flush(): void;
@@ -32,7 +42,12 @@ type RuntimeSmokeConfig = {
 type DemoCliOptions = {
   agentId: string;
   initialPrompt: string;
+  listSessions: boolean;
+  loadSessionId?: string;
   logFile?: string;
+  resumeLast: boolean;
+  resumeSessionId?: string;
+  resumeSnapshotPath?: string;
 };
 
 type LogSink = {
@@ -59,15 +74,43 @@ type StreamAccumulator = {
   type?: StreamChunkType;
 };
 
+type TurnEventProjectionInstruction =
+  | {
+      kind: "line";
+      label: string;
+      detail: string;
+    }
+  | {
+      kind: "skip";
+    }
+  | {
+      kind: "stream";
+      streamType: StreamChunkType;
+      text: string;
+    };
+
+type TurnProjection = {
+  bindTurn(turnId: string): void;
+  hasProjectedAssistantOutput(): boolean;
+  stop(): void;
+};
+
+type TurnEventProjection = {
+  nextTurn(): void;
+  project(event: AcpRuntimeTurnEvent): TurnEventProjectionInstruction;
+};
+
 const AGENT_ALIASES: Record<string, string> = {
   claude: "claude-acp",
   codex: "codex-acp",
+  gemini: "gemini",
   simulator: "simulator-agent-acp-local",
 };
 
 const LOCAL_COMMANDS = [
   "/help",
   "/snapshot",
+  "/snapshot-save",
   "/mode",
   "/config",
   "/slash",
@@ -89,9 +132,34 @@ function parseCliOptions(argv: string[]): DemoCliOptions {
   const rawAgent = argv[2];
   const agentId = resolveAgentId(rawAgent);
   const promptTokens: string[] = [];
+  let listSessions = false;
+  let loadSessionId: string | undefined;
   let logFile = process.env.ACP_RUNTIME_LOG_FILE?.trim() || undefined;
+  let resumeLast = false;
+  let resumeSessionId: string | undefined;
+  let resumeSnapshotPath: string | undefined;
 
   for (const token of argv.slice(rawAgent ? 3 : 2)) {
+    if (token === "--sessions") {
+      listSessions = true;
+      continue;
+    }
+    if (token.startsWith("--load=")) {
+      loadSessionId = token.slice("--load=".length) || undefined;
+      continue;
+    }
+    if (token.startsWith("--resume=")) {
+      resumeSessionId = token.slice("--resume=".length) || undefined;
+      continue;
+    }
+    if (token === "--resume-last") {
+      resumeLast = true;
+      continue;
+    }
+    if (token.startsWith("--resume-snapshot=")) {
+      resumeSnapshotPath = token.slice("--resume-snapshot=".length) || undefined;
+      continue;
+    }
     if (token.startsWith("--log-file=")) {
       logFile = token.slice("--log-file=".length) || undefined;
       continue;
@@ -106,8 +174,52 @@ function parseCliOptions(argv: string[]): DemoCliOptions {
   return {
     agentId,
     initialPrompt: promptTokens.join(" "),
+    listSessions,
+    loadSessionId,
     logFile,
+    resumeLast,
+    resumeSessionId,
+    resumeSnapshotPath,
   };
+}
+
+function formatSessionList(
+  sessions: readonly {
+    id: string;
+    cwd: string;
+    title?: string;
+    updatedAt?: string;
+    agentType?: string;
+  }[],
+): string {
+  if (sessions.length === 0) {
+    return "[runtime] no agent sessions";
+  }
+
+  return sessions
+    .map((session, index) =>
+      [
+        `${index + 1}. ${session.id}`,
+        `   cwd=${session.cwd}`,
+        `   title=${session.title ?? "<none>"}`,
+        `   updatedAt=${session.updatedAt ?? "<none>"}`,
+        `   agentType=${session.agentType ?? "<none>"}`,
+      ].join("\n"),
+    )
+    .join("\n");
+}
+
+function renderHistoryEntries(
+  entries: readonly AcpRuntimeHistoryEntry[],
+  renderer: TimelineRenderer,
+): void {
+  for (const entry of entries) {
+    if (entry.type === "user") {
+      renderer.writeLine("user", entry.text);
+      continue;
+    }
+    renderer.writeEvent(entry);
+  }
 }
 
 async function configureLogFile(logFile: string | undefined): Promise<LogSink> {
@@ -249,7 +361,6 @@ function completeLocalCommand(
     const matches = values.filter((value) => value.startsWith(current));
     return [matches.length > 0 ? matches : values, current];
   }
-
   if (parts[0] === "/slash") {
     const commands =
       session?.metadata.availableCommands?.map((command) => command.name) ?? [];
@@ -416,6 +527,75 @@ function summarizeOperationResult(operation: AcpRuntimeOperation): string[] {
 function formatOperationHeader(operation: AcpRuntimeOperation): string {
   const title = shortenForTerminal(operation.title, 110);
   return `${operation.kind} | ${title}`;
+}
+
+function describeOperationKind(kind: AcpRuntimeOperation["kind"]): string {
+  switch (kind) {
+    case "execute_command":
+      return "命令";
+    case "read_file":
+      return "读取文件";
+    case "write_file":
+      return "写入文件";
+    case "document_edit":
+      return "编辑文档";
+    case "mcp_call":
+      return "工具调用";
+    case "network_request":
+      return "网络请求";
+    default:
+      return "操作";
+  }
+}
+
+function summarizeOperationSubject(operation: AcpRuntimeOperation): string {
+  if (operation.target?.value) {
+    return shortenForTerminal(operation.target.value, 96);
+  }
+  if (operation.summary) {
+    return shortenForTerminal(operation.summary, 96);
+  }
+  return shortenForTerminal(operation.title, 96);
+}
+
+function summarizeOperationInlineResult(
+  operation: AcpRuntimeOperation,
+): string | undefined {
+  const first = summarizeOperationResult(operation)[0];
+  if (!first) {
+    return undefined;
+  }
+  return shortenForTerminal(first.replace(/^[a-z.]+=/, ""), 96);
+}
+
+function formatOperationInline(
+  operation: AcpRuntimeOperation,
+  lifecycle: "completed" | "failed" | "started" | "updated",
+  errorMessage?: string,
+): string {
+  const kind = describeOperationKind(operation.kind);
+  const subject = summarizeOperationSubject(operation);
+  const result = summarizeOperationInlineResult(operation);
+
+  if (lifecycle === "started") {
+    return `${kind}: ${subject}`;
+  }
+
+  if (lifecycle === "updated") {
+    if (operation.phase === "awaiting_permission") {
+      return `等待权限 ${kind}: ${subject}`;
+    }
+    if (operation.phase === "proposed") {
+      return `准备 ${kind}: ${subject}`;
+    }
+    return `进行中 ${kind}: ${subject}`;
+  }
+
+  if (lifecycle === "completed") {
+    return result ? `${kind}完成: ${result}` : `${kind}完成: ${subject}`;
+  }
+
+  return `${kind}失败: ${errorMessage ? shortenForTerminal(errorMessage, 96) : subject}`;
 }
 
 function formatOperationDetail(operation: AcpRuntimeOperation): string {
@@ -606,19 +786,19 @@ function formatEventDetail(event: AcpRuntimeTurnEvent): string {
     case "usage_updated":
       return JSON.stringify(event.usage);
     case "permission_requested":
-      return `${event.request.kind} | ${event.request.title}`;
+      return `需要权限(${event.request.kind}): ${shortenForTerminal(event.request.title, 96)}`;
     case "permission_resolved":
-      return `${event.decision} | ${event.request.title}`;
+      return `权限${event.decision === "allowed" ? "已允许" : "已拒绝"}(${event.request.kind}): ${shortenForTerminal(event.request.title, 96)}`;
     case "plan_updated":
       return JSON.stringify(event.plan);
     case "operation_started":
-      return formatOperationDetail(event.operation);
+      return formatOperationInline(event.operation, "started");
     case "operation_updated":
-      return formatOperationDetail(event.operation);
+      return formatOperationInline(event.operation, "updated");
     case "operation_completed":
-      return formatOperationDetail(event.operation);
+      return formatOperationInline(event.operation, "completed");
     case "operation_failed":
-      return `${formatOperationDetail(event.operation)}\nerror=${event.error.message}`;
+      return formatOperationInline(event.operation, "failed", event.error.message);
     case "failed":
       return event.error.message;
     case "completed":
@@ -648,8 +828,7 @@ function createTimelineRenderer(logSink: LogSink, outputGate: OutputGate): Timel
   let turnNumber = 0;
   let turnStartedAt = Date.now();
   const stream: StreamAccumulator = { buffer: "" };
-  const operationDetails = new Map<string, string>();
-  let lastMetadataSummary: string | undefined;
+  const eventProjection = createTurnEventProjection();
 
   function writeLine(label: string, detail: string): void {
     const clock = formatClock(new Date());
@@ -697,8 +876,7 @@ function createTimelineRenderer(logSink: LogSink, outputGate: OutputGate): Timel
       flushStream();
       turnNumber += 1;
       turnStartedAt = Date.now();
-      operationDetails.clear();
-      lastMetadataSummary = undefined;
+      eventProjection.nextTurn();
       logSink.writeJson({
         prompt,
         recordType: "turn_prompt",
@@ -716,29 +894,69 @@ function createTimelineRenderer(logSink: LogSink, outputGate: OutputGate): Timel
         timestamp: new Date().toISOString(),
       });
 
-      if (event.type === "thinking" || event.type === "text") {
-        const type = event.type;
+      const instruction = eventProjection.project(event);
+      if (instruction.kind === "stream") {
+        const type = instruction.streamType;
         if (stream.type && stream.type !== type) {
           flushStream();
         }
         stream.type = type;
-        stream.buffer += event.text;
-        if (shouldFlushStream(type, event.text)) {
+        stream.buffer += instruction.text;
+        if (shouldFlushStream(type, instruction.text)) {
           flushStream();
         }
         return;
       }
 
       flushStream();
-
-      if (event.type === "metadata_updated") {
-        const summary = formatEventDetail(event);
-        if (summary === lastMetadataSummary) {
-          return;
-        }
-        lastMetadataSummary = summary;
-        writeLine(event.type, summary);
+      if (instruction.kind === "skip") {
         return;
+      }
+      writeLine(instruction.label, instruction.detail);
+    },
+    writeLine,
+  };
+}
+
+function createTurnEventProjection(): TurnEventProjection {
+  const operationDetails = new Map<string, string>();
+  let sawAssistantText = false;
+
+  return {
+    nextTurn(): void {
+      operationDetails.clear();
+      sawAssistantText = false;
+    },
+    project(event): TurnEventProjectionInstruction {
+      if (event.type === "thinking") {
+        return { kind: "skip" };
+      }
+
+      if (event.type === "text") {
+        sawAssistantText = true;
+        return {
+          kind: "stream",
+          streamType: "text",
+          text: event.text,
+        };
+      }
+
+      if (
+        event.type === "queued" ||
+        event.type === "started" ||
+        event.type === "metadata_updated" ||
+        event.type === "usage_updated"
+      ) {
+        return { kind: "skip" };
+      }
+
+      if (
+        event.type === "completed" &&
+        sawAssistantText &&
+        typeof event.outputText === "string" &&
+        event.outputText.length > 0
+      ) {
+        return { kind: "skip" };
       }
 
       if (
@@ -754,25 +972,208 @@ function createTimelineRenderer(logSink: LogSink, outputGate: OutputGate): Timel
         const previous = operationDetails.get(event.operation.id);
 
         if (event.type === "operation_updated" && previous === detail) {
-          return;
+          return { kind: "skip" };
         }
 
         operationDetails.set(event.operation.id, detail);
-        writeLine(event.type, detail);
-
         if (
           event.type === "operation_completed" ||
           event.type === "operation_failed"
         ) {
           operationDetails.delete(event.operation.id);
         }
-        return;
+        return {
+          detail,
+          kind: "line",
+          label: "tool",
+        };
       }
 
-      writeLine(event.type, formatEventDetail(event));
+      if (
+        event.type === "permission_requested" ||
+        event.type === "permission_resolved"
+      ) {
+        return {
+          detail: formatEventDetail(event),
+          kind: "line",
+          label: "permission",
+        };
+      }
+
+      return {
+        detail: formatEventDetail(event),
+        kind: "line",
+        label: event.type,
+      };
     },
-    writeLine,
   };
+}
+
+function projectionUpdateToTurnEvent(
+  update: AcpRuntimeProjectionUpdate,
+): AcpRuntimeTurnEvent {
+  switch (update.type) {
+    case "metadata_projection_updated":
+      return {
+        metadata: update.metadata,
+        turnId: update.turnId,
+        type: "metadata_updated",
+      };
+    case "usage_projection_updated":
+      return {
+        turnId: update.turnId,
+        type: "usage_updated",
+        usage: update.usage,
+      };
+    case "operation_projection_updated":
+      if (update.lifecycle === "started") {
+        return {
+          operation: update.operation,
+          turnId: update.turnId,
+          type: "operation_started",
+        };
+      }
+      if (update.lifecycle === "updated") {
+        return {
+          operation: update.operation,
+          turnId: update.turnId,
+          type: "operation_updated",
+        };
+      }
+      if (update.lifecycle === "completed") {
+        return {
+          operation: update.operation,
+          turnId: update.turnId,
+          type: "operation_completed",
+        };
+      }
+      return {
+        error: new AcpProtocolError(update.errorMessage ?? "Operation failed."),
+        operation: update.operation,
+        turnId: update.turnId,
+        type: "operation_failed",
+      };
+    case "permission_projection_updated":
+      if (update.lifecycle === "requested") {
+        return {
+          operation: update.operation,
+          request: update.request,
+          turnId: update.turnId,
+          type: "permission_requested",
+        };
+      }
+      return {
+        decision: update.decision ?? "denied",
+        operation: update.operation,
+        request: update.request,
+        turnId: update.turnId,
+        type: "permission_resolved",
+      };
+  }
+}
+
+function createTurnProjection(
+  session: Awaited<ReturnType<AcpRuntime["createFromRegistry"]>>,
+  renderer: TimelineRenderer,
+): TurnProjection {
+  let activeTurnId: string | undefined;
+  let projectedAssistantOutput = false;
+  const seen = new Map<
+    string,
+    {
+      planSignature?: string;
+      textLength?: number;
+    }
+  >();
+
+  const stopWatching = session.watchReadModel((update) => {
+    if (
+      update.type !== "thread_entry_added" &&
+      update.type !== "thread_entry_updated"
+    ) {
+      return;
+    }
+
+    const entry = update.entry;
+    if (!entryHasTurnId(entry) || entry.turnId !== activeTurnId) {
+      return;
+    }
+
+    const previous = seen.get(entry.id);
+
+    if (entry.kind === "assistant_message") {
+      const previousLength = previous?.textLength ?? 0;
+      const delta = entry.text.slice(previousLength);
+      if (delta.length > 0) {
+        projectedAssistantOutput = true;
+        renderer.writeEvent({
+          text: delta,
+          turnId: entry.turnId,
+          type: "text",
+        });
+      }
+      seen.set(entry.id, {
+        textLength: entry.text.length,
+      });
+      return;
+    }
+
+    if (entry.kind === "assistant_thought") {
+      const previousLength = previous?.textLength ?? 0;
+      const delta = entry.text.slice(previousLength);
+      if (delta.length > 0) {
+        renderer.writeEvent({
+          text: delta,
+          turnId: entry.turnId,
+          type: "thinking",
+        });
+      }
+      seen.set(entry.id, {
+        textLength: entry.text.length,
+      });
+      return;
+    }
+
+    if (entry.kind === "plan") {
+      const signature = JSON.stringify(entry.plan);
+      if (previous?.planSignature !== signature) {
+        renderer.writeEvent({
+          plan: entry.plan,
+          turnId: entry.turnId,
+          type: "plan_updated",
+        });
+      }
+      seen.set(entry.id, {
+        planSignature: signature,
+      });
+    }
+  });
+
+  const stopWatchingProjection = session.watchProjection((update) => {
+    if (update.turnId !== activeTurnId) {
+      return;
+    }
+    renderer.writeEvent(projectionUpdateToTurnEvent(update));
+  });
+
+  return {
+    bindTurn(turnId: string): void {
+      activeTurnId = turnId;
+    },
+    hasProjectedAssistantOutput(): boolean {
+      return projectedAssistantOutput;
+    },
+    stop(): void {
+      stopWatching();
+      stopWatchingProjection();
+    },
+  };
+}
+
+function entryHasTurnId(
+  entry: AcpRuntimeThreadEntry,
+): entry is Exclude<Readonly<AcpRuntimeThreadEntry>, { kind: "user_message" }> {
+  return entry.kind !== "user_message";
 }
 
 async function promptForPermission(
@@ -862,15 +1263,52 @@ async function runTurn(
   renderer: TimelineRenderer,
 ): Promise<void> {
   renderer.nextTurn(prompt);
+  const projection = createTurnProjection(session, renderer);
 
-  for await (const event of session.stream(prompt)) {
-    renderer.writeEvent(event);
-    if (event.type === "failed") {
-      renderer.flush();
-      return;
+  try {
+    for await (const event of session.stream(prompt)) {
+      if (event.type === "started") {
+        projection.bindTurn(event.turnId);
+        renderer.writeEvent(event);
+        continue;
+      }
+
+      if (
+        event.type === "thinking" ||
+        event.type === "text" ||
+        event.type === "plan_updated" ||
+        event.type === "operation_started" ||
+        event.type === "operation_updated" ||
+        event.type === "operation_completed" ||
+        event.type === "operation_failed" ||
+        event.type === "permission_requested" ||
+        event.type === "permission_resolved" ||
+        event.type === "metadata_updated" ||
+        event.type === "usage_updated"
+      ) {
+        continue;
+      }
+
+      if (
+        event.type === "completed" &&
+        projection.hasProjectedAssistantOutput() &&
+        typeof event.outputText === "string" &&
+        event.outputText.length > 0
+      ) {
+        renderer.flush();
+        continue;
+      }
+
+      renderer.writeEvent(event);
+      if (event.type === "failed") {
+        renderer.flush();
+        return;
+      }
     }
+    renderer.flush();
+  } finally {
+    projection.stop();
   }
-  renderer.flush();
 }
 
 async function runRepl(
@@ -883,7 +1321,9 @@ async function runRepl(
 ): Promise<void> {
   console.log("");
   console.log(`Interactive runtime smoke ready for ${label}.`);
-  console.log("Commands: /help, /snapshot, /mode, /config, /slash, /exit");
+  console.log(
+    "Commands: /help, /snapshot, /snapshot-save, /mode, /config, /slash, /exit",
+  );
 
   while (true) {
     if (exitSignal.requested) {
@@ -914,10 +1354,11 @@ async function runRepl(
 
     if (prompt === "/help") {
       console.log(
-        "Use plain text for agent prompts. Local commands: /help, /snapshot, /mode, /config, /slash, /exit",
+        "Use plain text for agent prompts. Local commands: /help, /snapshot, /snapshot-save, /mode, /config, /slash, /exit",
       );
       console.log("  /mode                  Show available modes");
       console.log("  /mode <id>             Switch current mode");
+      console.log("  /snapshot-save <path>  Save the current runtime snapshot");
       console.log("  /config                Show config options");
       console.log("  /config <id>           Show one config option");
       console.log("  /config <id> <value>   Set one config option");
@@ -930,6 +1371,25 @@ async function runRepl(
 
     if (prompt === "/snapshot") {
       console.log(JSON.stringify(session.snapshot(), null, 2));
+      continue;
+    }
+
+    if (prompt.startsWith("/snapshot-save ")) {
+      const filePath = prompt.slice("/snapshot-save ".length).trim();
+      if (!filePath) {
+        console.log("usage: /snapshot-save <path>");
+        continue;
+      }
+      const snapshot = session.snapshot();
+      await mkdir(dirname(filePath), { recursive: true });
+      await writeFile(filePath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+      logSink.writeJson({
+        filePath,
+        recordType: "local_command",
+        subcommand: "snapshot_save",
+        timestamp: new Date().toISOString(),
+      });
+      console.log(`[runtime] snapshot saved: ${filePath}`);
       continue;
     }
 
@@ -1097,11 +1557,18 @@ async function createRuntimeSmokeConfig(
 
 async function main(): Promise<void> {
   const options = parseCliOptions(process.argv);
-  const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
   const logSink = await configureLogFile(options.logFile);
   const outputGate = createOutputGate();
   const renderer = createTimelineRenderer(logSink, outputGate);
   const config = await createRuntimeSmokeConfig(options.agentId);
+  const registry = new AcpRuntimeSessionRegistry({
+    store: new AcpRuntimeJsonSessionRegistryStore(
+      join(config.cwd, ".tmp", "runtime-session-registry.json"),
+    ),
+  });
+  const runtime = new AcpRuntime(createStdioAcpConnectionFactory(), {
+    registry,
+  });
   const exitSignal: ExitSignal = { requested: false };
   let session:
     | Awaited<ReturnType<AcpRuntime["createFromRegistry"]>>
@@ -1114,28 +1581,125 @@ async function main(): Promise<void> {
     },
   });
 
-  session = await runtime.createFromRegistry({
-    agentId: config.agentId,
-    cwd: config.cwd,
-    handlers: {
-      ...config.handlers,
-      permission(request) {
-        logSink.writeJson({
-          recordType: "permission_request",
-          request,
-          timestamp: new Date().toISOString(),
-        });
-        return promptForPermission(
-          rl,
-          renderer,
-          logSink,
-          exitSignal,
-          outputGate,
-          request,
-        );
+  if (options.listSessions) {
+    const result = await runtime.listAgentSessionsFromRegistry({
+      agentId: config.agentId,
+      cwd: config.cwd,
+      handlers: config.handlers,
+    });
+    console.log(formatSessionList(result.sessions));
+    await config.cleanup();
+    await logSink.close();
+    rl.close();
+    return;
+  }
+
+  const createPermissionHandler = () => (request: AcpRuntimePermissionRequest) => {
+    logSink.writeJson({
+      recordType: "permission_request",
+      request,
+      timestamp: new Date().toISOString(),
+    });
+    return promptForPermission(
+      rl,
+      renderer,
+      logSink,
+      exitSignal,
+      outputGate,
+      request,
+    );
+  };
+
+  const createAuthenticationHandler = () => (
+    request: Parameters<NonNullable<AcpRuntimeAuthorityHandlers["authentication"]>>[0],
+  ) =>
+    promptForDemoAuthentication({
+      logSink,
+      outputGate,
+      renderer,
+      request,
+      rl,
+    });
+
+  if (options.resumeSnapshotPath) {
+    const snapshot = JSON.parse(
+      await readFile(options.resumeSnapshotPath, "utf8"),
+    ) as AcpRuntimeSnapshot;
+    session = await runtime.resume({
+      handlers: {
+        authentication: createAuthenticationHandler(),
+        ...config.handlers,
+        permission: createPermissionHandler(),
       },
-    },
-  });
+      snapshot,
+    });
+  } else if (options.resumeLast) {
+    const latest = await registry.listSessions({
+      agentType: config.agentId,
+      cwd: config.cwd,
+      limit: 1,
+    });
+    const latestSessionId = latest.sessions[0]?.id;
+    if (!latestSessionId) {
+      throw new Error(
+        `[runtime] no locally persisted sessions found for ${config.agentId} in ${config.cwd}`,
+      );
+    }
+    const snapshot = registry.getSnapshot(latestSessionId);
+    if (!snapshot) {
+      throw new Error(
+        `[runtime] local snapshot missing for session ${latestSessionId}`,
+      );
+    }
+    session = await runtime.resume({
+      handlers: {
+        authentication: createAuthenticationHandler(),
+        ...config.handlers,
+        permission: createPermissionHandler(),
+      },
+      snapshot,
+    });
+  } else if (options.resumeSessionId) {
+    const snapshot =
+      registry.getSnapshot(options.resumeSessionId) ??
+      ({
+        agent: await resolveRuntimeAgentFromRegistry(config.agentId),
+        cwd: config.cwd,
+        session: {
+          id: options.resumeSessionId,
+        },
+        version: ACP_RUNTIME_SNAPSHOT_VERSION,
+      } satisfies AcpRuntimeSnapshot);
+    session = await runtime.resume({
+      handlers: {
+        authentication: createAuthenticationHandler(),
+        ...config.handlers,
+        permission: createPermissionHandler(),
+      },
+      snapshot,
+    });
+  } else if (options.loadSessionId) {
+    session = await runtime.loadFromRegistry({
+      agentId: config.agentId,
+      cwd: config.cwd,
+      handlers: {
+        authentication: createAuthenticationHandler(),
+        ...config.handlers,
+        permission: createPermissionHandler(),
+      },
+      sessionId: options.loadSessionId,
+    });
+  } else {
+    session = await runtime.createFromRegistry({
+      agentId: config.agentId,
+      cwd: config.cwd,
+      handlers: {
+        authentication: createAuthenticationHandler(),
+        ...config.handlers,
+        permission: createPermissionHandler(),
+      },
+    });
+  }
 
   logSink.writeJson({
     agentId: config.agentId,
@@ -1156,6 +1720,20 @@ async function main(): Promise<void> {
     `[runtime] agentType: ${session.snapshot().agent.type ?? "<none>"}`,
   );
   console.log(`[runtime] cwd: ${config.cwd}`);
+  if (process.platform === "win32" && config.agentId === "codex-acp") {
+    console.log(
+      "[runtime] warning: Codex on Windows works best under WSL2.",
+    );
+  }
+
+  if (options.loadSessionId) {
+    const historyEntries = session.drainHistoryEntries();
+    if (historyEntries.length > 0) {
+      console.log("");
+      console.log("[runtime] loaded history replay");
+      renderHistoryEntries(historyEntries, renderer);
+    }
+  }
 
   try {
     if (options.initialPrompt) {

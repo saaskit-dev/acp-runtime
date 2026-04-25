@@ -186,10 +186,54 @@ export type AcpRuntimePermissionHandler = (
   request: AcpRuntimePermissionRequest,
 ) => Promise<AcpRuntimePermissionDecision> | AcpRuntimePermissionDecision;
 
-export type AcpRuntimeAuthenticationMethod = {
+export type AcpRuntimeAuthenticationMethodMeta = Readonly<
+  Record<string, unknown>
+>;
+
+export type AcpRuntimeAuthenticationMethodBase = {
   description?: string;
   id: string;
+  meta?: AcpRuntimeAuthenticationMethodMeta;
   title: string;
+};
+
+export type AcpRuntimeAuthenticationEnvVar = {
+  label?: string;
+  name: string;
+  optional?: boolean;
+  secret?: boolean;
+};
+
+export type AcpRuntimeAgentAuthenticationMethod =
+  AcpRuntimeAuthenticationMethodBase & {
+    type: "agent";
+  };
+
+export type AcpRuntimeEnvVarAuthenticationMethod =
+  AcpRuntimeAuthenticationMethodBase & {
+    link?: string;
+    type: "env_var";
+    vars: readonly AcpRuntimeAuthenticationEnvVar[];
+  };
+
+export type AcpRuntimeTerminalAuthenticationMethod =
+  AcpRuntimeAuthenticationMethodBase & {
+    args?: readonly string[];
+    env?: Readonly<Record<string, string>>;
+    type: "terminal";
+  };
+
+export type AcpRuntimeAuthenticationMethod =
+  | AcpRuntimeAgentAuthenticationMethod
+  | AcpRuntimeEnvVarAuthenticationMethod
+  | AcpRuntimeTerminalAuthenticationMethod;
+
+export type AcpRuntimeTerminalAuthenticationRequest = {
+  args: readonly string[];
+  command: string;
+  env?: Readonly<Record<string, string>>;
+  label: string;
+  methodId: string;
 };
 
 export type AcpRuntimeAgentInfo = {
@@ -315,6 +359,125 @@ export type AcpRuntimeUsage = {
   totalTokens?: number;
 };
 
+export type AcpRuntimeHistoryEntry =
+  | {
+      text: string;
+      type: "user";
+    }
+  | AcpRuntimeTurnEvent;
+
+export type AcpRuntimeThreadEntry =
+  | {
+      id: string;
+      kind: "assistant_message";
+      output?: readonly AcpRuntimeOutputPart[];
+      status: "completed" | "failed" | "streaming";
+      text: string;
+      turnId: string;
+    }
+  | {
+      id: string;
+      kind: "assistant_thought";
+      status: "completed" | "failed" | "streaming";
+      text: string;
+      turnId: string;
+    }
+  | {
+      id: string;
+      kind: "plan";
+      plan: readonly AcpRuntimePlanItem[];
+      turnId: string;
+    }
+  | {
+      content: readonly AcpRuntimeThreadToolContent[];
+      id: string;
+      kind: "tool_call";
+      locations?: readonly AcpRuntimeThreadToolLocation[];
+      rawInput?: unknown;
+      rawOutput?: unknown;
+      status: "completed" | "failed" | "in_progress" | "pending";
+      title: string;
+      toolCallId: string;
+      toolKind?: string;
+      turnId: string;
+    }
+  | {
+      id: string;
+      kind: "user_message";
+      text: string;
+      turnId?: string;
+    };
+
+export type AcpRuntimeToolCallSnapshot = Extract<
+  AcpRuntimeThreadEntry,
+  { kind: "tool_call" }
+>;
+
+export type AcpRuntimeThreadToolLocation = {
+  line?: number;
+  path: string;
+};
+
+export type AcpRuntimeDiffSnapshot = {
+  changeType: "update" | "write";
+  createdAt: string;
+  newLineCount: number;
+  newText: string;
+  oldLineCount?: number;
+  oldText?: string;
+  path: string;
+  revision: number;
+  toolCallId?: string;
+  updatedAt: string;
+};
+
+export type AcpRuntimeTerminalSnapshot = {
+  completedAt?: string;
+  command?: string;
+  createdAt: string;
+  cwd?: string;
+  exitCode?: number | null;
+  outputLength?: number;
+  outputLineCount?: number;
+  output?: string;
+  releasedAt?: string;
+  revision: number;
+  status: "completed" | "running" | "unknown";
+  stopRequestedAt?: string;
+  terminalId: string;
+  toolCallId?: string;
+  truncated?: boolean;
+  updatedAt: string;
+};
+
+export type AcpRuntimeThreadToolContent =
+  | {
+      changeType: "update" | "write";
+      id: string;
+      kind: "diff";
+      newText: string;
+      oldText?: string;
+      path: string;
+    }
+  | {
+      id: string;
+      kind: "content";
+      label?: string;
+      part?: AcpRuntimeOutputPart;
+      text?: string;
+    }
+  | {
+      command?: string;
+      cwd?: string;
+      exitCode?: number | null;
+      id: string;
+      kind: "terminal";
+      output?: string;
+      status: "completed" | "running" | "unknown";
+      truncated?: boolean;
+      terminalId: string;
+    };
+
 export type AcpRuntimeDiagnostics = {
   lastError?: {
     code: string;
@@ -342,6 +505,139 @@ export type AcpRuntimeRegistryListOptions = {
   cwd?: string;
   limit?: number;
 };
+
+export type AcpRuntimeStoredSessionDeletedUpdate = {
+  sessionId: string;
+  type: "session_deleted";
+};
+
+export type AcpRuntimeStoredSessionRefreshUpdate = {
+  type: "refresh";
+};
+
+export type AcpRuntimeStoredSessionSavedUpdate = {
+  session: AcpRuntimeSessionReference;
+  type: "session_saved";
+};
+
+export type AcpRuntimeStoredSessionListUpdate =
+  | AcpRuntimeStoredSessionDeletedUpdate
+  | AcpRuntimeStoredSessionRefreshUpdate
+  | AcpRuntimeStoredSessionSavedUpdate;
+
+export type AcpRuntimeStoredSessionWatcher = (
+  update: AcpRuntimeStoredSessionListUpdate,
+) => void;
+
+export type AcpRuntimeThreadEntryAddedUpdate = {
+  entry: AcpRuntimeThreadEntry;
+  type: "thread_entry_added";
+};
+
+export type AcpRuntimeThreadEntryUpdatedUpdate = {
+  entry: AcpRuntimeThreadEntry;
+  type: "thread_entry_updated";
+};
+
+export type AcpRuntimeTerminalUpdatedUpdate = {
+  terminal: AcpRuntimeTerminalSnapshot;
+  type: "terminal_updated";
+};
+
+export type AcpRuntimeDiffUpdatedUpdate = {
+  diff: AcpRuntimeDiffSnapshot;
+  type: "diff_updated";
+};
+
+export type AcpRuntimeReadModelUpdate =
+  | AcpRuntimeDiffUpdatedUpdate
+  | AcpRuntimeTerminalUpdatedUpdate
+  | AcpRuntimeThreadEntryAddedUpdate
+  | AcpRuntimeThreadEntryUpdatedUpdate;
+
+export type AcpRuntimeReadModelWatcher = (
+  update: AcpRuntimeReadModelUpdate,
+) => void;
+
+export type AcpRuntimeDiffWatcher = (diff: AcpRuntimeDiffSnapshot) => void;
+
+export type AcpRuntimeTerminalWatcher = (
+  terminal: AcpRuntimeTerminalSnapshot,
+) => void;
+
+export type AcpRuntimeToolObjectUpdate =
+  | AcpRuntimeDiffUpdatedUpdate
+  | AcpRuntimeTerminalUpdatedUpdate;
+
+export type AcpRuntimeToolObjectWatcher = (
+  update: AcpRuntimeToolObjectUpdate,
+) => void;
+
+export type AcpRuntimeToolCallBundle = {
+  diffs: readonly AcpRuntimeDiffSnapshot[];
+  terminals: readonly AcpRuntimeTerminalSnapshot[];
+  toolCall: AcpRuntimeToolCallSnapshot;
+};
+
+export type AcpRuntimeToolCallWatcher = (
+  bundle: AcpRuntimeToolCallBundle,
+) => void;
+
+export type AcpRuntimeOperationBundle = {
+  operation: AcpRuntimeOperation;
+  permissionRequests: readonly AcpRuntimePermissionRequest[];
+};
+
+export type AcpRuntimeOperationWatcher = (
+  operation: AcpRuntimeOperation,
+) => void;
+
+export type AcpRuntimeOperationBundleWatcher = (
+  bundle: AcpRuntimeOperationBundle,
+) => void;
+
+export type AcpRuntimePermissionRequestWatcher = (
+  request: AcpRuntimePermissionRequest,
+) => void;
+
+export type AcpRuntimeOperationProjectionUpdate = {
+  errorMessage?: string;
+  lifecycle: "completed" | "failed" | "started" | "updated";
+  operation: AcpRuntimeOperation;
+  turnId: string;
+  type: "operation_projection_updated";
+};
+
+export type AcpRuntimePermissionProjectionUpdate = {
+  decision?: "allowed" | "denied";
+  lifecycle: "requested" | "resolved";
+  operation: AcpRuntimeOperation;
+  request: AcpRuntimePermissionRequest;
+  turnId: string;
+  type: "permission_projection_updated";
+};
+
+export type AcpRuntimeMetadataProjectionUpdate = {
+  metadata: AcpRuntimeSessionMetadata;
+  turnId: string;
+  type: "metadata_projection_updated";
+};
+
+export type AcpRuntimeUsageProjectionUpdate = {
+  turnId: string;
+  type: "usage_projection_updated";
+  usage: AcpRuntimeUsage;
+};
+
+export type AcpRuntimeProjectionUpdate =
+  | AcpRuntimeMetadataProjectionUpdate
+  | AcpRuntimeOperationProjectionUpdate
+  | AcpRuntimePermissionProjectionUpdate
+  | AcpRuntimeUsageProjectionUpdate;
+
+export type AcpRuntimeProjectionWatcher = (
+  update: AcpRuntimeProjectionUpdate,
+) => void;
 
 export type AcpRuntimeSnapshot = {
   agent: AcpRuntimeAgent;

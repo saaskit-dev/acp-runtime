@@ -114,6 +114,14 @@ Internally, ACP-specific behavior is split into:
 - `acp/profiles/`: agent-specific normalization strategy selected by `agent.type`
 - `acp/driver.ts`: ACP SDK-backed session driver
 
+The repository now documents a stricter compatibility boundary:
+
+- runtime core keeps semantic normalization and protocol-shape correction
+- host / demo adapters keep login execution strategy and UX policy
+- explicit profile fallbacks must be marked as policy, not generic ACP behavior
+
+See [Runtime Agent Compatibility](docs/guides/runtime-agent-compatibility.md).
+
 This is intentionally not a generic multi-protocol abstraction. The runtime is ACP-focused, but still normalizes behavioral differences across ACP agents.
 
 For registry-backed startup, the runtime now exposes first-class helpers.
