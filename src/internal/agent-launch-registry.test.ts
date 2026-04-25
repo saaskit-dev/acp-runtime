@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockReadFile = vi.fn();
@@ -31,6 +33,7 @@ describe("agent launch registry", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
     vi.stubGlobal("fetch", vi.fn());
   });
 
@@ -146,6 +149,51 @@ describe("agent launch registry", () => {
       recursive: true,
     });
     expect(mockWriteFile).toHaveBeenCalled();
+  });
+
+  it("falls back to the workspace tmp cache when the home cache is not writable", async () => {
+    mockStat
+      .mockRejectedValueOnce(new Error("missing home cache"))
+      .mockRejectedValueOnce(new Error("missing workspace cache"));
+    mockMkdir
+      .mockRejectedValueOnce(new Error("EPERM"))
+      .mockResolvedValueOnce(undefined);
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      text: async () => JSON.stringify({
+        agents: [
+          {
+            description: "Python Agent",
+            distribution: {
+              uvx: {
+                package: "python-agent",
+              },
+            },
+            id: "python-agent",
+            name: "Python Agent",
+            version: "0.1.0",
+          },
+        ],
+        version: "1",
+      }),
+    } as Response);
+
+    const { resolveAgentLaunch } = await import("./agent-launch-registry.js");
+    await resolveAgentLaunch("python-agent");
+
+    expect(mockMkdir).toHaveBeenNthCalledWith(1, "/mock-home/.cache/acp-runtime", {
+      recursive: true,
+    });
+    expect(mockMkdir).toHaveBeenNthCalledWith(
+      2,
+      resolve(process.cwd(), ".tmp", "acp-runtime-cache"),
+      { recursive: true },
+    );
+    expect(mockWriteFile).toHaveBeenCalledWith(
+      resolve(process.cwd(), ".tmp", "acp-runtime-cache", "registry.json"),
+      expect.any(String),
+      "utf8",
+    );
   });
 
   it("prefers PATH binaries over archive download for binary distributions", async () => {

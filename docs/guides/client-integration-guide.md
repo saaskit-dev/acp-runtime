@@ -13,7 +13,7 @@ prefer the runtime's registry-backed entry point:
 
 ```ts
 const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
-const session = await runtime.createFromRegistry({
+const session = await runtime.sessions.registry.start({
   agentId: "simulator-agent-acp-local",
   cwd: process.cwd(),
 });
@@ -54,7 +54,7 @@ Boundary:
 ## Runtime Host Shortcut
 
 If you are integrating through `acp-runtime`, you usually do not need to launch the agent yourself.
-Use `createFromRegistry({ agentId })` for the normal host path, and only drop to raw stdio process management when building a lower-level ACP client or transport adapter.
+Use `runtime.sessions.registry.start({ agentId })` for the normal host path, and only drop to raw stdio process management when building a lower-level ACP client or transport adapter.
 ## Translation
 
 - [简体中文](../zh-CN/guides/client-integration-guide.md)

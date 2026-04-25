@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   AcpPermissionDeniedError,
   AcpRuntime,
+  type AcpRuntimeSession,
   type AcpRuntimeTurnEvent,
   createClaudeCodeAcpAgent,
   createStdioAcpConnectionFactory,
@@ -27,6 +29,15 @@ function shouldSkipClaudeCodeContract(): boolean {
   return process.env.ACP_RUNTIME_SKIP_CLAUDE_CODE_TEST === "1";
 }
 
+function isCommandInPath(command: string): boolean {
+  const which = process.platform === "win32" ? "where" : "which";
+  const result = spawnSync(which, [command], {
+    encoding: "utf8",
+    stdio: "pipe",
+  });
+  return result.status === 0;
+}
+
 async function resolveClaudeCodeContractAgent() {
   if (shouldSkipClaudeCodeContract()) {
     return {
@@ -37,7 +48,7 @@ async function resolveClaudeCodeContractAgent() {
   if (process.env.ACP_RUNTIME_RUN_CLAUDE_CODE_TEST === "1") {
     return {
       createSession(runtime: AcpRuntime, cwd: string) {
-        return runtime.create({
+        return runtime.sessions.start({
           agent: createClaudeCodeAcpAgent({ via: "npx" }),
           cwd,
         });
@@ -46,10 +57,20 @@ async function resolveClaudeCodeContractAgent() {
   }
 
   try {
-    await resolveRuntimeAgentFromRegistry("claude-acp");
+    const resolvedAgent = await resolveRuntimeAgentFromRegistry("claude-acp");
+    if (
+      resolvedAgent.command === "npx" &&
+      !isCommandInPath("claude-agent-acp")
+    ) {
+      return {
+        skipReason:
+          "claude-agent-acp is not installed locally; skipping registry-backed npx launch that would require package download. Set ACP_RUNTIME_RUN_CLAUDE_CODE_TEST=1 to force it.",
+      } as const;
+    }
+
     return {
       createSession(runtime: AcpRuntime, cwd: string) {
-        return runtime.createFromRegistry({
+        return runtime.sessions.registry.start({
           agentId: "claude-acp",
           cwd,
         });
@@ -110,7 +131,7 @@ describe("AcpRuntime x Claude Code ACP", () => {
           }),
         );
         let stage = "create";
-        let session: Awaited<ReturnType<AcpRuntime["create"]>> | undefined;
+        let session: AcpRuntimeSession | undefined;
 
         try {
           trace.push(`attempt=${attempt} stage=${stage}`);
@@ -118,16 +139,16 @@ describe("AcpRuntime x Claude Code ACP", () => {
 
           expect(session.metadata.id).toBeTruthy();
           expect(
-            session.listAgentModes().some((mode) => mode.id === "plan"),
+            session.agent.listModes().some((mode) => mode.id === "plan"),
           ).toBe(true);
           expect(
-            session.listAgentConfigOptions().some((option) => option.id === "model"),
+            session.agent.listConfigOptions().some((option) => option.id === "model"),
           ).toBe(true);
           const firstEvents: AcpRuntimeTurnEvent[] = [];
 
           stage = "send";
           trace.push(`attempt=${attempt} stage=${stage}`);
-          const result = await session.send("Reply with exactly the word READY.", {
+          const result = await session.turn.send("Reply with exactly the word READY.", {
             onEvent(event) {
               firstEvents.push(event);
               trace.push(`event: ${JSON.stringify(event)}`);
@@ -141,7 +162,7 @@ describe("AcpRuntime x Claude Code ACP", () => {
           stage = "default-permission-denied";
           trace.push(`attempt=${attempt} stage=${stage}`);
           await expect(
-            session.send(
+            session.turn.send(
               "Write the exact text 'denied' into ./claude-default-denied.txt using tools, then report success.",
               {
                 onEvent(event) {
@@ -164,19 +185,19 @@ describe("AcpRuntime x Claude Code ACP", () => {
 
           stage = "set-raw-mode";
           trace.push(`attempt=${attempt} stage=${stage}`);
-          await session.setAgentMode("plan");
+          await session.agent.setMode("plan");
           expect(session.metadata.currentModeId).toBe("plan");
 
           stage = "set-dontask-mode";
           trace.push(`attempt=${attempt} stage=${stage}`);
-          await session.setAgentMode("dontAsk");
+          await session.agent.setMode("dontAsk");
           expect(session.metadata.currentModeId).toBe("dontAsk");
 
           const modeDeniedEvents: AcpRuntimeTurnEvent[] = [];
           stage = "mode-denied";
           trace.push(`attempt=${attempt} stage=${stage}`);
           await expect(
-            session.send(
+            session.turn.send(
               "Write the exact text 'denied' into ./claude-dontask-denied.txt using tools, then report success.",
               {
                 onEvent(event) {
@@ -199,7 +220,7 @@ describe("AcpRuntime x Claude Code ACP", () => {
 
           stage = "set-bypass-mode";
           trace.push(`attempt=${attempt} stage=${stage}`);
-          await session.setAgentMode("bypassPermissions");
+          await session.agent.setMode("bypassPermissions");
           expect(session.metadata.currentModeId).toBe("bypassPermissions");
           expect(session.status).toBe("ready");
         } catch (error) {
@@ -214,7 +235,7 @@ describe("AcpRuntime x Claude Code ACP", () => {
           }
           throw error;
         } finally {
-          await session?.close().catch(() => undefined);
+          await session?.lifecycle.close().catch(() => undefined);
         }
       });
     },

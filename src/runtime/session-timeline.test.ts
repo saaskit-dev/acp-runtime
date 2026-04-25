@@ -197,6 +197,105 @@ describe("AcpRuntimeSessionTimeline", () => {
     ]);
   });
 
+  it("emits read-model and tool-call watcher updates in derived-object-first order", () => {
+    const timeline = new AcpRuntimeSessionTimeline();
+    const readModelUpdates: string[] = [];
+    const bundleUpdates: string[] = [];
+
+    const stopReadModel = timeline.watch((update) => {
+      switch (update.type) {
+        case "diff_updated":
+          readModelUpdates.push(`diff:${update.diff.path}:${update.diff.revision}`);
+          break;
+        case "terminal_updated":
+          readModelUpdates.push(
+            `terminal:${update.terminal.terminalId}:${update.terminal.revision}:${update.terminal.status}`,
+          );
+          break;
+        case "thread_entry_added":
+        case "thread_entry_updated":
+          if (update.entry.kind === "tool_call") {
+            readModelUpdates.push(`${update.type}:${update.entry.status}`);
+          }
+          break;
+      }
+    });
+    const stopToolCall = timeline.watchToolCall("tool-1", (bundle) => {
+      bundleUpdates.push(
+        `${bundle.toolCall.status}:${bundle.diffs.map((diff) => diff.revision).join(",")}:${bundle.terminals.map((terminal) => terminal.revision).join(",")}`,
+      );
+    });
+
+    timeline.upsertToolCall({
+      content: [
+        {
+          changeType: "write",
+          id: "diff-1",
+          kind: "diff",
+          newText: "alpha",
+          path: "/tmp/alpha.txt",
+        },
+        {
+          command: "echo alpha",
+          cwd: "/tmp",
+          id: "terminal-1",
+          kind: "terminal",
+          output: "alpha",
+          status: "running",
+          terminalId: "term-1",
+          truncated: false,
+        },
+      ],
+      status: "in_progress",
+      toolCallId: "tool-1",
+      turnId: "turn-1",
+    });
+
+    timeline.upsertToolCall({
+      content: [
+        {
+          changeType: "update",
+          id: "diff-1",
+          kind: "diff",
+          newText: "alpha beta",
+          oldText: "alpha",
+          path: "/tmp/alpha.txt",
+        },
+        {
+          exitCode: 0,
+          id: "terminal-1",
+          kind: "terminal",
+          output: "done",
+          status: "completed",
+          terminalId: "term-1",
+        },
+      ],
+      status: "completed",
+      toolCallId: "tool-1",
+      turnId: "turn-1",
+    });
+
+    stopReadModel();
+    stopToolCall();
+
+    expect(readModelUpdates).toEqual([
+      "diff:/tmp/alpha.txt:1",
+      "terminal:term-1:1:running",
+      "thread_entry_added:in_progress",
+      "diff:/tmp/alpha.txt:2",
+      "terminal:term-1:2:completed",
+      "thread_entry_updated:completed",
+    ]);
+    expect(bundleUpdates).toEqual([
+      "in_progress:1:",
+      "in_progress:1:1",
+      "in_progress:1:1",
+      "completed:2:1",
+      "completed:2:2",
+      "completed:2:2",
+    ]);
+  });
+
   it("keeps terminal and diff lifecycle metadata across repeated updates", () => {
     const timeline = new AcpRuntimeSessionTimeline();
     const diffUpdates: string[] = [];

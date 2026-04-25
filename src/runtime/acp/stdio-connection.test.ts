@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { AnyMessage } from "@agentclientprotocol/sdk";
 
 import {
+  formatUnexpectedStdioExitError,
   nodeReadableToWeb,
   nodeWritableToWeb,
   normalizeInboundAcpMessage,
@@ -108,5 +109,43 @@ describe("stdio stream bridges", () => {
 
     expect(new TextDecoder().decode(chunks[0])).toBe("ping");
     expect(writable.writableEnded).toBe(true);
+  });
+});
+
+describe("stdio process exit diagnostics", () => {
+  it("includes lifecycle context in unexpected exit errors", () => {
+    const error = formatUnexpectedStdioExitError({
+      activeOperationSummary: "initialize",
+      code: 1,
+      command: "claude-agent-acp",
+      cwd: "/tmp/project",
+      pid: 4242,
+      signal: null,
+      stderr: "boot failed",
+    });
+
+    expect(error.message).toContain("ACP stdio process exited unexpectedly");
+    expect(error.message).toContain("during initialize");
+    expect(error.message).toContain('command="claude-agent-acp"');
+    expect(error.message).toContain("cwd=/tmp/project");
+    expect(error.message).toContain("pid=4242");
+    expect(error.message).toContain("code=1");
+    expect(error.message).toContain("signal=null");
+    expect(error.message).toContain('stderr="boot failed"');
+  });
+
+  it("reports idle exits without stderr", () => {
+    const error = formatUnexpectedStdioExitError({
+      code: null,
+      command: "codex-acp",
+      cwd: "/tmp/project",
+      signal: "SIGTERM",
+    });
+
+    expect(error.message).toContain("while idle");
+    expect(error.message).toContain('command="codex-acp"');
+    expect(error.message).toContain("code=null");
+    expect(error.message).toContain("signal=SIGTERM");
+    expect(error.message).not.toContain("stderr=");
   });
 });

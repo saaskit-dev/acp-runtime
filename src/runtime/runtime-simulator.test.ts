@@ -87,7 +87,7 @@ describe("AcpRuntime x simulator-agent ACP", () => {
     await writeFile(firstPath, "seed one\n", "utf8");
     await writeFile(secondPath, "seed two\n", "utf8");
 
-    const session = await runtime.create({
+    const session = await runtime.sessions.start({
       agent: {
         args: [cliPath, "--storage-dir", storageDir],
         command: process.execPath,
@@ -97,20 +97,20 @@ describe("AcpRuntime x simulator-agent ACP", () => {
       handlers,
     });
 
-    expect(session.snapshot().agent.type).toBe(SIMULATOR_AGENT_ACP_REGISTRY_ID);
-    expect(session.listAgentModes().map((mode) => mode.id)).toEqual([
+    expect(session.lifecycle.snapshot().agent.type).toBe(SIMULATOR_AGENT_ACP_REGISTRY_ID);
+    expect(session.agent.listModes().map((mode) => mode.id)).toEqual([
       "deny",
       "accept-edits",
       "yolo",
     ]);
-    expect(session.listAgentConfigOptions().map((option) => option.id)).toEqual([
+    expect(session.agent.listConfigOptions().map((option) => option.id)).toEqual([
       "approval-policy",
       "model",
       "reasoning",
     ]);
 
     const renameTurn = collectEvents();
-    const renameResult = await session.send(
+    const renameResult = await session.turn.send(
       "/rename Integration Session",
       renameTurn,
     );
@@ -120,7 +120,7 @@ describe("AcpRuntime x simulator-agent ACP", () => {
     expect(session.metadata.title).toBe("Integration Session");
 
     const guardedWrite = collectEvents();
-    const guardedWriteResult = await session.send(
+    const guardedWriteResult = await session.turn.send(
       `/write ${firstPath} first`,
       guardedWrite,
     );
@@ -131,11 +131,11 @@ describe("AcpRuntime x simulator-agent ACP", () => {
       ),
     ).toBe(true);
 
-    await session.setAgentMode("yolo");
+    await session.agent.setMode("yolo");
     expect(session.metadata.currentModeId).toBe("yolo");
 
     const unguardedWrite = collectEvents();
-    const unguardedWriteResult = await session.send(
+    const unguardedWriteResult = await session.turn.send(
       `/write ${secondPath} second`,
       unguardedWrite,
     );
@@ -146,7 +146,7 @@ describe("AcpRuntime x simulator-agent ACP", () => {
       ),
     ).toBe(false);
 
-    const snapshot = session.snapshot();
+    const snapshot = session.lifecycle.snapshot();
     expect(snapshot.config).toMatchObject({
       "approval-policy": "accept-edits",
       model: "claude",
@@ -154,7 +154,7 @@ describe("AcpRuntime x simulator-agent ACP", () => {
     });
     expect(snapshot.currentModeId).toBe("yolo");
 
-    const resumed = await runtime.resume({
+    const resumed = await runtime.sessions.resume({
       handlers,
       snapshot,
     });
@@ -165,24 +165,24 @@ describe("AcpRuntime x simulator-agent ACP", () => {
       reasoning: "medium",
     });
 
-    await resumed.setAgentMode("deny");
+    await resumed.agent.setMode("deny");
     expect(resumed.metadata.currentModeId).toBe("deny");
-    const deniedSnapshot = resumed.snapshot();
+    const deniedSnapshot = resumed.lifecycle.snapshot();
     expect(deniedSnapshot.currentModeId).toBe("deny");
 
-    const describeResult = await resumed.send("/describe");
+    const describeResult = await resumed.turn.send("/describe");
     expect(describeResult.outputText).toContain("Current mode: deny");
     expect(describeResult.outputText).toContain("Permission policy: deny");
 
-    const resumedDenied = await runtime.resume({
+    const resumedDenied = await runtime.sessions.resume({
       handlers,
       snapshot: deniedSnapshot,
     });
     expect(resumedDenied.metadata.currentModeId).toBe("deny");
 
-    await resumedDenied.close();
+    await resumedDenied.lifecycle.close();
 
-    await resumed.close();
-    await session.close();
+    await resumed.lifecycle.close();
+    await session.lifecycle.close();
   });
 });

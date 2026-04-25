@@ -37,12 +37,20 @@ type AgentProcess = ChildProcess & {
 const DEFAULT_AGENT_CLOSE_AFTER_STDIN_END_MS = 100;
 const AGENT_CLOSE_TERM_GRACE_MS = 1_500;
 const AGENT_CLOSE_KILL_GRACE_MS = 1_000;
+const STDERR_TAIL_LIMIT = 2_000;
+
+type StdioOperationTracker = {
+  end(operation: string): void;
+  start(operation: string): void;
+  summary(): string | undefined;
+};
 
 export function createStdioAcpConnectionFactory(
   options: StdioFactoryOptions = {},
 ): AcpConnectionFactory {
   return async (input) => {
     let disposing = false;
+    const operationTracker = createStdioOperationTracker();
     const spawnedChild = spawn(input.agent.command, input.agent.args ?? [], {
       cwd: input.cwd,
       env: {
@@ -73,11 +81,26 @@ export function createStdioAcpConnectionFactory(
     );
     const sdkConnection = new ClientSideConnection(() => input.client, stream);
 
-    const onExit = createExitWatcher(child, stderrChunks, () => disposing);
+    const onExit = createExitWatcher(
+      child,
+      {
+        args: input.agent.args,
+        command: input.agent.command,
+        cwd: input.cwd,
+        pid: child.pid ?? undefined,
+      },
+      stderrChunks,
+      () => disposing,
+      () => operationTracker.summary(),
+    );
     void onExit.catch(() => {
       // Observed by wrapped requests/closed; suppress global unhandled rejection noise.
     });
-    const connection = wrapConnectionWithExit(sdkConnection, onExit);
+    const connection = wrapConnectionWithExit(
+      sdkConnection,
+      onExit,
+      operationTracker,
+    );
     void connection.closed.catch(() => {
       // Suppress unhandled rejections for callers that do not observe `closed`.
     });
@@ -209,13 +232,21 @@ export function nodeWritableToWeb(
 function wrapConnectionWithExit(
   connection: ClientSideConnection,
   onExit: Promise<void>,
+  operationTracker: StdioOperationTracker,
 ): AcpConnection {
   const exitFailure = onExit.then<never>(
     () => new Promise<never>(() => {}),
     (error) => Promise.reject(error),
   );
-  const withExit = <T>(operation: Promise<T>): Promise<T> =>
-    Promise.race([operation, exitFailure]);
+  const withExit = <T>(name: string, operation: Promise<T>): Promise<T> => {
+    operationTracker.start(name);
+    const guardedOperation = operation.catch(async (error) => {
+      throw await enhanceClosedConnectionError(error, onExit, name);
+    });
+    return Promise.race([guardedOperation, exitFailure]).finally(() => {
+      operationTracker.end(name);
+    });
+  };
   const signal = createConnectionSignal(connection.signal, onExit);
   const closed = Promise.race([connection.closed, onExit]);
 
@@ -223,37 +254,41 @@ function wrapConnectionWithExit(
     signal,
     closed,
     authenticate(params) {
-      return withExit(connection.authenticate(params));
+      return withExit("authenticate", connection.authenticate(params));
     },
     cancel(params) {
-      return withExit(connection.cancel(params));
+      return withExit("cancel", connection.cancel(params));
     },
     initialize(params) {
-      return withExit(connection.initialize(params));
+      return withExit("initialize", connection.initialize(params));
     },
     listSessions: connection.listSessions
-      ? (params) => withExit(connection.listSessions(params))
+      ? (params) => withExit("listSessions", connection.listSessions(params))
       : undefined,
     loadSession: connection.loadSession
-      ? (params) => withExit(connection.loadSession(params))
+      ? (params) => withExit("loadSession", connection.loadSession(params))
       : undefined,
     newSession(params) {
-      return withExit(connection.newSession(params));
+      return withExit("newSession", connection.newSession(params));
     },
     prompt(params) {
-      return withExit(connection.prompt(params));
+      return withExit("prompt", connection.prompt(params));
     },
     setSessionConfigOption: connection.setSessionConfigOption
-      ? (params) => withExit(connection.setSessionConfigOption(params))
+      ? (params) =>
+          withExit(
+            "setSessionConfigOption",
+            connection.setSessionConfigOption(params),
+          )
       : undefined,
     setSessionMode: connection.setSessionMode
-      ? (params) => withExit(connection.setSessionMode(params))
+      ? (params) => withExit("setSessionMode", connection.setSessionMode(params))
       : undefined,
     closeSession: connection.closeSession
-      ? (params) => withExit(connection.closeSession(params))
+      ? (params) => withExit("closeSession", connection.closeSession(params))
       : undefined,
     resumeSession: connection.resumeSession
-      ? (params) => withExit(connection.resumeSession(params))
+      ? (params) => withExit("resumeSession", connection.resumeSession(params))
       : undefined,
   };
 }
@@ -449,8 +484,15 @@ function createTappedStream(
 
 function createExitWatcher(
   child: AgentProcess,
+  context: {
+    args?: string[];
+    command: string;
+    cwd: string;
+    pid?: number;
+  },
   stderrChunks: string[],
   isExpectedExit: () => boolean,
+  getActiveOperationSummary: () => string | undefined,
 ): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     child.once("error", reject);
@@ -462,13 +504,91 @@ function createExitWatcher(
 
       const stderr = stderrChunks.join("").trim();
       reject(
-        new Error(
-          stderr.length > 0
-            ? `ACP stdio process exited unexpectedly: ${stderr}`
-            : `ACP stdio process exited unexpectedly with code=${code} signal=${signal}`,
-        ),
+        formatUnexpectedStdioExitError({
+          activeOperationSummary: getActiveOperationSummary(),
+          code,
+          command: context.command,
+          cwd: context.cwd,
+          pid: context.pid,
+          signal,
+          stderr,
+        }),
       );
     });
+  });
+}
+
+function createStdioOperationTracker(): StdioOperationTracker {
+  const counts = new Map<string, number>();
+
+  return {
+    start(operation: string) {
+      counts.set(operation, (counts.get(operation) ?? 0) + 1);
+    },
+    end(operation: string) {
+      const next = (counts.get(operation) ?? 0) - 1;
+      if (next > 0) {
+        counts.set(operation, next);
+        return;
+      }
+      counts.delete(operation);
+    },
+    summary() {
+      const active = [...counts.keys()];
+      return active.length > 0 ? active.join(",") : undefined;
+    },
+  };
+}
+
+export function formatUnexpectedStdioExitError(input: {
+  activeOperationSummary?: string;
+  code: number | null;
+  command: string;
+  cwd: string;
+  pid?: number;
+  signal: NodeJS.Signals | null;
+  stderr?: string;
+}): Error {
+  const parts = [
+    "ACP stdio process exited unexpectedly",
+    input.activeOperationSummary
+      ? `during ${input.activeOperationSummary}`
+      : "while idle",
+    `command=${formatCommandForLog(input.command)}`,
+    `cwd=${input.cwd}`,
+  ];
+
+  if (input.pid !== undefined) {
+    parts.push(`pid=${input.pid}`);
+  }
+
+  parts.push(`code=${input.code}`);
+  parts.push(`signal=${input.signal}`);
+
+  const stderrTail = trimStderrTail(input.stderr);
+  if (stderrTail) {
+    parts.push(`stderr=${JSON.stringify(stderrTail)}`);
+  }
+
+  return new Error(parts.join("; "));
+}
+
+async function enhanceClosedConnectionError(
+  error: unknown,
+  onExit: Promise<void>,
+  operationName: string,
+): Promise<unknown> {
+  if (!isClosedConnectionError(error)) {
+    return error;
+  }
+
+  const exitError = await waitForExitError(onExit);
+  if (exitError) {
+    return exitError;
+  }
+
+  return new Error(`ACP connection closed during ${operationName}`, {
+    cause: error,
   });
 }
 
@@ -579,6 +699,52 @@ function basenameToken(command: string): string {
   const normalized = command.replaceAll("\\", "/");
   const index = normalized.lastIndexOf("/");
   return index >= 0 ? normalized.slice(index + 1) : normalized;
+}
+
+function formatCommandForLog(command: string): string {
+  return JSON.stringify(command);
+}
+
+function trimStderrTail(stderr: string | undefined): string | undefined {
+  if (!stderr) {
+    return undefined;
+  }
+
+  if (stderr.length <= STDERR_TAIL_LIMIT) {
+    return stderr;
+  }
+
+  return `...${stderr.slice(-STDERR_TAIL_LIMIT)}`;
+}
+
+function isClosedConnectionError(error: unknown): error is Error {
+  return error instanceof Error && error.message === "ACP connection closed";
+}
+
+async function waitForExitError(
+  onExit: Promise<void>,
+  timeoutMs: number = 250,
+): Promise<Error | undefined> {
+  return new Promise<Error | undefined>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      finish(undefined);
+    }, timeoutMs);
+
+    const finish = (value: Error | undefined) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+
+    void onExit.then(
+      () => finish(undefined),
+      (error) => finish(error instanceof Error ? error : new Error(String(error))),
+    );
+  });
 }
 
 function normalizeReadableChunk(

@@ -8,6 +8,9 @@ Language:
 
 - [Client Integration Guide](client-integration-guide.md)
 - [Runtime Agent Compatibility](runtime-agent-compatibility.md)
+- [Runtime SDK By Scenario](runtime-sdk-by-scenario.md)
 - [Runtime SDK API](runtime-sdk-api.md)
+- [Runtime SDK API Coverage](runtime-sdk-api-coverage.md)
+- [Runtime SDK Read Models](runtime-sdk-read-models.md)
 - [Runtime SDK Minimal Demo](runtime-sdk-minimal-demo.md)
 - [Runtime SDK Demo](runtime-sdk-demo.md)

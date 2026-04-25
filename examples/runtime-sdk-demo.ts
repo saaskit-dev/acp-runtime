@@ -10,6 +10,7 @@ import {
   AcpProtocolError,
   AcpRuntime,
   AcpRuntimeJsonSessionRegistryStore,
+  AcpRuntimeSession,
   AcpRuntimeSessionRegistry,
   createStdioAcpConnectionFactory,
   resolveRuntimeAgentFromRegistry,
@@ -157,7 +158,8 @@ function parseCliOptions(argv: string[]): DemoCliOptions {
       continue;
     }
     if (token.startsWith("--resume-snapshot=")) {
-      resumeSnapshotPath = token.slice("--resume-snapshot=".length) || undefined;
+      resumeSnapshotPath =
+        token.slice("--resume-snapshot=".length) || undefined;
       continue;
     }
     if (token.startsWith("--log-file=")) {
@@ -316,7 +318,7 @@ function createOutputGate(): OutputGate {
 
 function completeLocalCommand(
   line: string,
-  session?: Awaited<ReturnType<AcpRuntime["createFromRegistry"]>>,
+  session?: AcpRuntimeSession,
 ): [string[], string] {
   const trimmed = line.trimStart();
   if (!trimmed.startsWith("/")) {
@@ -334,14 +336,14 @@ function completeLocalCommand(
   }
 
   if (parts[0] === "/mode") {
-    const modes = session?.listAgentModes().map((mode) => mode.id) ?? [];
+    const modes = session?.agent.listModes().map((mode) => mode.id) ?? [];
     const current = trailingSpace ? "" : (parts[1] ?? "");
     const matches = modes.filter((mode) => mode.startsWith(current));
     return [matches.length > 0 ? matches : modes, current];
   }
 
   if (parts[0] === "/config") {
-    const options = session?.listAgentConfigOptions() ?? [];
+    const options = session?.agent.listConfigOptions() ?? [];
     const optionIds = options.map((option) => option.id);
 
     if (parts.length === 2 && !trailingSpace) {
@@ -427,7 +429,8 @@ function getJsonOutputValue(
   operation: AcpRuntimeOperation,
 ): Record<string, unknown> | undefined {
   const jsonPart = operation.result?.output?.find(
-    (part) => part.type === "json" && part.value && typeof part.value === "object",
+    (part) =>
+      part.type === "json" && part.value && typeof part.value === "object",
   );
 
   return jsonPart?.type === "json" &&
@@ -731,7 +734,9 @@ function renderMarkdownForTerminal(markdown: string): string {
 }
 
 function summarizeMetadata(
-  metadata: NonNullable<AcpRuntimeTurnEvent["type"] extends never ? never : Record<string, unknown>>,
+  metadata: NonNullable<
+    AcpRuntimeTurnEvent["type"] extends never ? never : Record<string, unknown>
+  >,
 ): string {
   const sessionMetadata = metadata as {
     agentConfigOptions?: readonly { id: string; value: unknown }[];
@@ -746,7 +751,10 @@ function summarizeMetadata(
   if (sessionMetadata.currentModeId) {
     parts.push(`currentMode=${sessionMetadata.currentModeId}`);
   }
-  if (sessionMetadata.config && Object.keys(sessionMetadata.config).length > 0) {
+  if (
+    sessionMetadata.config &&
+    Object.keys(sessionMetadata.config).length > 0
+  ) {
     parts.push(
       `config=${Object.entries(sessionMetadata.config)
         .map(([key, value]) => `${key}=${String(value)}`)
@@ -798,7 +806,11 @@ function formatEventDetail(event: AcpRuntimeTurnEvent): string {
     case "operation_completed":
       return formatOperationInline(event.operation, "completed");
     case "operation_failed":
-      return formatOperationInline(event.operation, "failed", event.error.message);
+      return formatOperationInline(
+        event.operation,
+        "failed",
+        event.error.message,
+      );
     case "failed":
       return event.error.message;
     case "completed":
@@ -824,7 +836,10 @@ function createFilesystemHandlers(): AcpRuntimeAuthorityHandlers["filesystem"] {
   };
 }
 
-function createTimelineRenderer(logSink: LogSink, outputGate: OutputGate): TimelineRenderer {
+function createTimelineRenderer(
+  logSink: LogSink,
+  outputGate: OutputGate,
+): TimelineRenderer {
   let turnNumber = 0;
   let turnStartedAt = Date.now();
   const stream: StreamAccumulator = { buffer: "" };
@@ -859,10 +874,7 @@ function createTimelineRenderer(logSink: LogSink, outputGate: OutputGate): Timel
 
   function shouldFlushStream(type: StreamChunkType, chunk: string): boolean {
     if (type === "thinking") {
-      return (
-        /[\n。！？!?]/.test(chunk) ||
-        stream.buffer.length >= 160
-      );
+      return /[\n。！？!?]/.test(chunk) || stream.buffer.length >= 160;
     }
 
     return /(?:\n\n|\n|[。！？!?]$)/.test(chunk) || stream.buffer.length >= 220;
@@ -1073,7 +1085,7 @@ function projectionUpdateToTurnEvent(
 }
 
 function createTurnProjection(
-  session: Awaited<ReturnType<AcpRuntime["createFromRegistry"]>>,
+  session: AcpRuntimeSession,
   renderer: TimelineRenderer,
 ): TurnProjection {
   let activeTurnId: string | undefined;
@@ -1086,7 +1098,7 @@ function createTurnProjection(
     }
   >();
 
-  const stopWatching = session.watchReadModel((update) => {
+  const stopWatching = session.model.watch((update) => {
     if (
       update.type !== "thread_entry_added" &&
       update.type !== "thread_entry_updated"
@@ -1149,7 +1161,7 @@ function createTurnProjection(
     }
   });
 
-  const stopWatchingProjection = session.watchProjection((update) => {
+  const stopWatchingProjection = session.live.watch((update) => {
     if (update.turnId !== activeTurnId) {
       return;
     }
@@ -1259,14 +1271,14 @@ async function promptForPermission(
 
 async function runTurn(
   prompt: string,
-  session: Awaited<ReturnType<AcpRuntime["createFromRegistry"]>>,
+  session: AcpRuntimeSession,
   renderer: TimelineRenderer,
 ): Promise<void> {
   renderer.nextTurn(prompt);
   const projection = createTurnProjection(session, renderer);
 
   try {
-    for await (const event of session.stream(prompt)) {
+    for await (const event of session.turn.stream(prompt)) {
       if (event.type === "started") {
         projection.bindTurn(event.turnId);
         renderer.writeEvent(event);
@@ -1313,7 +1325,7 @@ async function runTurn(
 
 async function runRepl(
   rl: Interface,
-  session: Awaited<ReturnType<AcpRuntime["createFromRegistry"]>>,
+  session: AcpRuntimeSession,
   renderer: TimelineRenderer,
   logSink: LogSink,
   exitSignal: ExitSignal,
@@ -1370,7 +1382,7 @@ async function runRepl(
     }
 
     if (prompt === "/snapshot") {
-      console.log(JSON.stringify(session.snapshot(), null, 2));
+      console.log(JSON.stringify(session.lifecycle.snapshot(), null, 2));
       continue;
     }
 
@@ -1380,9 +1392,13 @@ async function runRepl(
         console.log("usage: /snapshot-save <path>");
         continue;
       }
-      const snapshot = session.snapshot();
+      const snapshot = session.lifecycle.snapshot();
       await mkdir(dirname(filePath), { recursive: true });
-      await writeFile(filePath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+      await writeFile(
+        filePath,
+        `${JSON.stringify(snapshot, null, 2)}\n`,
+        "utf8",
+      );
       logSink.writeJson({
         filePath,
         recordType: "local_command",
@@ -1394,12 +1410,12 @@ async function runRepl(
     }
 
     if (prompt === "/mode") {
-      console.log(JSON.stringify(session.listAgentModes(), null, 2));
+      console.log(JSON.stringify(session.agent.listModes(), null, 2));
       continue;
     }
 
     if (prompt === "/config") {
-      console.log(JSON.stringify(session.listAgentConfigOptions(), null, 2));
+      console.log(JSON.stringify(session.agent.listConfigOptions(), null, 2));
       continue;
     }
 
@@ -1417,7 +1433,7 @@ async function runRepl(
         continue;
       }
       try {
-        await session.setAgentMode(modeId);
+        await session.agent.setMode(modeId);
         logSink.writeJson({
           modeId,
           recordType: "local_command",
@@ -1452,8 +1468,8 @@ async function runRepl(
         continue;
       }
 
-      const option = session
-        .listAgentConfigOptions()
+      const option = session.agent
+        .listConfigOptions()
         .find((entry) => entry.id === optionId);
 
       if (!option) {
@@ -1467,7 +1483,7 @@ async function runRepl(
       }
 
       try {
-        await session.setAgentConfigOption(optionId, value);
+        await session.agent.setConfigOption(optionId, value);
         logSink.writeJson({
           optionId,
           recordType: "local_command",
@@ -1570,9 +1586,7 @@ async function main(): Promise<void> {
     registry,
   });
   const exitSignal: ExitSignal = { requested: false };
-  let session:
-    | Awaited<ReturnType<AcpRuntime["createFromRegistry"]>>
-    | undefined;
+  let session: AcpRuntimeSession | undefined;
   const rl = createInterface({
     input,
     output,
@@ -1582,7 +1596,7 @@ async function main(): Promise<void> {
   });
 
   if (options.listSessions) {
-    const result = await runtime.listAgentSessionsFromRegistry({
+    const result = await runtime.sessions.registry.remote.list({
       agentId: config.agentId,
       cwd: config.cwd,
       handlers: config.handlers,
@@ -1594,38 +1608,43 @@ async function main(): Promise<void> {
     return;
   }
 
-  const createPermissionHandler = () => (request: AcpRuntimePermissionRequest) => {
-    logSink.writeJson({
-      recordType: "permission_request",
-      request,
-      timestamp: new Date().toISOString(),
-    });
-    return promptForPermission(
-      rl,
-      renderer,
-      logSink,
-      exitSignal,
-      outputGate,
-      request,
-    );
-  };
+  const createPermissionHandler =
+    () => (request: AcpRuntimePermissionRequest) => {
+      logSink.writeJson({
+        recordType: "permission_request",
+        request,
+        timestamp: new Date().toISOString(),
+      });
+      return promptForPermission(
+        rl,
+        renderer,
+        logSink,
+        exitSignal,
+        outputGate,
+        request,
+      );
+    };
 
-  const createAuthenticationHandler = () => (
-    request: Parameters<NonNullable<AcpRuntimeAuthorityHandlers["authentication"]>>[0],
-  ) =>
-    promptForDemoAuthentication({
-      logSink,
-      outputGate,
-      renderer,
-      request,
-      rl,
-    });
+  const createAuthenticationHandler =
+    () =>
+    (
+      request: Parameters<
+        NonNullable<AcpRuntimeAuthorityHandlers["authentication"]>
+      >[0],
+    ) =>
+      promptForDemoAuthentication({
+        logSink,
+        outputGate,
+        renderer,
+        request,
+        rl,
+      });
 
   if (options.resumeSnapshotPath) {
     const snapshot = JSON.parse(
       await readFile(options.resumeSnapshotPath, "utf8"),
     ) as AcpRuntimeSnapshot;
-    session = await runtime.resume({
+    session = await runtime.sessions.resume({
       handlers: {
         authentication: createAuthenticationHandler(),
         ...config.handlers,
@@ -1651,7 +1670,7 @@ async function main(): Promise<void> {
         `[runtime] local snapshot missing for session ${latestSessionId}`,
       );
     }
-    session = await runtime.resume({
+    session = await runtime.sessions.resume({
       handlers: {
         authentication: createAuthenticationHandler(),
         ...config.handlers,
@@ -1670,7 +1689,7 @@ async function main(): Promise<void> {
         },
         version: ACP_RUNTIME_SNAPSHOT_VERSION,
       } satisfies AcpRuntimeSnapshot);
-    session = await runtime.resume({
+    session = await runtime.sessions.resume({
       handlers: {
         authentication: createAuthenticationHandler(),
         ...config.handlers,
@@ -1679,7 +1698,7 @@ async function main(): Promise<void> {
       snapshot,
     });
   } else if (options.loadSessionId) {
-    session = await runtime.loadFromRegistry({
+    session = await runtime.sessions.registry.load({
       agentId: config.agentId,
       cwd: config.cwd,
       handlers: {
@@ -1690,7 +1709,7 @@ async function main(): Promise<void> {
       sessionId: options.loadSessionId,
     });
   } else {
-    session = await runtime.createFromRegistry({
+    session = await runtime.sessions.registry.start({
       agentId: config.agentId,
       cwd: config.cwd,
       handlers: {
@@ -1708,7 +1727,7 @@ async function main(): Promise<void> {
     rawLogFile: logSink.rawLogFile,
     recordType: "session_created",
     sessionMetadata: session.metadata,
-    snapshot: session.snapshot(),
+    snapshot: session.lifecycle.snapshot(),
     timestamp: new Date().toISOString(),
   });
 
@@ -1717,17 +1736,15 @@ async function main(): Promise<void> {
   console.log(`[runtime] agentId: ${config.agentId}`);
   console.log(`[runtime] label: ${config.label}`);
   console.log(
-    `[runtime] agentType: ${session.snapshot().agent.type ?? "<none>"}`,
+    `[runtime] agentType: ${session.lifecycle.snapshot().agent.type ?? "<none>"}`,
   );
   console.log(`[runtime] cwd: ${config.cwd}`);
   if (process.platform === "win32" && config.agentId === "codex-acp") {
-    console.log(
-      "[runtime] warning: Codex on Windows works best under WSL2.",
-    );
+    console.log("[runtime] warning: Codex on Windows works best under WSL2.");
   }
 
   if (options.loadSessionId) {
-    const historyEntries = session.drainHistoryEntries();
+    const historyEntries = session.model.history.drain();
     if (historyEntries.length > 0) {
       console.log("");
       console.log("[runtime] loaded history replay");
@@ -1749,7 +1766,7 @@ async function main(): Promise<void> {
     }
   } finally {
     rl.close();
-    await session.close().catch(() => undefined);
+    await session.lifecycle.close().catch(() => undefined);
     await config.cleanup();
     await logSink.close();
   }

@@ -1,7 +1,7 @@
 import { createReadStream } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir, platform, arch } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Extract } from "unzipper";
 import { extract as tarExtract } from "tar";
@@ -15,6 +15,7 @@ import { resolveBuiltSimulatorWorkspaceCliPath } from "./simulator-workspace.js"
 const REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 export const LOCAL_SIMULATOR_AGENT_ID = LOCAL_SIMULATOR_AGENT_ACP_REGISTRY_ID;
+const CACHE_ROOT_ENV_VAR = "ACP_RUNTIME_CACHE_DIR";
 
 type BinaryTarget = {
   archive: string;
@@ -99,12 +100,22 @@ function currentPlatformKey(): keyof BinaryDistribution {
   throw new Error(`Unsupported platform: ${os}/${cpu}`);
 }
 
-function registryCachePath(): string {
-  return join(homedir(), ".cache", "acp-runtime", "registry.json");
+function runtimeCacheRootCandidates(): string[] {
+  const candidates = [
+    process.env[CACHE_ROOT_ENV_VAR]?.trim(),
+    join(homedir(), ".cache", "acp-runtime"),
+    resolve(process.cwd(), ".tmp", "acp-runtime-cache"),
+  ].filter((value): value is string => Boolean(value));
+
+  return [...new Set(candidates)];
 }
 
-function agentCacheDir(agentId: string): string {
-  return join(homedir(), ".cache", "acp-runtime", "agents", agentId);
+function registryCachePaths(): string[] {
+  return runtimeCacheRootCandidates().map((root) => join(root, "registry.json"));
+}
+
+function agentCacheDirs(agentId: string): string[] {
+  return runtimeCacheRootCandidates().map((root) => join(root, "agents", agentId));
 }
 
 async function isCacheFresh(filePath: string): Promise<boolean> {
@@ -117,11 +128,11 @@ async function isCacheFresh(filePath: string): Promise<boolean> {
 }
 
 async function fetchRegistry(): Promise<Registry> {
-  const cachePath = registryCachePath();
-
-  if (await isCacheFresh(cachePath)) {
-    const raw = await readFile(cachePath, "utf8");
-    return JSON.parse(raw) as Registry;
+  for (const cachePath of registryCachePaths()) {
+    if (await isCacheFresh(cachePath)) {
+      const raw = await readFile(cachePath, "utf8");
+      return JSON.parse(raw) as Registry;
+    }
   }
 
   const response = await fetch(REGISTRY_URL);
@@ -130,10 +141,22 @@ async function fetchRegistry(): Promise<Registry> {
   }
 
   const data = await response.text();
-  await mkdir(join(homedir(), ".cache", "acp-runtime"), { recursive: true });
-  await writeFile(cachePath, data, "utf8");
+  await persistRegistryCache(data);
 
   return JSON.parse(data) as Registry;
+}
+
+async function persistRegistryCache(data: string): Promise<void> {
+  for (const cachePath of registryCachePaths()) {
+    const cacheRoot = dirname(cachePath);
+    try {
+      await mkdir(cacheRoot, { recursive: true });
+      await writeFile(cachePath, data, "utf8");
+      return;
+    } catch {
+      // Try the next writable cache root. Cache persistence is best effort.
+    }
+  }
 }
 
 function findAgent(registry: Registry, agentId: string): RegistryAgent {
@@ -179,41 +202,51 @@ async function extractArchive(archivePath: string, destDir: string): Promise<voi
 }
 
 async function ensureBinaryFromArchive(agentId: string, target: BinaryTarget): Promise<AgentLaunchConfig> {
-  const cacheDir = agentCacheDir(agentId);
   const archiveUrl = target.archive;
   const archiveFilename = archiveUrl.split("/").pop() ?? "agent.archive";
-  const archivePath = join(cacheDir, archiveFilename);
-
   const cmdName = target.cmd.replace(/^\.\//, "");
-  const cachedCmd = resolve(cacheDir, cmdName);
+  const failures: string[] = [];
 
-  try {
-    await stat(cachedCmd);
-    return {
-      command: cachedCmd,
-      args: target.args ?? [],
-      env: target.env ?? {},
-    };
-  } catch (_) {
-    void _;
+  for (const cacheDir of agentCacheDirs(agentId)) {
+    const archivePath = join(cacheDir, archiveFilename);
+    const cachedCmd = resolve(cacheDir, cmdName);
+
+    try {
+      await stat(cachedCmd);
+      return {
+        command: cachedCmd,
+        args: target.args ?? [],
+        env: target.env ?? {},
+      };
+    } catch (_) {
+      void _;
+    }
+
+    try {
+      await mkdir(cacheDir, { recursive: true });
+      process.stderr.write(`Downloading ${agentId} from ${archiveUrl}...\n`);
+      await downloadFile(archiveUrl, archivePath);
+
+      process.stderr.write(`Extracting ${archiveFilename}...\n`);
+      await extractArchive(archivePath, cacheDir);
+
+      if (platform() !== "win32") {
+        spawnSync("chmod", ["+x", cachedCmd]);
+      }
+
+      return {
+        command: cachedCmd,
+        args: target.args ?? [],
+        env: target.env ?? {},
+      };
+    } catch (error) {
+      failures.push(`${cacheDir}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
-  await mkdir(cacheDir, { recursive: true });
-  process.stderr.write(`Downloading ${agentId} from ${archiveUrl}...\n`);
-  await downloadFile(archiveUrl, archivePath);
-
-  process.stderr.write(`Extracting ${archiveFilename}...\n`);
-  await extractArchive(archivePath, cacheDir);
-
-  if (platform() !== "win32") {
-    spawnSync("chmod", ["+x", cachedCmd]);
-  }
-
-  return {
-    command: cachedCmd,
-    args: target.args ?? [],
-    env: target.env ?? {},
-  };
+  throw new Error(
+    `Failed to prepare cached binary for agent "${agentId}". Tried: ${failures.join(" | ")}`,
+  );
 }
 
 async function resolveBinary(agentId: string, dist: BinaryDistribution): Promise<AgentLaunchConfig> {

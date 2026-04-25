@@ -101,6 +101,7 @@ export type {
   AcpRuntimeHistoryEntry,
   AcpRuntimeProjectionUpdate,
   AcpRuntimeProjectionWatcher,
+  AcpRuntimeRegistryListOptions,
   AcpRuntimeReasoningLevel,
   AcpRuntimeResumeOptions,
   AcpRuntimeSessionList,

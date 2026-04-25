@@ -4,7 +4,7 @@ Language:
 - English (default)
 - [简体中文](../zh-CN/guides/runtime-sdk-demo.md)
 
-This page defines the recommended host-side usage of the `acp-runtime` public SDK.
+This page defines the host-side usage of the `acp-runtime` public SDK.
 It is intentionally written only in runtime concepts:
 
 - `AcpRuntime`
@@ -19,9 +19,13 @@ It does not use raw ACP methods or vendor-specific protocol details.
 
 ## Source Demo
 
-- [runtime-sdk-demo.ts](../examples/runtime-sdk-demo.ts)
+- [runtime-sdk-demo.ts](../../examples/runtime-sdk-demo.ts)
 
-This unified example uses `createFromRegistry({ agentId })` as the default host entry point and switches behavior by agent id.
+Recommended companions:
+- [Runtime SDK By Scenario](runtime-sdk-by-scenario.md)
+- [Runtime SDK API Coverage](runtime-sdk-api-coverage.md)
+
+This unified example uses `runtime.sessions.registry.start({ agentId })` as the default host entry point and switches behavior by agent id.
 
 ## Covered Scenarios
 
@@ -36,26 +40,25 @@ This unified example uses `createFromRegistry({ agentId })` as the default host 
 - handle all top-level typed runtime errors
 - run a full end-to-end host workflow
 
-## Demo Shape
+## Position In The Reading Order
 
-The demo is split into focused functions:
+Use this file after the staged examples when you want the entire user-facing host flow in one place:
 
-- `createSessionDemo()`
-- `inspectSessionStateDemo()`
-- `runSimpleTurnDemo()`
-- `sendStructuredTurnDemo()`
-- `streamInteractiveTurnDemo()`
-- `loadAndResumeDemo()`
-- `cancelTurnDemo()`
-- `errorHandlingDemo()`
-- `fullScenarioDemo()`
+- startup
+- session selection
+- interactive turn rendering
+- permissions
+- authentication
+- load / resume
+- snapshot save
+- local CLI commands
 
 ## Design Notes
 
 - The demo treats `runtime` as the host-facing SDK instance.
 - Agent startup is resolved through the runtime's registry-backed entry point instead of hard-coded launch arguments.
-- Raw agent control happens through `setAgentMode()` and `setAgentConfigOption()`.
+- Raw agent control happens through `session.agent.setMode()` and `session.agent.setConfigOption()`.
 - Permission decisions are modeled through `permission` handlers, not raw ACP messages.
 - Tool execution is modeled through `Operation` events, not `tool_call` or `tool_call_update`.
-- Recovery is modeled through `snapshot()` and `resume()`.
+- Recovery is modeled through `session.lifecycle.snapshot()` and `runtime.sessions.resume()`.
 - Host control flow is modeled through typed runtime errors, not vendor `stopReason` values.

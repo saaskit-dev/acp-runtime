@@ -44,6 +44,37 @@ export class AcpRuntime {
   private readonly pendingLoads = new Map<string, Promise<ManagedSessionEntry>>();
   private readonly pendingResumes = new Map<string, Promise<ManagedSessionEntry>>();
 
+  readonly sessions = {
+    start: (options: AcpRuntimeCreateOptions) => this.startSession(options),
+    load: (options: AcpRuntimeLoadOptions) => this.loadSession(options),
+    resume: (options: AcpRuntimeResumeOptions) => this.resumeSession(options),
+    remote: {
+      list: (options: AcpRuntimeListAgentSessionsOptions) =>
+        this.listRemoteSessions(options),
+    },
+    registry: {
+      start: (options: AcpRuntimeCreateFromRegistryOptions) =>
+        this.startSessionFromRegistry(options),
+      load: (options: AcpRuntimeLoadFromRegistryOptions) =>
+        this.loadSessionFromRegistry(options),
+      remote: {
+        list: (
+          options: AcpRuntimeListAgentSessionsFromRegistryOptions,
+        ) => this.listRemoteSessionsFromRegistry(options),
+      },
+    },
+    stored: {
+      list: (options?: AcpRuntimeRegistryListOptions) =>
+        this.listStoredSessionRefs(options),
+      delete: (sessionId: string) => this.deleteStoredSessionRef(sessionId),
+      deleteMany: (options?: AcpRuntimeRegistryListOptions) =>
+        this.deleteStoredSessionsMatching(options),
+      watch: (watcher: AcpRuntimeStoredSessionWatcher) =>
+        this.watchStoredSessionRefs(watcher),
+      refresh: () => this.refreshStoredSessionRefs(),
+    },
+  } as const;
+
   constructor(
     connectionFactory: AcpConnectionFactory,
     private readonly options: RuntimeConstructorOptions = {},
@@ -53,7 +84,9 @@ export class AcpRuntime {
       createAcpSessionService(connectionFactory, options.acp ?? {});
   }
 
-  async create(options: AcpRuntimeCreateOptions): Promise<AcpRuntimeSession> {
+  private async startSession(
+    options: AcpRuntimeCreateOptions,
+  ): Promise<AcpRuntimeSession> {
     try {
       await this.ensureRegistryHydrated();
       const driver = await this.sessionService.create(options);
@@ -66,17 +99,19 @@ export class AcpRuntime {
     }
   }
 
-  async createFromRegistry(
+  private async startSessionFromRegistry(
     options: AcpRuntimeCreateFromRegistryOptions,
   ): Promise<AcpRuntimeSession> {
     const { agentId, ...rest } = options;
-    return this.create({
+    return this.startSession({
       ...rest,
       agent: await this.resolveAgent(agentId),
     });
   }
 
-  async load(options: AcpRuntimeLoadOptions): Promise<AcpRuntimeSession> {
+  private async loadSession(
+    options: AcpRuntimeLoadOptions,
+  ): Promise<AcpRuntimeSession> {
     try {
       await this.ensureRegistryHydrated();
       const existing = this.activeSessions.get(options.sessionId);
@@ -105,17 +140,17 @@ export class AcpRuntime {
     }
   }
 
-  async loadFromRegistry(
+  private async loadSessionFromRegistry(
     options: AcpRuntimeLoadFromRegistryOptions,
   ): Promise<AcpRuntimeSession> {
     const { agentId, ...rest } = options;
-    return this.load({
+    return this.loadSession({
       ...rest,
       agent: await this.resolveAgent(agentId),
     });
   }
 
-  async listAgentSessions(
+  private async listRemoteSessions(
     options: AcpRuntimeListAgentSessionsOptions,
   ): Promise<AcpRuntimeSessionList> {
     try {
@@ -129,17 +164,19 @@ export class AcpRuntime {
     }
   }
 
-  async listAgentSessionsFromRegistry(
+  private async listRemoteSessionsFromRegistry(
     options: AcpRuntimeListAgentSessionsFromRegistryOptions,
   ): Promise<AcpRuntimeSessionList> {
     const { agentId, ...rest } = options;
-    return this.listAgentSessions({
+    return this.listRemoteSessions({
       ...rest,
       agent: await this.resolveAgent(agentId),
     });
   }
 
-  async resume(options: AcpRuntimeResumeOptions): Promise<AcpRuntimeSession> {
+  private async resumeSession(
+    options: AcpRuntimeResumeOptions,
+  ): Promise<AcpRuntimeSession> {
     try {
       await this.ensureRegistryHydrated();
       const sessionId = options.snapshot.session.id;
@@ -169,7 +206,7 @@ export class AcpRuntime {
     }
   }
 
-  async listStoredSessions(
+  private async listStoredSessionRefs(
     options: AcpRuntimeRegistryListOptions = {},
   ): Promise<AcpRuntimeSessionList> {
     await this.ensureRegistryHydrated();
@@ -179,23 +216,25 @@ export class AcpRuntime {
     };
   }
 
-  async deleteStoredSession(sessionId: string): Promise<boolean> {
+  private async deleteStoredSessionRef(sessionId: string): Promise<boolean> {
     await this.ensureRegistryHydrated();
     return (await this.options.registry?.deleteSession(sessionId)) ?? false;
   }
 
-  async deleteStoredSessions(
+  private async deleteStoredSessionsMatching(
     options: AcpRuntimeRegistryListOptions = {},
   ): Promise<number> {
     await this.ensureRegistryHydrated();
     return (await this.options.registry?.deleteSessions(options)) ?? 0;
   }
 
-  watchStoredSessions(watcher: AcpRuntimeStoredSessionWatcher): () => void {
+  private watchStoredSessionRefs(
+    watcher: AcpRuntimeStoredSessionWatcher,
+  ): () => void {
     return this.options.registry?.watch(watcher) ?? (() => {});
   }
 
-  refreshStoredSessions(): void {
+  private refreshStoredSessionRefs(): void {
     this.options.registry?.notifyRefresh();
   }
 

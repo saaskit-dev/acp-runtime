@@ -8,9 +8,13 @@ This page shows the smallest reasonable host integration for the current public 
 
 ## Source Demo
 
-- [runtime-sdk-demo.ts](../examples/runtime-sdk-demo.ts)
+- [runtime-sdk-stage-1-minimal.ts](../../examples/runtime-sdk-stage-1-minimal.ts)
 
-Run it with `simulator` or leave the agent id empty to use `createFromRegistry({ agentId: "simulator-agent-acp-local" })`.
+Use this together with:
+- [Runtime SDK By Scenario](runtime-sdk-by-scenario.md)
+- [Runtime SDK API Coverage](runtime-sdk-api-coverage.md)
+
+This stage uses `runtime.sessions.registry.start({ agentId: "simulator-agent-acp-local" })` as the default path and also shows the explicit `runtime.sessions.start({ agent })` override path.
 
 ## What It Covers
 
@@ -30,4 +34,5 @@ Use this demo when you want:
 ## Next Step
 
 For richer session state, streaming, operations, permissions, resume, and typed error handling, see:
+- [Runtime SDK By Scenario](runtime-sdk-by-scenario.md)
 - [Runtime SDK Demo](runtime-sdk-demo.md)

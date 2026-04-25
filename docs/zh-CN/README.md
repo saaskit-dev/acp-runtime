@@ -12,7 +12,10 @@
 
 - [客户端接入指南](guides/client-integration-guide.md)
 - [Runtime Agent Compatibility](guides/runtime-agent-compatibility.md)
+- [Runtime SDK 分阶段接入](guides/runtime-sdk-by-scenario.md)
 - [Runtime SDK API](guides/runtime-sdk-api.md)
+- [Runtime SDK API 覆盖矩阵](guides/runtime-sdk-api-coverage.md)
+- [Runtime SDK 读模型说明](guides/runtime-sdk-read-models.md)
 - [Runtime SDK Minimal Demo](guides/runtime-sdk-minimal-demo.md)
 - [Runtime SDK Demo](guides/runtime-sdk-demo.md)
 

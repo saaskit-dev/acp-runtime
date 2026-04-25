@@ -57,6 +57,43 @@
 - ACP Session Resume RFD: https://agentclientprotocol.com/rfds/session-resume
 - [Client Integration Guide](docs/guides/client-integration-guide.md)
 
+## Quick Start
+
+如果你是把 `acp-runtime` 接到产品宿主里，建议先从这个最小例子开始：
+
+```ts
+import {
+  AcpRuntime,
+  AcpRuntimeJsonSessionRegistryStore,
+  AcpRuntimeSessionRegistry,
+  createStdioAcpConnectionFactory,
+} from "@saaskit-dev/acp-runtime";
+
+const registry = new AcpRuntimeSessionRegistry({
+  store: new AcpRuntimeJsonSessionRegistryStore(".tmp/runtime-registry.json"),
+});
+
+const runtime = new AcpRuntime(createStdioAcpConnectionFactory(), { registry });
+
+const session = await runtime.sessions.registry.start({
+  agentId: "claude-acp",
+  cwd: process.cwd(),
+  handlers: {
+    permission: () => ({ decision: "allow", scope: "session" }),
+  },
+});
+
+const text = await session.turn.run("Summarize the current workspace.");
+const snapshot = session.lifecycle.snapshot();
+
+await session.lifecycle.close();
+```
+
+接下来建议按这个顺序看：
+- [Runtime SDK 分阶段接入](docs/zh-CN/guides/runtime-sdk-by-scenario.md)
+- [Runtime SDK 读模型说明](docs/zh-CN/guides/runtime-sdk-read-models.md)
+- [Runtime SDK API 覆盖矩阵](docs/zh-CN/guides/runtime-sdk-api-coverage.md)
+
 ## 仓库结构
 
 - `src/`：只放 runtime 库源码
@@ -101,8 +138,8 @@ npx @saaskit-dev/simulator-agent-acp@latest
 
 当前 runtime 对外已经收敛成三个核心概念：
 
-- `AcpRuntime`：宿主侧入口，负责 `create` / `load` / `resume` / session list
-- `AcpRuntimeSession`：统一的 session 对象模型，承载 policy、turn、snapshot 和关闭/取消/配置能力
+- `AcpRuntime`：宿主侧入口，负责 `runtime.sessions.*`
+- `AcpRuntimeSession`：统一的 session 对象模型，承载 `session.agent.*`、`session.turn.*`、`session.model.*`、`session.live.*`、`session.lifecycle.*`
 - `AcpSessionDriver`：内部 driver 边界，用来抹平不同 ACP agent 的行为差异
 
 内部的 ACP 实现分成三块：
@@ -118,13 +155,17 @@ npx @saaskit-dev/simulator-agent-acp@latest
 
 ```ts
 const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
-const session = await runtime.createFromRegistry({
+const session = await runtime.sessions.registry.start({
   agentId: "claude-acp",
   cwd: process.cwd(),
 });
 ```
 
 如果只想先拿到解析后的启动配置而不立即创建 session，可以使用 `resolveRuntimeAgentFromRegistry(agentId)`。
+
+建议先看：
+- [Runtime SDK 分阶段接入](docs/zh-CN/guides/runtime-sdk-by-scenario.md)
+- [Runtime SDK API 覆盖矩阵](docs/zh-CN/guides/runtime-sdk-api-coverage.md)
 
 ## 当前验证状态
 

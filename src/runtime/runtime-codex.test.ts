@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   AcpPermissionDeniedError,
   AcpRuntime,
+  type AcpRuntimeSession,
   type AcpRuntimeTurnEvent,
   createCodexAcpAgent,
   createStdioAcpConnectionFactory,
@@ -26,6 +27,15 @@ afterEach(async () => {
 
 function shouldSkipCodexContract(): boolean {
   return process.env.ACP_RUNTIME_SKIP_CODEX_TEST === "1";
+}
+
+function isCommandInPath(command: string): boolean {
+  const which = process.platform === "win32" ? "where" : "which";
+  const result = spawnSync(which, [command], {
+    encoding: "utf8",
+    stdio: "pipe",
+  });
+  return result.status === 0;
 }
 
 function hasCodexCredentials(): boolean {
@@ -58,7 +68,7 @@ async function resolveCodexContractAgent() {
   if (process.env.ACP_RUNTIME_RUN_CODEX_TEST === "1") {
     return {
       createSession(runtime: AcpRuntime, cwd: string) {
-        return runtime.create({
+        return runtime.sessions.start({
           agent: createCodexAcpAgent({ via: "npx" }),
           cwd,
         });
@@ -66,11 +76,18 @@ async function resolveCodexContractAgent() {
     } as const;
   }
 
+  if (!isCommandInPath("codex-acp")) {
+    return {
+      skipReason:
+        "codex-acp is not installed locally; skipping registry-backed launch that would require package download or binary fetch. Set ACP_RUNTIME_RUN_CODEX_TEST=1 to force it.",
+    } as const;
+  }
+
   try {
     await resolveRuntimeAgentFromRegistry("codex-acp");
     return {
       createSession(runtime: AcpRuntime, cwd: string) {
-        return runtime.createFromRegistry({
+        return runtime.sessions.registry.start({
           agentId: "codex-acp",
           cwd,
         });
@@ -107,7 +124,7 @@ describe("AcpRuntime x Codex ACP", () => {
         }),
       );
       let stage = "create";
-      let session: Awaited<ReturnType<AcpRuntime["create"]>> | undefined;
+      let session: AcpRuntimeSession | undefined;
 
       try {
         trace.push(`stage=${stage}`);
@@ -116,13 +133,13 @@ describe("AcpRuntime x Codex ACP", () => {
         expect(session.metadata.id).toBeTruthy();
         expect(session.capabilities.agent.prompt).toBe(true);
         expect(
-          session.listAgentModes().some((mode) => mode.id === "read-only"),
+          session.agent.listModes().some((mode) => mode.id === "read-only"),
         ).toBe(true);
         const firstEvents: AcpRuntimeTurnEvent[] = [];
 
         stage = "send";
         trace.push(`stage=${stage}`);
-        const result = await session.send("Reply with exactly the word READY.", {
+        const result = await session.turn.send("Reply with exactly the word READY.", {
           onEvent(event) {
             firstEvents.push(event);
             trace.push(`event: ${JSON.stringify(event)}`);
@@ -135,14 +152,14 @@ describe("AcpRuntime x Codex ACP", () => {
 
         stage = "set-read-only";
         trace.push(`stage=${stage}`);
-        await session.setAgentMode("read-only");
+        await session.agent.setMode("read-only");
         expect(session.metadata.currentModeId).toBe("read-only");
 
         const deniedEvents: AcpRuntimeTurnEvent[] = [];
         stage = "permission-denied";
         trace.push(`stage=${stage}`);
         await expect(
-          session.send(
+          session.turn.send(
             "Write the exact text 'denied' into ./codex-readonly-denied.txt using tools, then report success.",
             {
               onEvent(event) {
@@ -170,7 +187,7 @@ describe("AcpRuntime x Codex ACP", () => {
         }
         throw error;
       } finally {
-        await session?.close().catch(() => undefined);
+        await session?.lifecycle.close().catch(() => undefined);
       }
     },
     240_000,

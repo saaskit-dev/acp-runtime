@@ -6,9 +6,13 @@
 
 ## 示例源码
 
-- [runtime-sdk-demo.ts](../../examples/runtime-sdk-demo.ts)
+- [runtime-sdk-stage-1-minimal.ts](../../../examples/runtime-sdk-stage-1-minimal.ts)
 
-这个示例在不传 agent id 时默认使用 `createFromRegistry({ agentId: "simulator-agent-acp-local" })`。
+建议配合阅读：
+- [Runtime SDK 分阶段接入](runtime-sdk-by-scenario.md)
+- [Runtime SDK API 覆盖矩阵](runtime-sdk-api-coverage.md)
+
+这一阶段默认使用 `runtime.sessions.registry.start({ agentId: "simulator-agent-acp-local" })`，同时也展示显式 `runtime.sessions.start({ agent })` 的 override 路径。
 
 ## 覆盖内容
 
@@ -28,4 +32,5 @@
 ## 下一步
 
 如果要看更完整的 session state、stream、operation、permission、resume 和 typed error handling，见：
+- [Runtime SDK 分阶段接入](runtime-sdk-by-scenario.md)
 - [Runtime SDK Demo](runtime-sdk-demo.md)

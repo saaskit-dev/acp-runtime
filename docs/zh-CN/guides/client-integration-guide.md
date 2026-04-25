@@ -9,7 +9,7 @@
 
 ```ts
 const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
-const session = await runtime.createFromRegistry({
+const session = await runtime.sessions.registry.start({
   agentId: "simulator-agent-acp-local",
   cwd: process.cwd(),
 });
@@ -36,7 +36,7 @@ const session = await runtime.createFromRegistry({
 ## 0. Runtime 宿主捷径
 
 如果你的产品是把 `acp-runtime` 当成宿主 SDK 接入，通常不需要自己手动拉起 agent 进程。
-默认推荐走 `createFromRegistry({ agentId })`。
+默认推荐走 `runtime.sessions.registry.start({ agentId })`。
 只有在你实现更底层的 ACP client 或 transport adapter 时，才需要回到手动管理 stdio 子进程的路径。
 
 ## 1. Agent 形态

@@ -30,6 +30,9 @@ Protocol alignment for the simulator is tracked with explicit metadata:
 ## Entry Points
 
 - [Client Integration Guide](docs/guides/client-integration-guide.md)
+- [Runtime SDK By Scenario](docs/guides/runtime-sdk-by-scenario.md)
+- [Runtime SDK Read Models](docs/guides/runtime-sdk-read-models.md)
+- [Runtime SDK API Coverage](docs/guides/runtime-sdk-api-coverage.md)
 - [RFC-0001: Runtime Public Abstraction](docs/rfcs/0001-runtime-public-abstraction.md)
 - [RFC-0002: Runtime Execution and Authority](docs/rfcs/0002-runtime-execution-and-authority.md)
 - [RFC-0003: Runtime Snapshot, Policy, and Recovery](docs/rfcs/0003-runtime-snapshot-policy-and-recovery.md)
@@ -37,6 +40,43 @@ Protocol alignment for the simulator is tracked with explicit metadata:
 - [RFC-0005: Simulator Agent ACP](docs/rfcs/0005-simulator-agent.md)
 - [Protocol Coverage Matrix](docs/research/protocol-coverage-matrix.md)
 - [Documentation Index](docs/README.md)
+
+## Quick Start
+
+If you are integrating `acp-runtime` into a product host, start here:
+
+```ts
+import {
+  AcpRuntime,
+  AcpRuntimeJsonSessionRegistryStore,
+  AcpRuntimeSessionRegistry,
+  createStdioAcpConnectionFactory,
+} from "@saaskit-dev/acp-runtime";
+
+const registry = new AcpRuntimeSessionRegistry({
+  store: new AcpRuntimeJsonSessionRegistryStore(".tmp/runtime-registry.json"),
+});
+
+const runtime = new AcpRuntime(createStdioAcpConnectionFactory(), { registry });
+
+const session = await runtime.sessions.registry.start({
+  agentId: "claude-acp",
+  cwd: process.cwd(),
+  handlers: {
+    permission: () => ({ decision: "allow", scope: "session" }),
+  },
+});
+
+const text = await session.turn.run("Summarize the current workspace.");
+const snapshot = session.lifecycle.snapshot();
+
+await session.lifecycle.close();
+```
+
+Then read in this order:
+- [Runtime SDK By Scenario](docs/guides/runtime-sdk-by-scenario.md)
+- [Runtime SDK Read Models](docs/guides/runtime-sdk-read-models.md)
+- [Runtime SDK API Coverage](docs/guides/runtime-sdk-api-coverage.md)
 
 ## Open Source Conventions
 
@@ -104,8 +144,8 @@ Generated runtime state now defaults to `./.tmp/` so the repository root stays c
 
 The current runtime surface is organized around three public concepts:
 
-- `AcpRuntime`: host-facing entry point for `create`, `load`, `resume`, and agent session listing
-- `AcpRuntimeSession`: unified object model for session state, raw agent modes/options, turns, snapshots, and close/cancel operations
+- `AcpRuntime`: host-facing entry point for `runtime.sessions.*`
+- `AcpRuntimeSession`: unified object model for `session.agent.*`, `session.turn.*`, `session.model.*`, `session.live.*`, and `session.lifecycle.*`
 - `AcpSessionDriver`: internal driver boundary used to normalize ACP agent differences behind the runtime session API
 
 Internally, ACP-specific behavior is split into:
@@ -121,6 +161,10 @@ The repository now documents a stricter compatibility boundary:
 - explicit profile fallbacks must be marked as policy, not generic ACP behavior
 
 See [Runtime Agent Compatibility](docs/guides/runtime-agent-compatibility.md).
+For the recommended learning order, start with
+[Runtime SDK By Scenario](docs/guides/runtime-sdk-by-scenario.md).
+For a method-by-method lookup, use
+[Runtime SDK API Coverage](docs/guides/runtime-sdk-api-coverage.md).
 
 This is intentionally not a generic multi-protocol abstraction. The runtime is ACP-focused, but still normalizes behavioral differences across ACP agents.
 
@@ -129,7 +173,7 @@ Hosts can ask the runtime to resolve launch config from the ACP registry instead
 
 ```ts
 const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
-const session = await runtime.createFromRegistry({
+const session = await runtime.sessions.registry.start({
   agentId: "claude-acp",
   cwd: process.cwd(),
 });
@@ -153,7 +197,7 @@ The repository now has runtime-level validation for the currently integrated ACP
 
 The Claude Code contract test now resolves launch config from the ACP registry by default.
 If `claude-agent-acp` is already on `PATH`, it uses the local binary.
-Otherwise it falls back to the registry-defined distribution, which currently means `npx @agentclientprotocol/claude-agent-acp`.
+If the local binary is not installed, the default test suite now skips that real-environment contract test rather than forcing a package download through `npx`.
 
 If you want to force the legacy direct `npx` path without consulting the registry first, set:
 
@@ -169,7 +213,7 @@ ACP_RUNTIME_SKIP_CLAUDE_CODE_TEST=1 pnpm test
 
 The Codex contract test also resolves launch config from the ACP registry by default.
 If `codex-acp` is already on `PATH`, it uses the local binary.
-Otherwise it falls back to the registry-defined distribution, which currently means `npx @zed-industries/codex-acp`.
+If the local binary is not installed, the default test suite now skips that real-environment contract test rather than forcing a package download or registry binary fetch.
 
 If you want to force the direct `npx` path for Codex, set:
 
@@ -184,6 +228,16 @@ ACP_RUNTIME_SKIP_CODEX_TEST=1 pnpm test
 ```
 
 If the registry launch cannot be resolved, the default test suite skips that contract test and still runs the deterministic simulator-backed runtime integration test.
+
+## Session Handle Lifecycle
+
+Runtime session handles are ref-counted wrappers over an underlying runtime-managed session driver.
+
+- repeated `runtime.sessions.load()` calls for the same `sessionId` share one underlying driver
+- repeated `runtime.sessions.resume()` calls for the same `snapshot.session.id` share one underlying driver
+- closing one handle does not invalidate sibling handles for the same runtime session
+- the underlying driver closes only after the final live handle closes
+- once a specific handle is closed, that handle rejects new turn and mutation calls
 
 ## Additional Docs
 

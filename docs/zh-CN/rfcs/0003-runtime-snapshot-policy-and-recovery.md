@@ -42,10 +42,10 @@
 
 当前代码里的直接对应关系是：
 
-- `session.snapshot()`：公共 snapshot 生成入口
+- `session.lifecycle.snapshot()`：公共 snapshot 生成入口
 - `session-registry.ts`：维护 `session.id -> snapshot`
 - `session-registry-store.ts`：JSON 持久化存储
-- `runtime.resume()`：接收 runtime snapshot，而不是协议碎片
+- `runtime.sessions.resume()`：接收 runtime snapshot，而不是协议碎片
 - `acp/profiles/`：把 runtime policy 投影到具体 agent 的 ACP mode/config 操作
 
 `Snapshot` 不是：
@@ -94,7 +94,7 @@
 
 ## 6. Resume 语义
 
-`resume()` 是 runtime 动作，不是简单协议动作。
+`runtime.sessions.resume()` 是 runtime 动作，不是简单协议动作。
 
 建议流程：
 
@@ -158,13 +158,13 @@ runtime 不负责：
 
 从 Public SDK 的视角：
 
-- 应暴露 `snapshot()` 或等价 API
-- `resume()` 的输入应是 runtime snapshot，而不是协议碎片
+- 应暴露 `session.lifecycle.snapshot()` 或等价 API
+- `runtime.sessions.resume()` 的输入应是 runtime snapshot，而不是协议碎片
 - 顶层不应把 raw vendor state 当作恢复对象
 
 ## 11. 最终结论
 
-`Snapshot` 负责“恢复点”，`Policy` 负责“恢复意图”，`resume` 负责把两者重新组装成一个 runtime session。
+`Snapshot` 负责“恢复点”，`Policy` 负责“恢复意图”，`runtime.sessions.resume()` 负责把两者重新组装成一个 runtime session。
 
 以后如果实现把这三者重新混成一个协议化 JSON blob，应视为偏离本 RFC。
 

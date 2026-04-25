@@ -44,9 +44,10 @@ async function main(): Promise<void> {
   for (const result of results) {
     const marker = result.status === "PASS" ? "✓" : "✗";
     const color = result.status === "PASS" ? "\x1b[32m" : "\x1b[31m";
+    const reset = "\x1b[0m";
     const idPart = result.id ? ` (${result.id})` : "";
     const errorPart = result.error ? ` — ${result.error}` : "";
-    console.log(`  ${color}${marker}\x1b[0m ${result.file}${idPart}${errorPart}`);
+    console.log(`  ${color}${marker}${reset} ${result.file}${idPart}${errorPart}`);
   }
 
   console.log();
