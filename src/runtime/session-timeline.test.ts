@@ -296,6 +296,28 @@ describe("AcpRuntimeSessionTimeline", () => {
     ]);
   });
 
+  it("isolates watcher failures from other watchers and state updates", () => {
+    const timeline = new AcpRuntimeSessionTimeline();
+    const updates: string[] = [];
+    timeline.watch(() => {
+      throw new Error("watcher failed");
+    });
+    timeline.watch((update) => {
+      updates.push(update.type);
+    });
+
+    expect(() => timeline.appendPrompt("hello", "turn-1")).not.toThrow();
+
+    expect(updates).toEqual(["thread_entry_added"]);
+    expect(timeline.entries).toEqual([
+      expect.objectContaining({
+        kind: "user_message",
+        text: "hello",
+        turnId: "turn-1",
+      }),
+    ]);
+  });
+
   it("keeps terminal and diff lifecycle metadata across repeated updates", () => {
     const timeline = new AcpRuntimeSessionTimeline();
     const diffUpdates: string[] = [];
@@ -527,7 +549,9 @@ describe("AcpRuntimeSessionTimeline", () => {
           updates.push(`metadata:${update.metadata.id}`);
           break;
         case "usage_projection_updated":
-          updates.push(`usage:${update.usage.totalTokens ?? 0}`);
+          updates.push(
+            `usage:${update.usage.totalTokens ?? update.usage.contextUsedTokens ?? 0}`,
+          );
           break;
         case "operation_projection_updated":
           updates.push(
@@ -572,7 +596,8 @@ describe("AcpRuntimeSessionTimeline", () => {
       turnId: "turn-1",
       type: "usage_updated",
       usage: {
-        totalTokens: 42,
+        contextUsedTokens: 42,
+        contextWindowTokens: 200_000,
       },
     });
     timeline.appendTimelineEntry({
@@ -723,7 +748,8 @@ describe("AcpRuntimeSessionTimeline", () => {
       title: "Session 1",
     });
     expect(timeline.projectionUsage).toEqual({
-      totalTokens: 42,
+      contextUsedTokens: 42,
+      contextWindowTokens: 200_000,
     });
     expect(updates).toEqual([
       "metadata:session-1",

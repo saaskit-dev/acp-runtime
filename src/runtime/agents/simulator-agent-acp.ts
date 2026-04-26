@@ -2,7 +2,7 @@ import type { AcpRuntimeAgent } from "../core/types.js";
 import {
   createNpxCommandLaunch,
   resolvePackageSpec,
-} from "../../internal/launch-config.js";
+} from "./launch-config.js";
 
 export const SIMULATOR_AGENT_ACP_COMMAND = "simulator-agent-acp";
 export const SIMULATOR_AGENT_ACP_REGISTRY_ID = "simulator-agent-acp";

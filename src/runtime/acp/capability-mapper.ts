@@ -84,7 +84,7 @@ function mapImplementationInfo(
 }
 
 export function extractRuntimeConfig(
-  options: SessionConfigOption[] | null | undefined,
+  options: readonly SessionConfigOption[] | null | undefined,
 ): Readonly<Record<string, AcpRuntimeConfigValue>> | undefined {
   if (!options || options.length === 0) {
     return undefined;
@@ -121,7 +121,7 @@ export function mapSessionModes(
 }
 
 export function mapSessionConfigOptions(
-  options: SessionConfigOption[] | null | undefined,
+  options: readonly SessionConfigOption[] | null | undefined,
 ): readonly AcpRuntimeAgentConfigOption[] | undefined {
   if (!options?.length) {
     return undefined;
@@ -132,25 +132,34 @@ export function mapSessionConfigOptions(
     description: option.description ?? undefined,
     id: option.id,
     name: option.name,
-    options:
-      option.type === "select"
-        ? option.options
-            .filter(
-              (
-                entry,
-              ): entry is {
-                description?: string | null;
-                name: string;
-                value: string;
-              } => "value" in entry,
-            )
-            .map((entry) => ({
-              description: entry.description ?? undefined,
-              name: entry.name,
-              value: entry.value,
-            }))
-        : undefined,
+    options: mapSessionConfigOptionChoices(option),
     type: option.type,
     value: option.currentValue,
   }));
+}
+
+function mapSessionConfigOptionChoices(
+  option: SessionConfigOption,
+): AcpRuntimeAgentConfigOption["options"] {
+  if (option.type !== "select") {
+    return undefined;
+  }
+
+  return option.options.flatMap((entry) => {
+    if ("value" in entry) {
+      return [
+        {
+          description: entry.description ?? undefined,
+          name: entry.name,
+          value: entry.value,
+        },
+      ];
+    }
+
+    return entry.options.map((choice) => ({
+      description: choice.description ?? undefined,
+      name: choice.name,
+      value: choice.value,
+    }));
+  });
 }

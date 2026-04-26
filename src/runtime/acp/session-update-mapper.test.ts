@@ -21,6 +21,67 @@ function createMetadata(): AcpRuntimeSessionMetadata {
 }
 
 describe("session update mapper permission evidence", () => {
+  it("updates config values and option metadata from config option updates", () => {
+    const metadata = createMetadata();
+    const events = mapSessionUpdateToRuntimeEvents({
+      diagnostics: {},
+      metadata,
+      notification: {
+        sessionId: "session-1",
+        update: {
+          configOptions: [
+            {
+              category: "model",
+              currentValue: "gpt-5.5",
+              id: "model",
+              name: "Model",
+              options: [
+                {
+                  name: "GPT-5.5",
+                  value: "gpt-5.5",
+                },
+              ],
+              type: "select",
+            },
+          ],
+          sessionUpdate: "config_option_update",
+        },
+      } as never,
+      profile,
+      turn: createTurnState(),
+    });
+
+    expect(metadata.config).toEqual({
+      model: "gpt-5.5",
+    });
+    expect(metadata.agentConfigOptions).toEqual([
+      {
+        category: "model",
+        description: undefined,
+        id: "model",
+        name: "Model",
+        options: [
+          {
+            description: undefined,
+            name: "GPT-5.5",
+            value: "gpt-5.5",
+          },
+        ],
+        type: "select",
+        value: "gpt-5.5",
+      },
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      metadata: {
+        config: {
+          model: "gpt-5.5",
+        },
+      },
+      type: "metadata_updated",
+    });
+  });
+
   it("preserves request -> cancelled evidence on denied permissions", () => {
     const turn = createTurnState();
     const mapped = mapPermissionRequest({

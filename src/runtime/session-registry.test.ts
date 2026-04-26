@@ -4,10 +4,8 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import {
-  AcpRuntimeJsonSessionRegistryStore,
-  AcpRuntimeSessionRegistry,
-} from "./index.js";
+import { AcpRuntimeSessionRegistry } from "./registry/session-registry.js";
+import { AcpRuntimeJsonSessionRegistryStore } from "./registry/session-registry-store.js";
 import type { AcpRuntimeSnapshot } from "./core/types.js";
 
 const tempDirs: string[] = [];
@@ -194,5 +192,44 @@ describe("AcpRuntimeSessionRegistry persistence", () => {
       "refresh",
     ]);
     expect(registry.listSessions().sessions).toEqual([]);
+  });
+
+  it("merges concurrent registry writes from separate registry instances", async () => {
+    const root = await mkdtemp(join(tmpdir(), "acp-runtime-registry-"));
+    tempDirs.push(root);
+    const path = join(root, "registry.json");
+    const first = new AcpRuntimeSessionRegistry({
+      store: new AcpRuntimeJsonSessionRegistryStore(path),
+    });
+    const second = new AcpRuntimeSessionRegistry({
+      store: new AcpRuntimeJsonSessionRegistryStore(path),
+    });
+
+    await Promise.all([
+      first.rememberSnapshot(
+        createSnapshot({
+          agentType: "agent-alpha",
+          cwd: "/tmp/project-alpha",
+          sessionId: "session-alpha",
+        }),
+      ),
+      second.rememberSnapshot(
+        createSnapshot({
+          agentType: "agent-beta",
+          cwd: "/tmp/project-beta",
+          sessionId: "session-beta",
+        }),
+      ),
+    ]);
+
+    const reader = new AcpRuntimeSessionRegistry({
+      store: new AcpRuntimeJsonSessionRegistryStore(path),
+    });
+    await reader.hydrate();
+
+    expect(reader.listSessions().sessions.map((session) => session.id).sort()).toEqual([
+      "session-alpha",
+      "session-beta",
+    ]);
   });
 });

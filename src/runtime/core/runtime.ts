@@ -7,25 +7,37 @@ import {
 } from "./errors.js";
 import { resolveRuntimeAgentFromRegistry } from "../registry/agent-resolver.js";
 import { AcpRuntimeSession } from "./session.js";
+import { ACP_RUNTIME_SNAPSHOT_VERSION } from "./constants.js";
 import type { AcpSessionDriver, AcpSessionService } from "./session-driver.js";
 import {
   createAcpSessionService,
   type AcpSessionServiceOptions,
 } from "../acp/session-service.js";
+import { SingleFlight } from "./concurrency.js";
 import type { AcpConnectionFactory } from "../acp/connection-types.js";
+import { resolveRuntimeHomePath } from "../paths.js";
+import { AcpRuntimeSessionRegistry } from "../registry/session-registry.js";
+import { AcpRuntimeJsonSessionRegistryStore } from "../registry/session-registry-store.js";
 import type {
+  AcpRuntimeAgent,
+  AcpRuntimeAgentInput,
   AcpRuntimeCreateOptions,
-  AcpRuntimeCreateFromRegistryOptions,
   AcpRuntimeListAgentSessionsOptions,
-  AcpRuntimeListAgentSessionsFromRegistryOptions,
+  AcpRuntimeListSessionsOptions,
   AcpRuntimeLoadOptions,
-  AcpRuntimeLoadFromRegistryOptions,
+  AcpRuntimeLoadSessionOptions,
   AcpRuntimeOptions,
   AcpRuntimeRegistryListOptions,
   AcpRuntimeResumeOptions,
+  AcpRuntimeResumeSessionOptions,
   AcpRuntimeSessionList,
-  AcpRuntimeStoredSessionWatcher,
+  AcpRuntimeSessionReference,
+  AcpRuntimeSnapshot,
+  AcpRuntimeStartSessionOptions,
 } from "./types.js";
+import { SeverityNumber } from "@opentelemetry/api-logs";
+import { emitRuntimeLog } from "../observability/logging.js";
+import { sessionAttributes, withSpan } from "../observability/tracing.js";
 
 type RuntimeConstructorOptions = AcpRuntimeOptions & {
   acp?: AcpSessionServiceOptions;
@@ -39,203 +51,462 @@ type ManagedSessionEntry = {
 };
 
 export class AcpRuntime {
+  private readonly options: RuntimeConstructorOptions;
+  private readonly sessionRegistry?: AcpRuntimeSessionRegistry;
   private readonly sessionService: AcpSessionService;
   private readonly activeSessions = new Map<string, ManagedSessionEntry>();
-  private readonly pendingLoads = new Map<string, Promise<ManagedSessionEntry>>();
-  private readonly pendingResumes = new Map<string, Promise<ManagedSessionEntry>>();
+  private readonly closingSessions = new Map<string, Promise<void>>();
+  private readonly pendingOpens = new SingleFlight<ManagedSessionEntry>();
 
   readonly sessions = {
-    start: (options: AcpRuntimeCreateOptions) => this.startSession(options),
-    load: (options: AcpRuntimeLoadOptions) => this.loadSession(options),
-    resume: (options: AcpRuntimeResumeOptions) => this.resumeSession(options),
-    remote: {
-      list: (options: AcpRuntimeListAgentSessionsOptions) =>
-        this.listRemoteSessions(options),
-    },
-    registry: {
-      start: (options: AcpRuntimeCreateFromRegistryOptions) =>
-        this.startSessionFromRegistry(options),
-      load: (options: AcpRuntimeLoadFromRegistryOptions) =>
-        this.loadSessionFromRegistry(options),
-      remote: {
-        list: (
-          options: AcpRuntimeListAgentSessionsFromRegistryOptions,
-        ) => this.listRemoteSessionsFromRegistry(options),
-      },
-    },
-    stored: {
-      list: (options?: AcpRuntimeRegistryListOptions) =>
-        this.listStoredSessionRefs(options),
-      delete: (sessionId: string) => this.deleteStoredSessionRef(sessionId),
-      deleteMany: (options?: AcpRuntimeRegistryListOptions) =>
-        this.deleteStoredSessionsMatching(options),
-      watch: (watcher: AcpRuntimeStoredSessionWatcher) =>
-        this.watchStoredSessionRefs(watcher),
-      refresh: () => this.refreshStoredSessionRefs(),
-    },
+    start: (options: AcpRuntimeStartSessionOptions) =>
+      this.startSessionFromInput(options),
+    load: (options: AcpRuntimeLoadSessionOptions) =>
+      this.loadSessionFromInput(options),
+    resume: (options: AcpRuntimeResumeSessionOptions) =>
+      this.resumeSessionFromInput(options),
+    list: (options: AcpRuntimeListSessionsOptions = {}) =>
+      this.listSessions(options),
   } as const;
 
+  constructor(connectionFactory: AcpConnectionFactory, options?: AcpRuntimeOptions);
   constructor(
     connectionFactory: AcpConnectionFactory,
-    private readonly options: RuntimeConstructorOptions = {},
+    options: RuntimeConstructorOptions = {},
   ) {
+    this.options = options;
+    this.sessionRegistry = createSessionRegistry(options);
     this.sessionService =
       options.sessionService ??
       createAcpSessionService(connectionFactory, options.acp ?? {});
   }
 
+  private async startSessionFromInput(
+    options: AcpRuntimeStartSessionOptions,
+  ): Promise<AcpRuntimeSession> {
+    return this.startSession({
+      ...options,
+      agent: await this.resolveAgentInput(options.agent),
+    });
+  }
+
+  private async loadSessionFromInput(
+    options: AcpRuntimeLoadSessionOptions,
+  ): Promise<AcpRuntimeSession> {
+    const resolved = await this.resolveSessionOpenOptions(options);
+    return this.loadSession({
+      ...resolved,
+      sessionId: options.sessionId,
+    });
+  }
+
+  private async resumeSessionFromInput(
+    options: AcpRuntimeResumeSessionOptions,
+  ): Promise<AcpRuntimeSession> {
+    const resolved = await this.resolveSessionOpenOptions(options);
+    const storedSnapshot = await this.getStoredSnapshot(options.sessionId);
+    const snapshot: AcpRuntimeSnapshot = {
+      ...(storedSnapshot ?? {
+        session: { id: options.sessionId },
+        version: ACP_RUNTIME_SNAPSHOT_VERSION,
+      }),
+      agent: resolved.agent,
+      cwd: resolved.cwd,
+      mcpServers: resolved.mcpServers ?? storedSnapshot?.mcpServers,
+      session: { id: options.sessionId },
+      version: storedSnapshot?.version ?? ACP_RUNTIME_SNAPSHOT_VERSION,
+    };
+    return this.resumeSession({
+      handlers: options.handlers,
+      queue: options.queue,
+      snapshot,
+    });
+  }
+
   private async startSession(
     options: AcpRuntimeCreateOptions,
   ): Promise<AcpRuntimeSession> {
-    try {
-      await this.ensureRegistryHydrated();
-      const driver = await this.sessionService.create(options);
-      return await this.registerManagedSession(driver);
-    } catch (error) {
-      if (error instanceof AcpError) {
-        throw error;
-      }
-      throw new AcpCreateError("Failed to create runtime session.", error);
-    }
-  }
-
-  private async startSessionFromRegistry(
-    options: AcpRuntimeCreateFromRegistryOptions,
-  ): Promise<AcpRuntimeSession> {
-    const { agentId, ...rest } = options;
-    return this.startSession({
-      ...rest,
-      agent: await this.resolveAgent(agentId),
-    });
+    return withSpan(
+      "acp.session.start",
+      {
+        attributes: sessionAttributes({
+          action: "start",
+          agent: options.agent,
+          cwd: options.cwd,
+        }),
+      },
+      async (span, spanContext) => {
+        try {
+          await this.ensureRegistryHydrated();
+          const driver = await this.sessionService.create({
+            ...options,
+            _observability: this.options.observability,
+            _traceContext: spanContext,
+          } as AcpRuntimeCreateOptions);
+          const sessionId = driver.snapshot().session.id;
+          span.setAttribute("acp.session.id", sessionId);
+          emitRuntimeLog({
+            attributes: sessionAttributes({
+              action: "start",
+              agent: options.agent,
+              cwd: options.cwd,
+              sessionId,
+            }),
+            body: "Runtime session started.",
+            context: spanContext,
+            eventName: "acp.session.start",
+          });
+          return await this.registerManagedSession(driver);
+        } catch (error) {
+          emitRuntimeLog({
+            attributes: sessionAttributes({
+              action: "start",
+              agent: options.agent,
+              cwd: options.cwd,
+            }),
+            body: error instanceof Error ? error.message : String(error),
+            context: spanContext,
+            eventName: "acp.session.start.failed",
+            exception: error,
+            severityNumber: SeverityNumber.ERROR,
+          });
+          if (error instanceof AcpError) {
+            throw error;
+          }
+          throw new AcpCreateError("Failed to create runtime session.", error);
+        }
+      },
+    );
   }
 
   private async loadSession(
     options: AcpRuntimeLoadOptions,
   ): Promise<AcpRuntimeSession> {
-    try {
-      await this.ensureRegistryHydrated();
-      const existing = this.activeSessions.get(options.sessionId);
-      if (existing) {
-        return this.acquireSessionHandle(existing);
-      }
+    return withSpan(
+      "acp.session.load",
+      {
+        attributes: sessionAttributes({
+          action: "load",
+          agent: options.agent,
+          cwd: options.cwd,
+          sessionId: options.sessionId,
+        }),
+      },
+      async (span, spanContext) => {
+        try {
+          await this.ensureRegistryHydrated();
+          let reused = false;
+          const existing = this.activeSessions.get(options.sessionId);
+          if (existing) {
+            reused = true;
+            span.setAttribute("acp.session.reused", true);
+            emitRuntimeLog({
+              attributes: sessionAttributes({
+                action: "load",
+                agent: options.agent,
+                cwd: options.cwd,
+                reused,
+                sessionId: existing.sessionId,
+              }),
+              body: "Runtime session loaded.",
+              context: spanContext,
+              eventName: "acp.session.load",
+            });
+            if (options.queue) {
+              existing.driver.setQueuePolicy(options.queue);
+            }
+            return this.acquireSessionHandle(existing);
+          }
 
-      let pending = this.pendingLoads.get(options.sessionId);
-      if (!pending) {
-        pending = this.sessionService
-          .load(options)
-          .then((driver) => this.registerManagedSessionEntry(driver))
-          .finally(() => {
-            this.pendingLoads.delete(options.sessionId);
+          const pending = this.pendingOpens.do(options.sessionId, async () => {
+            await this.waitForSessionClose(options.sessionId);
+            const active = this.activeSessions.get(options.sessionId);
+            if (active) {
+              return active;
+            }
+            return this.registerManagedSessionEntry(
+              await this.sessionService.load({
+                ...options,
+                _observability: this.options.observability,
+                _traceContext: spanContext,
+              } as AcpRuntimeLoadOptions),
+            );
           });
-        this.pendingLoads.set(options.sessionId, pending);
-      }
+          reused = this.activeSessions.has(options.sessionId);
+          if (reused) {
+            span.setAttribute("acp.session.reused", true);
+          }
 
-      const entry = await pending;
-      return this.acquireSessionHandle(entry);
-    } catch (error) {
-      if (error instanceof AcpError) {
-        throw error;
-      }
-      throw new AcpLoadError("Failed to load runtime session.", error);
-    }
-  }
-
-  private async loadSessionFromRegistry(
-    options: AcpRuntimeLoadFromRegistryOptions,
-  ): Promise<AcpRuntimeSession> {
-    const { agentId, ...rest } = options;
-    return this.loadSession({
-      ...rest,
-      agent: await this.resolveAgent(agentId),
-    });
+          const entry = await pending;
+          if (options.queue) {
+            entry.driver.setQueuePolicy(options.queue);
+          }
+          span.setAttribute("acp.session.id", entry.sessionId);
+          emitRuntimeLog({
+            attributes: sessionAttributes({
+              action: "load",
+              agent: options.agent,
+              cwd: options.cwd,
+              reused,
+              sessionId: entry.sessionId,
+            }),
+            body: "Runtime session loaded.",
+            context: spanContext,
+            eventName: "acp.session.load",
+          });
+          return this.acquireSessionHandle(entry);
+        } catch (error) {
+          emitRuntimeLog({
+            attributes: sessionAttributes({
+              action: "load",
+              agent: options.agent,
+              cwd: options.cwd,
+              sessionId: options.sessionId,
+            }),
+            body: error instanceof Error ? error.message : String(error),
+            context: spanContext,
+            eventName: "acp.session.load.failed",
+            exception: error,
+            severityNumber: SeverityNumber.ERROR,
+          });
+          if (error instanceof AcpError) {
+            throw error;
+          }
+          throw new AcpLoadError("Failed to load runtime session.", error);
+        }
+      },
+    );
   }
 
   private async listRemoteSessions(
     options: AcpRuntimeListAgentSessionsOptions,
   ): Promise<AcpRuntimeSessionList> {
-    try {
-      await this.ensureRegistryHydrated();
-      return await this.sessionService.listAgentSessions(options);
-    } catch (error) {
-      if (error instanceof AcpError) {
-        throw error;
-      }
-      throw new AcpListError("Failed to list runtime sessions.", error);
-    }
+    return withSpan(
+      "acp.session.list",
+      {
+        attributes: sessionAttributes({
+          action: "list",
+          agent: options.agent,
+          cwd: options.cwd,
+        }),
+      },
+      async (span, spanContext) => {
+        try {
+          await this.ensureRegistryHydrated();
+          const list = await this.sessionService.listAgentSessions({
+            ...options,
+            _observability: this.options.observability,
+            _traceContext: spanContext,
+          } as AcpRuntimeListAgentSessionsOptions);
+          span.setAttribute("acp.session.list.count", list.sessions.length);
+          emitRuntimeLog({
+            attributes: {
+              ...sessionAttributes({
+                action: "list",
+                agent: options.agent,
+                cwd: options.cwd,
+              }),
+              "acp.session.list.count": list.sessions.length,
+            },
+            body: `Listed ${list.sessions.length} remote sessions.`,
+            context: spanContext,
+            eventName: "acp.session.list",
+          });
+          return list;
+        } catch (error) {
+          emitRuntimeLog({
+            attributes: sessionAttributes({
+              action: "list",
+              agent: options.agent,
+              cwd: options.cwd,
+            }),
+            body: error instanceof Error ? error.message : String(error),
+            context: spanContext,
+            eventName: "acp.session.list.failed",
+            exception: error,
+            severityNumber: SeverityNumber.ERROR,
+          });
+          if (error instanceof AcpError) {
+            throw error;
+          }
+          throw new AcpListError("Failed to list runtime sessions.", error);
+        }
+      },
+    );
   }
 
-  private async listRemoteSessionsFromRegistry(
-    options: AcpRuntimeListAgentSessionsFromRegistryOptions,
+  private async listSessions(
+    options: AcpRuntimeListSessionsOptions,
   ): Promise<AcpRuntimeSessionList> {
-    const { agentId, ...rest } = options;
-    return this.listRemoteSessions({
-      ...rest,
-      agent: await this.resolveAgent(agentId),
-    });
+    const source = options.source ?? "all";
+    const shouldListLocal = source === "all" || source === "local";
+    const shouldListRemote = source === "all" || source === "remote";
+    let agent: AcpRuntimeAgent | undefined;
+
+    if (options.agent && shouldListRemote) {
+      agent = await this.resolveAgentInput(options.agent);
+    } else if (typeof options.agent === "object") {
+      agent = options.agent;
+    }
+
+    if (source === "remote" && (!options.agent || !options.cwd)) {
+      throw new AcpListError(
+        "Remote session listing requires both agent and cwd.",
+      );
+    }
+
+    const local = shouldListLocal
+      ? await this.listStoredSessionRefs({
+          agentType:
+            agent?.type ??
+            (typeof options.agent === "string" ? options.agent : undefined),
+          cursor: options.cursor,
+          cwd: options.cwd,
+          limit: options.limit,
+        })
+      : { nextCursor: undefined, sessions: [] };
+
+    const remote =
+      shouldListRemote && agent && options.cwd
+        ? await this.listRemoteSessions({
+            agent,
+            cursor: options.cursor,
+            cwd: options.cwd,
+            handlers: options.handlers,
+          })
+        : { nextCursor: undefined, sessions: [] };
+
+    if (source === "local") {
+      return {
+        nextCursor: local.nextCursor,
+        sessions: local.sessions.map((session) => ({
+          ...session,
+          source: "local" as const,
+        })),
+      };
+    }
+
+    if (source === "remote") {
+      return {
+        nextCursor: remote.nextCursor,
+        sessions: remote.sessions.map((session) => ({
+          ...session,
+          source: "remote" as const,
+        })),
+      };
+    }
+
+    return this.mergeSessionLists(local, remote);
   }
 
   private async resumeSession(
     options: AcpRuntimeResumeOptions,
   ): Promise<AcpRuntimeSession> {
-    try {
-      await this.ensureRegistryHydrated();
-      const sessionId = options.snapshot.session.id;
-      const existing = this.activeSessions.get(sessionId);
-      if (existing) {
-        return this.acquireSessionHandle(existing);
-      }
+    return withSpan(
+      "acp.session.resume",
+      {
+        attributes: sessionAttributes({
+          action: "resume",
+          agent: options.snapshot.agent,
+          cwd: options.snapshot.cwd,
+          sessionId: options.snapshot.session.id,
+        }),
+      },
+      async (span, spanContext) => {
+        try {
+          await this.ensureRegistryHydrated();
+          const sessionId = options.snapshot.session.id;
+          let reused = false;
+          const existing = this.activeSessions.get(sessionId);
+          if (existing) {
+            reused = true;
+            span.setAttribute("acp.session.reused", true);
+            emitRuntimeLog({
+              attributes: sessionAttributes({
+                action: "resume",
+                agent: options.snapshot.agent,
+                cwd: options.snapshot.cwd,
+                reused,
+                sessionId: existing.sessionId,
+              }),
+              body: "Runtime session resumed.",
+              context: spanContext,
+              eventName: "acp.session.resume",
+            });
+            if (options.queue) {
+              existing.driver.setQueuePolicy(options.queue);
+            }
+            return this.acquireSessionHandle(existing);
+          }
 
-      let pending = this.pendingResumes.get(sessionId);
-      if (!pending) {
-        pending = this.sessionService
-          .resume(options)
-          .then((driver) => this.registerManagedSessionEntry(driver))
-          .finally(() => {
-            this.pendingResumes.delete(sessionId);
+          const pending = this.pendingOpens.do(sessionId, async () => {
+            await this.waitForSessionClose(sessionId);
+            const active = this.activeSessions.get(sessionId);
+            if (active) {
+              return active;
+            }
+            return this.registerManagedSessionEntry(
+              await this.sessionService.resume({
+                ...options,
+                _observability: this.options.observability,
+                _traceContext: spanContext,
+              } as AcpRuntimeResumeOptions),
+            );
           });
-        this.pendingResumes.set(sessionId, pending);
-      }
+          reused = this.activeSessions.has(sessionId);
+          if (reused) {
+            span.setAttribute("acp.session.reused", true);
+          }
 
-      const entry = await pending;
-      return this.acquireSessionHandle(entry);
-    } catch (error) {
-      if (error instanceof AcpError) {
-        throw error;
-      }
-      throw new AcpResumeError("Failed to resume runtime session.", error);
-    }
+          const entry = await pending;
+          if (options.queue) {
+            entry.driver.setQueuePolicy(options.queue);
+          }
+          span.setAttribute("acp.session.id", entry.sessionId);
+          emitRuntimeLog({
+            attributes: sessionAttributes({
+              action: "resume",
+              agent: options.snapshot.agent,
+              cwd: options.snapshot.cwd,
+              reused,
+              sessionId: entry.sessionId,
+            }),
+            body: "Runtime session resumed.",
+            context: spanContext,
+            eventName: "acp.session.resume",
+          });
+          return this.acquireSessionHandle(entry);
+        } catch (error) {
+          emitRuntimeLog({
+            attributes: sessionAttributes({
+              action: "resume",
+              agent: options.snapshot.agent,
+              cwd: options.snapshot.cwd,
+              sessionId: options.snapshot.session.id,
+            }),
+            body: error instanceof Error ? error.message : String(error),
+            context: spanContext,
+            eventName: "acp.session.resume.failed",
+            exception: error,
+            severityNumber: SeverityNumber.ERROR,
+          });
+          if (error instanceof AcpError) {
+            throw error;
+          }
+          throw new AcpResumeError("Failed to resume runtime session.", error);
+        }
+      },
+    );
   }
 
   private async listStoredSessionRefs(
     options: AcpRuntimeRegistryListOptions = {},
   ): Promise<AcpRuntimeSessionList> {
     await this.ensureRegistryHydrated();
-    return this.options.registry?.listSessions(options) ?? {
+    return this.sessionRegistry?.listSessions(options) ?? {
       nextCursor: undefined,
       sessions: [],
     };
-  }
-
-  private async deleteStoredSessionRef(sessionId: string): Promise<boolean> {
-    await this.ensureRegistryHydrated();
-    return (await this.options.registry?.deleteSession(sessionId)) ?? false;
-  }
-
-  private async deleteStoredSessionsMatching(
-    options: AcpRuntimeRegistryListOptions = {},
-  ): Promise<number> {
-    await this.ensureRegistryHydrated();
-    return (await this.options.registry?.deleteSessions(options)) ?? 0;
-  }
-
-  private watchStoredSessionRefs(
-    watcher: AcpRuntimeStoredSessionWatcher,
-  ): () => void {
-    return this.options.registry?.watch(watcher) ?? (() => {});
-  }
-
-  private refreshStoredSessionRefs(): void {
-    this.options.registry?.notifyRefresh();
   }
 
   private async registerManagedSession(
@@ -256,15 +527,23 @@ export class AcpRuntime {
       }
       return existing;
     }
+    await this.sessionRegistry?.rememberSnapshot(driver.snapshot(), {
+      title: driver.metadata.title,
+    });
+    const existingAfterPersist = this.activeSessions.get(sessionId);
+    if (existingAfterPersist) {
+      if (existingAfterPersist.driver !== driver) {
+        await driver.close().catch(() => {});
+      }
+      return existingAfterPersist;
+    }
+
     const entry: ManagedSessionEntry = {
       driver,
       refCount: 0,
       sessionId,
     };
     this.activeSessions.set(sessionId, entry);
-    await this.options.registry?.rememberSnapshot(driver.snapshot(), {
-      title: driver.metadata.title,
-    });
     return entry;
   }
 
@@ -279,7 +558,7 @@ export class AcpRuntime {
         await this.releaseSession(entry.sessionId, entry.driver);
       },
       onSnapshotChanged: async (snapshot) => {
-        await this.options.registry?.rememberSnapshot(snapshot);
+        await this.sessionRegistry?.rememberSnapshot(snapshot);
       },
     });
   }
@@ -297,11 +576,85 @@ export class AcpRuntime {
       return;
     }
     this.activeSessions.delete(sessionId);
-    await driver.close();
+    let closing = this.closingSessions.get(sessionId);
+    if (!closing) {
+      closing = driver.close().finally(() => {
+        if (this.closingSessions.get(sessionId) === closing) {
+          this.closingSessions.delete(sessionId);
+        }
+      });
+      this.closingSessions.set(sessionId, closing);
+    }
+    await closing;
+  }
+
+  private async waitForSessionClose(sessionId: string): Promise<void> {
+    await this.closingSessions.get(sessionId);
   }
 
   private async ensureRegistryHydrated(): Promise<void> {
-    await this.options.registry?.hydrate();
+    await this.sessionRegistry?.hydrate();
+  }
+
+  private async getStoredSnapshot(
+    sessionId: string,
+  ): Promise<AcpRuntimeSnapshot | undefined> {
+    await this.ensureRegistryHydrated();
+    return this.sessionRegistry?.getSnapshot(sessionId);
+  }
+
+  private async resolveSessionOpenOptions(
+    options: AcpRuntimeLoadSessionOptions | AcpRuntimeResumeSessionOptions,
+  ): Promise<AcpRuntimeCreateOptions> {
+    const storedSnapshot = await this.getStoredSnapshot(options.sessionId);
+    const agent = options.agent
+      ? await this.resolveAgentInput(options.agent)
+      : storedSnapshot?.agent;
+    const cwd = options.cwd ?? storedSnapshot?.cwd;
+
+    if (!agent || !cwd) {
+      throw new AcpLoadError(
+        "Opening a session by id requires agent and cwd unless a local stored snapshot exists.",
+      );
+    }
+
+    return {
+      agent,
+      cwd,
+      handlers: options.handlers,
+      mcpServers: options.mcpServers ?? storedSnapshot?.mcpServers,
+      queue: options.queue,
+    };
+  }
+
+  private mergeSessionLists(
+    local: AcpRuntimeSessionList,
+    remote: AcpRuntimeSessionList,
+  ): AcpRuntimeSessionList {
+    const sessions = new Map<string, AcpRuntimeSessionReference>();
+    for (const session of local.sessions) {
+      sessions.set(session.id, {
+        ...session,
+        source: "local",
+      });
+    }
+    for (const session of remote.sessions) {
+      const existing = sessions.get(session.id);
+      sessions.set(session.id, {
+        ...existing,
+        ...session,
+        source: existing ? "both" : "remote",
+        updatedAt: existing?.updatedAt ?? session.updatedAt,
+      });
+    }
+    return {
+      nextCursor: remote.nextCursor ?? local.nextCursor,
+      sessions: [...sessions.values()],
+    };
+  }
+
+  private async resolveAgentInput(agent: AcpRuntimeAgentInput) {
+    return typeof agent === "string" ? this.resolveAgent(agent) : agent;
   }
 
   private async resolveAgent(agentId: string) {
@@ -309,4 +662,19 @@ export class AcpRuntime {
       agentId,
     );
   }
+}
+
+function createSessionRegistry(
+  options: RuntimeConstructorOptions,
+): AcpRuntimeSessionRegistry | undefined {
+  if (options.state === false || options.state?.enabled === false) {
+    return undefined;
+  }
+
+  return new AcpRuntimeSessionRegistry({
+    store: new AcpRuntimeJsonSessionRegistryStore(
+      options.state?.sessionRegistryPath ??
+        resolveRuntimeHomePath("state", "runtime-session-registry.json"),
+    ),
+  });
 }

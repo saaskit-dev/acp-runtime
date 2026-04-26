@@ -25,10 +25,10 @@ Key points:
 
 In the current codebase:
 
-- `session.lifecycle.snapshot()` is the public snapshot emission point
+- `session.snapshot()` is the public snapshot emission point
 - `session-registry.ts` persists `session.id -> snapshot`
 - `session-registry-store.ts` stores the JSON form on disk
-- `runtime.sessions.resume()` takes a runtime snapshot, not a raw protocol fragment
+- public `runtime.sessions.resume()` takes a `sessionId`; the internal resume path uses the runtime-owned snapshot, not a raw protocol fragment
 - `acp/profiles/` projects runtime policy into agent-specific ACP mode/config operations
 
 ## Translation

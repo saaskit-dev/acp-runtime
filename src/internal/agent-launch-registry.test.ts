@@ -4,13 +4,21 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockReadFile = vi.fn();
 const mockWriteFile = vi.fn();
+const mockRename = vi.fn();
+const mockRm = vi.fn();
+const mockOpen = vi.fn();
+const mockFileHandleWriteFile = vi.fn();
+const mockFileHandleClose = vi.fn();
 const mockMkdir = vi.fn();
 const mockStat = vi.fn();
 const mockSpawnSync = vi.fn();
 
 vi.mock("node:fs/promises", () => ({
   mkdir: mockMkdir,
+  open: mockOpen,
   readFile: mockReadFile,
+  rename: mockRename,
+  rm: mockRm,
   stat: mockStat,
   writeFile: mockWriteFile,
 }));
@@ -35,6 +43,10 @@ describe("agent launch registry", () => {
     vi.clearAllMocks();
     vi.unstubAllEnvs();
     vi.stubGlobal("fetch", vi.fn());
+    mockOpen.mockResolvedValue({
+      close: mockFileHandleClose,
+      writeFile: mockFileHandleWriteFile,
+    });
   });
 
   it("resolves npx launch config from a fresh cached registry without fetching", async () => {
@@ -145,19 +157,15 @@ describe("agent launch registry", () => {
       command: "uvx",
       env: { UVX_MODE: "1" },
     });
-    expect(mockMkdir).toHaveBeenCalledWith("/mock-home/.cache/acp-runtime", {
+    expect(mockMkdir).toHaveBeenCalledWith("/mock-home/.acp-runtime/cache", {
       recursive: true,
     });
     expect(mockWriteFile).toHaveBeenCalled();
   });
 
-  it("falls back to the workspace tmp cache when the home cache is not writable", async () => {
-    mockStat
-      .mockRejectedValueOnce(new Error("missing home cache"))
-      .mockRejectedValueOnce(new Error("missing workspace cache"));
-    mockMkdir
-      .mockRejectedValueOnce(new Error("EPERM"))
-      .mockResolvedValueOnce(undefined);
+  it("uses ACP_RUNTIME_CACHE_DIR when the host overrides the cache root", async () => {
+    vi.stubEnv("ACP_RUNTIME_CACHE_DIR", "/custom-cache-root");
+    mockStat.mockRejectedValueOnce(new Error("missing cache"));
     vi.mocked(fetch).mockResolvedValueOnce({
       ok: true,
       text: async () => JSON.stringify({
@@ -181,18 +189,20 @@ describe("agent launch registry", () => {
     const { resolveAgentLaunch } = await import("./agent-launch-registry.js");
     await resolveAgentLaunch("python-agent");
 
-    expect(mockMkdir).toHaveBeenNthCalledWith(1, "/mock-home/.cache/acp-runtime", {
+    expect(mockMkdir).toHaveBeenCalledWith("/custom-cache-root", {
       recursive: true,
     });
-    expect(mockMkdir).toHaveBeenNthCalledWith(
-      2,
-      resolve(process.cwd(), ".tmp", "acp-runtime-cache"),
-      { recursive: true },
-    );
     expect(mockWriteFile).toHaveBeenCalledWith(
-      resolve(process.cwd(), ".tmp", "acp-runtime-cache", "registry.json"),
+      expect.stringMatching(
+        /^\/custom-cache-root\/registry\.json\.\d+\.\d+\.[a-f0-9]+\.tmp$/,
+      ),
       expect.any(String),
-      "utf8",
+    );
+    expect(mockRename).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /^\/custom-cache-root\/registry\.json\.\d+\.\d+\.[a-f0-9]+\.tmp$/,
+      ),
+      resolve("/custom-cache-root", "registry.json"),
     );
   });
 

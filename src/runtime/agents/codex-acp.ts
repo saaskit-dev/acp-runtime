@@ -2,7 +2,7 @@ import type { AcpRuntimeAgent } from "../core/types.js";
 import {
   createNpxCommandLaunch,
   resolvePackageSpec,
-} from "../../internal/launch-config.js";
+} from "./launch-config.js";
 
 export const CODEX_ACP_REGISTRY_ID = "codex-acp";
 export const CODEX_ACP_PACKAGE = "@zed-industries/codex-acp";

@@ -3,8 +3,7 @@ import { dirname, resolve } from "node:path";
 
 import {
   AcpRuntime,
-  AcpRuntimeJsonSessionRegistryStore,
-  AcpRuntimeSessionRegistry,
+  resolveRuntimeHomePath,
   type AcpRuntimeAuthorityHandlers,
   type AcpRuntimePrompt,
   type AcpRuntimeSession,
@@ -25,15 +24,21 @@ export async function createExampleRuntime(input: {
 } = {}): Promise<AcpRuntime> {
   const registryPath = resolve(
     process.cwd(),
-    input.registryPath ?? ".tmp/runtime-sdk-examples/session-registry.json",
+    input.registryPath ?? resolveRuntimeHomePath(
+      "examples",
+      "runtime-sdk-examples",
+      "session-registry.json",
+    ),
   );
   await mkdir(dirname(registryPath), { recursive: true });
 
-  const registry = new AcpRuntimeSessionRegistry({
-    store: new AcpRuntimeJsonSessionRegistryStore(registryPath),
+  return new AcpRuntime(createStdioAcpConnectionFactory(), {
+    state: { sessionRegistryPath: registryPath },
   });
+}
 
-  return new AcpRuntime(createStdioAcpConnectionFactory(), { registry });
+export function resolveExampleRegistryPath(name: string): string {
+  return resolveRuntimeHomePath("examples", name);
 }
 
 export function createExampleHandlers(input: {
@@ -102,8 +107,8 @@ export async function startRegistryExampleSession(input: {
     registryPath: input.registryPath,
   });
   const handlers = input.handlers ?? createExampleHandlers();
-  const session = await runtime.sessions.registry.start({
-    agentId: input.agentId ?? DEFAULT_EXAMPLE_AGENT_ID,
+  const session = await runtime.sessions.start({
+    agent: input.agentId ?? DEFAULT_EXAMPLE_AGENT_ID,
     cwd: input.cwd ?? process.cwd(),
     handlers,
   });

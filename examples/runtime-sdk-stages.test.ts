@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { stage1ExplicitAgentExample, stage1RegistryMinimalExample } from "./runtime-sdk-stage-1-minimal.js";
 import { stage2SendExample, stage2StreamExample } from "./runtime-sdk-stage-2-interactive.js";
@@ -12,7 +15,21 @@ import {
 } from "./runtime-sdk-stage-7-host-authority.js";
 
 describe("runtime SDK staged examples", () => {
-  it("covers stage 1 minimal startup through registry and explicit agent paths", async () => {
+  let runtimeHomeDir = "";
+
+  beforeAll(async () => {
+    runtimeHomeDir = await mkdtemp(join(tmpdir(), "acp-runtime-stage-tests-"));
+    vi.stubEnv("ACP_RUNTIME_HOME_DIR", runtimeHomeDir);
+  });
+
+  afterAll(async () => {
+    vi.unstubAllEnvs();
+    if (runtimeHomeDir) {
+      await rm(runtimeHomeDir, { force: true, recursive: true });
+    }
+  });
+
+  it("covers stage 1 minimal startup through registry-id and explicit agent paths", async () => {
     const registryResult = await stage1RegistryMinimalExample();
     const explicitResult = await stage1ExplicitAgentExample();
 
@@ -70,18 +87,17 @@ describe("runtime SDK staged examples", () => {
     expect(result.projectionUpdates.length).toBeGreaterThan(0);
   });
 
-  it("covers stage 6 stored-session management", async () => {
+  it("covers stage 6 unified session listing", async () => {
     const result = await stage6StoredSessionsExample();
 
-    expect(result.beforeDelete.sessions.length).toBeGreaterThan(0);
+    expect(result.localSessions.sessions.length).toBeGreaterThan(0);
+    expect(result.remoteSessions.sessions.length).toBeGreaterThan(0);
+    expect(result.allSessions.sessions.length).toBeGreaterThan(0);
     expect(
-      result.updates.some(
-        (update) =>
-          update.type === "session_saved" || update.type === "session_deleted",
+      result.allSessions.sessions.some(
+        (session) => session.source === "both" || session.source === "local",
       ),
     ).toBe(true);
-    expect(result.deletedCount).toBeGreaterThanOrEqual(0);
-    expect(Array.isArray(result.afterDelete.sessions)).toBe(true);
   });
 
   it("covers stage 7 authority handler composition and terminal-auth resolution", () => {

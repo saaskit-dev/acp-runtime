@@ -70,8 +70,8 @@ async function resolveClaudeCodeContractAgent() {
 
     return {
       createSession(runtime: AcpRuntime, cwd: string) {
-        return runtime.sessions.registry.start({
-          agentId: "claude-acp",
+        return runtime.sessions.start({
+          agent: "claude-acp",
           cwd,
         });
       },
@@ -235,7 +235,7 @@ describe("AcpRuntime x Claude Code ACP", () => {
           }
           throw error;
         } finally {
-          await session?.lifecycle.close().catch(() => undefined);
+          await session?.close().catch(() => undefined);
         }
       });
     },

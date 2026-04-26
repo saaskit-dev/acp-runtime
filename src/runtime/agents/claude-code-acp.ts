@@ -2,7 +2,7 @@ import type { AcpRuntimeAgent } from "../core/types.js";
 import {
   createNpxCommandLaunch,
   resolvePackageSpec,
-} from "../../internal/launch-config.js";
+} from "./launch-config.js";
 
 export const CLAUDE_CODE_ACP_REGISTRY_ID = "claude-acp";
 export const CLAUDE_CODE_ACP_PACKAGE = "@agentclientprotocol/claude-agent-acp";

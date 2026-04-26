@@ -1,4 +1,4 @@
-import { resolveAgentLaunch } from "../../internal/agent-launch-registry.js";
+import { resolveAgentLaunch } from "./agent-launch-registry.js";
 
 import type { AcpRuntimeAgent } from "../core/types.js";
 

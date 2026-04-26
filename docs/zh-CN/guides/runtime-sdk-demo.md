@@ -23,7 +23,7 @@
 - [Runtime SDK 分阶段接入](runtime-sdk-by-scenario.md)
 - [Runtime SDK API 覆盖矩阵](runtime-sdk-api-coverage.md)
 
-这个统一示例默认通过 `runtime.sessions.registry.start({ agentId })` 进入 runtime，并通过 agent id 切换行为。
+这个统一示例默认通过 `runtime.sessions.start({ agent })` 进入 runtime，并通过 agent id 切换行为。
 
 ## 覆盖的场景
 
@@ -33,7 +33,7 @@
 - 发送结构化 prompt，并接收结构化 output
 - 用 `session.turn.stream()` 感知 operation 与 permission 生命周期
 - 显式 `runtime.sessions.load()` 旧 session
-- `session.lifecycle.snapshot()` 后 `runtime.sessions.resume()`
+- `session.snapshot()` 后 `runtime.sessions.resume()`
 - 取消进行中的 turn
 - 统一处理顶层 typed runtime errors
 - 跑一条完整宿主工作流
@@ -49,7 +49,6 @@
 - 权限
 - 认证
 - load / resume
-- snapshot 保存
 - 本地 CLI 命令
 
 ## 设计说明
@@ -59,5 +58,5 @@
 - 原生 agent 控制通过 `session.agent.setMode()` 与 `session.agent.setConfigOption()` 表达
 - 权限处理通过 `permission` handler 表达，而不是 raw ACP message
 - 工具执行通过 `Operation` 事件表达，而不是 `tool_call` / `tool_call_update`
-- 恢复通过 `session.lifecycle.snapshot()` / `runtime.sessions.resume()` 表达
+- 恢复通过 `session.snapshot()` / `runtime.sessions.resume()` 表达
 - 宿主控制流通过 typed runtime errors 表达，而不是 vendor `stopReason`

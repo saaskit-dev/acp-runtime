@@ -2,7 +2,7 @@ import type { AcpRuntimeAgent } from "../core/types.js";
 import {
   createNpxCommandLaunch,
   resolvePackageSpec,
-} from "../../internal/launch-config.js";
+} from "./launch-config.js";
 
 export const GEMINI_CLI_ACP_REGISTRY_ID = "gemini";
 export const GEMINI_CLI_ACP_PACKAGE = "@google/gemini-cli";

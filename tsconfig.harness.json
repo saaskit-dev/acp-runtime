@@ -1,8 +1,8 @@
 {
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
-    "outDir": "dist/harness",
-    "rootDir": "harness"
+    "outDir": "dist",
+    "rootDir": "."
   },
   "include": ["harness/**/*.ts"],
   "exclude": ["node_modules", "dist", "harness/**/*.test.ts"]

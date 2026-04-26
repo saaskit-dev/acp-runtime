@@ -8,6 +8,7 @@ import type {
   AcpRuntimeCreateOptions,
   AcpRuntimeListAgentSessionsOptions,
   AcpRuntimeLoadOptions,
+  AcpRuntimeObservabilityOptions,
   AcpRuntimeResumeOptions,
   AcpRuntimeSessionList,
 } from "../core/types.js";
@@ -20,6 +21,8 @@ import type {
 import { mapInitializeResponseToCapabilities } from "./capability-mapper.js";
 import { mapMcpServersToAcp } from "./connection-types.js";
 import { AcpSdkSessionDriver } from "./driver.js";
+import { emitRuntimeLog } from "../observability/logging.js";
+import { mergeTraceMeta, sessionAttributes, withSpan } from "../observability/tracing.js";
 import { resolveAcpAgentProfile } from "./profiles/index.js";
 
 const DEFAULT_CLIENT_INFO = {
@@ -41,11 +44,18 @@ export function createAcpSessionService(
         agent: input.agent,
         cwd: input.cwd,
         handlers: input.handlers,
+        observability: getObservabilityOptions(input),
+        traceContext: getTraceContext(input),
       });
-      const response = await bootstrap.connection.newSession({
-        cwd: input.cwd,
-        mcpServers: mapMcpServersToAcp(input.mcpServers ?? []),
-      });
+      const response = await bootstrap.connection.newSession(
+        mergeTraceMeta(
+          {
+            cwd: input.cwd,
+            mcpServers: mapMcpServersToAcp(input.mcpServers ?? []),
+          },
+          getTraceContext(input),
+        ),
+      );
       const profile = resolveAcpAgentProfile(input.agent);
 
       const driver = new AcpSdkSessionDriver(bootstrap.bridge, {
@@ -56,7 +66,9 @@ export function createAcpSessionService(
         handlers: input.handlers,
         initializeResponse: bootstrap.initializeResponse,
         mcpServers: input.mcpServers ?? [],
+        observability: getObservabilityOptions(input),
         profile,
+        queue: input.queue,
         response,
         sessionId: response.sessionId,
       });
@@ -72,6 +84,8 @@ export function createAcpSessionService(
         agent: input.agent,
         cwd: input.cwd,
         handlers: input.handlers,
+        observability: getObservabilityOptions(input),
+        traceContext: getTraceContext(input),
       });
       try {
         if (!bootstrap.connection.listSessions) {
@@ -80,10 +94,15 @@ export function createAcpSessionService(
           );
         }
 
-        const response = await bootstrap.connection.listSessions({
-          cursor: input.cursor ?? null,
-          cwd: input.cwd,
-        });
+        const response = await bootstrap.connection.listSessions(
+          mergeTraceMeta(
+            {
+              cursor: input.cursor ?? null,
+              cwd: input.cwd,
+            },
+            getTraceContext(input),
+          ),
+        );
 
         return {
           nextCursor: response.nextCursor ?? undefined,
@@ -107,16 +126,23 @@ export function createAcpSessionService(
         agent: input.agent,
         cwd: input.cwd,
         handlers: input.handlers,
+        observability: getObservabilityOptions(input),
+        traceContext: getTraceContext(input),
       });
       if (!bootstrap.connection.loadSession) {
         throw new AcpProtocolError("ACP agent does not support session/load.");
       }
 
-      const response = await bootstrap.connection.loadSession({
-        cwd: input.cwd,
-        mcpServers: mapMcpServersToAcp(input.mcpServers ?? []),
-        sessionId: input.sessionId,
-      });
+      const response = await bootstrap.connection.loadSession(
+        mergeTraceMeta(
+          {
+            cwd: input.cwd,
+            mcpServers: mapMcpServersToAcp(input.mcpServers ?? []),
+            sessionId: input.sessionId,
+          },
+          getTraceContext(input),
+        ),
+      );
       const profile = resolveAcpAgentProfile(input.agent);
 
       const driver = new AcpSdkSessionDriver(bootstrap.bridge, {
@@ -127,7 +153,9 @@ export function createAcpSessionService(
         handlers: input.handlers,
         initializeResponse: bootstrap.initializeResponse,
         mcpServers: input.mcpServers ?? [],
+        observability: getObservabilityOptions(input),
         profile,
+        queue: input.queue,
         response,
         sessionId: input.sessionId,
       });
@@ -143,6 +171,8 @@ export function createAcpSessionService(
         agent: input.snapshot.agent,
         cwd: input.snapshot.cwd,
         handlers: input.handlers,
+        observability: getObservabilityOptions(input),
+        traceContext: getTraceContext(input),
       });
       if (!bootstrap.connection.resumeSession) {
         throw new AcpProtocolError(
@@ -150,11 +180,16 @@ export function createAcpSessionService(
         );
       }
 
-      const response = await bootstrap.connection.resumeSession({
-        cwd: input.snapshot.cwd,
-        mcpServers: mapMcpServersToAcp(input.snapshot.mcpServers ?? []),
-        sessionId: input.snapshot.session.id,
-      });
+      const response = await bootstrap.connection.resumeSession(
+        mergeTraceMeta(
+          {
+            cwd: input.snapshot.cwd,
+            mcpServers: mapMcpServersToAcp(input.snapshot.mcpServers ?? []),
+            sessionId: input.snapshot.session.id,
+          },
+          getTraceContext(input),
+        ),
+      );
       const profile = resolveAcpAgentProfile(input.snapshot.agent);
 
       const driver = new AcpSdkSessionDriver(bootstrap.bridge, {
@@ -165,7 +200,9 @@ export function createAcpSessionService(
         handlers: input.handlers,
         initializeResponse: bootstrap.initializeResponse,
         mcpServers: input.snapshot.mcpServers ?? [],
+        observability: getObservabilityOptions(input),
         profile,
+        queue: input.queue,
         response,
         sessionId: input.snapshot.session.id,
       });
@@ -174,11 +211,13 @@ export function createAcpSessionService(
           bootstrap.connection,
           input.snapshot.session.id,
           input.snapshot.currentModeId,
+          getTraceContext(input),
         );
         await applySnapshotConfig(
           bootstrap.connection,
           input.snapshot.session.id,
           input.snapshot.config,
+          getTraceContext(input),
         );
       } catch (error) {
         await driver.close().catch(() => {});
@@ -195,6 +234,8 @@ async function bootstrapAcpSession(input: {
   agent: import("../core/types.js").AcpRuntimeAgent;
   cwd: string;
   handlers?: AcpRuntimeAuthorityHandlers;
+  observability?: AcpRuntimeObservabilityOptions;
+  traceContext?: import("@opentelemetry/api").Context;
 }) {
   const bridge = new AcpClientBridge(input.handlers);
   const profile = resolveAcpAgentProfile(input.agent);
@@ -202,23 +243,54 @@ async function bootstrapAcpSession(input: {
     agent: input.agent,
     client: bridge,
     cwd: input.cwd,
+    observability: input.observability,
+    traceContext: input.traceContext,
   });
-  const initializeResponse = await handle.connection.initialize({
-    clientCapabilities: {
-      auth: input.handlers?.authentication
-        ? { terminal: Boolean(input.handlers.terminal) }
-        : undefined,
-      fs: input.handlers?.filesystem
-        ? {
-            readTextFile: true,
-            writeTextFile: true,
-          }
-        : undefined,
-      terminal: Boolean(input.handlers?.terminal),
+  const initializeResponse = await withSpan(
+    "acp.session.initialize",
+    {
+      attributes: sessionAttributes({
+        action: "start",
+        agent: input.agent,
+        cwd: input.cwd,
+      }),
+      parentContext: input.traceContext,
     },
-    clientInfo: input.connectionOptions.clientInfo ?? DEFAULT_CLIENT_INFO,
-    protocolVersion: PROTOCOL_VERSION,
-  });
+    async (_span, spanContext) =>
+      handle.connection.initialize(
+        mergeTraceMeta(
+          {
+            clientCapabilities: {
+              auth: input.handlers?.authentication
+                ? { terminal: Boolean(input.handlers.terminal) }
+                : undefined,
+              fs: input.handlers?.filesystem
+                ? {
+                    readTextFile: true,
+                    writeTextFile: true,
+                  }
+                : undefined,
+              terminal: Boolean(input.handlers?.terminal),
+            },
+            clientInfo: input.connectionOptions.clientInfo ?? DEFAULT_CLIENT_INFO,
+            protocolVersion: PROTOCOL_VERSION,
+          },
+          spanContext,
+        ),
+      ).then((response) => {
+        emitRuntimeLog({
+          attributes: sessionAttributes({
+            action: "start",
+            agent: input.agent,
+            cwd: input.cwd,
+          }),
+          body: "ACP session initialized.",
+          context: spanContext,
+          eventName: "acp.session.initialize",
+        });
+        return response;
+      }),
+  );
   const normalizedInitializeResponse = {
     ...initializeResponse,
     authMethods: [
@@ -252,9 +324,36 @@ async function bootstrapAcpSession(input: {
       throw new AcpAuthenticationError("Authentication cancelled.");
     }
 
-    await handle.connection.authenticate({
-      methodId: selection.methodId,
-    });
+    await withSpan(
+      "acp.session.authenticate",
+      {
+        attributes: {
+          "acp.agent.type": input.agent.type,
+          "acp.auth.method_id": selection.methodId,
+        },
+        parentContext: input.traceContext,
+      },
+      async (_span, spanContext) =>
+        handle.connection.authenticate(
+          mergeTraceMeta(
+            {
+              methodId: selection.methodId,
+            },
+            spanContext,
+          ),
+        ).then((result) => {
+          emitRuntimeLog({
+            attributes: {
+              "acp.agent.type": input.agent.type,
+              "acp.auth.method_id": selection.methodId,
+            },
+            body: "ACP session authenticated.",
+            context: spanContext,
+            eventName: "acp.session.authenticate",
+          });
+          return result;
+        }),
+    );
   }
 
   return {
@@ -265,10 +364,25 @@ async function bootstrapAcpSession(input: {
   };
 }
 
+function getTraceContext(
+  input: object,
+): import("@opentelemetry/api").Context | undefined {
+  return (input as { _traceContext?: import("@opentelemetry/api").Context })
+    ._traceContext;
+}
+
+function getObservabilityOptions(
+  input: object,
+): AcpRuntimeObservabilityOptions | undefined {
+  return (input as { _observability?: AcpRuntimeObservabilityOptions })
+    ._observability;
+}
+
 async function applySnapshotConfig(
   connection: import("./connection-types.js").AcpConnection,
   sessionId: string,
   config: Readonly<Record<string, AcpRuntimeConfigValue>> | undefined,
+  traceContext?: import("@opentelemetry/api").Context,
 ): Promise<void> {
   if (!config || Object.keys(config).length === 0) {
     return;
@@ -283,19 +397,34 @@ async function applySnapshotConfig(
   for (const [configId, value] of Object.entries(config)) {
     if (typeof value === "boolean") {
       await connection.setSessionConfigOption({
-        configId,
-        sessionId,
-        type: "boolean",
-        value,
+        ...(mergeTraceMeta(
+          {
+            configId,
+            sessionId,
+            type: "boolean" as const,
+            value,
+          },
+          traceContext,
+        ) as {
+          configId: string;
+          sessionId: string;
+          type: "boolean";
+          value: boolean;
+        }),
       });
       continue;
     }
 
-    await connection.setSessionConfigOption({
-      configId,
-      sessionId,
-      value: String(value),
-    });
+    await connection.setSessionConfigOption(
+      mergeTraceMeta(
+        {
+          configId,
+          sessionId,
+          value: String(value),
+        },
+        traceContext,
+      ),
+    );
   }
 }
 
@@ -303,6 +432,7 @@ async function applySnapshotMode(
   connection: import("./connection-types.js").AcpConnection,
   sessionId: string,
   currentModeId: string | undefined,
+  traceContext?: import("@opentelemetry/api").Context,
 ): Promise<void> {
   if (!currentModeId) {
     return;
@@ -314,8 +444,13 @@ async function applySnapshotMode(
     );
   }
 
-  await connection.setSessionMode({
-    modeId: currentModeId,
-    sessionId,
-  });
+  await connection.setSessionMode(
+    mergeTraceMeta(
+      {
+        modeId: currentModeId,
+        sessionId,
+      },
+      traceContext,
+    ),
+  );
 }

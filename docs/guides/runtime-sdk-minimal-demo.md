@@ -14,7 +14,7 @@ Use this together with:
 - [Runtime SDK By Scenario](runtime-sdk-by-scenario.md)
 - [Runtime SDK API Coverage](runtime-sdk-api-coverage.md)
 
-This stage uses `runtime.sessions.registry.start({ agentId: "simulator-agent-acp-local" })` as the default path and also shows the explicit `runtime.sessions.start({ agent })` override path.
+This stage uses `runtime.sessions.start({ agent: "simulator-agent-acp-local" })` as the registry-id path and also shows the explicit `runtime.sessions.start({ agent })` override path.
 
 ## What It Covers
 

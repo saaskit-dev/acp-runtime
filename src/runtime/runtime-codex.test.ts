@@ -87,8 +87,8 @@ async function resolveCodexContractAgent() {
     await resolveRuntimeAgentFromRegistry("codex-acp");
     return {
       createSession(runtime: AcpRuntime, cwd: string) {
-        return runtime.sessions.registry.start({
-          agentId: "codex-acp",
+        return runtime.sessions.start({
+          agent: "codex-acp",
           cwd,
         });
       },
@@ -187,7 +187,7 @@ describe("AcpRuntime x Codex ACP", () => {
         }
         throw error;
       } finally {
-        await session?.lifecycle.close().catch(() => undefined);
+        await session?.close().catch(() => undefined);
       }
     },
     240_000,

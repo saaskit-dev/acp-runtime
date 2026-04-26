@@ -29,14 +29,24 @@ import type {
   AcpRuntimeToolObjectWatcher,
   AcpRuntimeUsage,
 } from "./types.js";
+import {
+  AcpRuntimeOperationProjectionLifecycle,
+  AcpRuntimePermissionProjectionLifecycle,
+  AcpRuntimeProjectionUpdateType,
+  AcpRuntimeReadModelUpdateType,
+  AcpRuntimeThreadEntryKind,
+  AcpRuntimeThreadToolContentKind,
+  AcpRuntimeTurnEventType,
+} from "./types.js";
+import { emitSafely } from "./concurrency.js";
 
 type AssistantEntry = Extract<
   AcpRuntimeThreadEntry,
-  { kind: "assistant_message" }
+  { kind: typeof AcpRuntimeThreadEntryKind.AssistantMessage }
 >;
 type ThoughtEntry = Extract<
   AcpRuntimeThreadEntry,
-  { kind: "assistant_thought" }
+  { kind: typeof AcpRuntimeThreadEntryKind.AssistantThought }
 >;
 
 export class AcpRuntimeSessionTimeline {
@@ -51,7 +61,7 @@ export class AcpRuntimeSessionTimeline {
   private nextId = 1;
   private readonly planEntries = new Map<
     string,
-    Extract<AcpRuntimeThreadEntry, { kind: "plan" }>
+    Extract<AcpRuntimeThreadEntry, { kind: typeof AcpRuntimeThreadEntryKind.Plan }>
   >();
   private readonly operationSnapshots = new Map<string, AcpRuntimeOperation>();
   private readonly permissionRequestSnapshots = new Map<
@@ -61,7 +71,7 @@ export class AcpRuntimeSessionTimeline {
   private readonly terminalSnapshots = new Map<string, AcpRuntimeTerminalSnapshot>();
   private readonly toolCallEntries = new Map<
     string,
-    Extract<AcpRuntimeThreadEntry, { kind: "tool_call" }>
+    Extract<AcpRuntimeThreadEntry, { kind: typeof AcpRuntimeThreadEntryKind.ToolCall }>
   >();
   private readonly diffSnapshots = new Map<string, AcpRuntimeDiffSnapshot>();
   private latestMetadataValue: AcpRuntimeSessionMetadata | undefined;
@@ -149,7 +159,10 @@ export class AcpRuntimeSessionTimeline {
 
   watchDiff(path: string, watcher: AcpRuntimeDiffWatcher): () => void {
     return this.watch((update) => {
-      if (update.type === "diff_updated" && update.diff.path === path) {
+      if (
+        update.type === AcpRuntimeReadModelUpdateType.DiffUpdated &&
+        update.diff.path === path
+      ) {
         watcher(update.diff);
       }
     });
@@ -161,7 +174,7 @@ export class AcpRuntimeSessionTimeline {
   ): () => void {
     return this.watch((update) => {
       if (
-        update.type === "terminal_updated" &&
+        update.type === AcpRuntimeReadModelUpdateType.TerminalUpdated &&
         update.terminal.terminalId === terminalId
       ) {
         watcher(update.terminal);
@@ -175,12 +188,12 @@ export class AcpRuntimeSessionTimeline {
   ): () => void {
     return this.watch((update) => {
       if (
-        update.type === "diff_updated" &&
+        update.type === AcpRuntimeReadModelUpdateType.DiffUpdated &&
         update.diff.toolCallId === toolCallId
       ) {
         watcher(update);
       } else if (
-        update.type === "terminal_updated" &&
+        update.type === AcpRuntimeReadModelUpdateType.TerminalUpdated &&
         update.terminal.toolCallId === toolCallId
       ) {
         watcher(update);
@@ -198,23 +211,23 @@ export class AcpRuntimeSessionTimeline {
         return;
       }
       if (
-        (update.type === "thread_entry_added" ||
-          update.type === "thread_entry_updated") &&
-        update.entry.kind === "tool_call" &&
+        (update.type === AcpRuntimeReadModelUpdateType.ThreadEntryAdded ||
+          update.type === AcpRuntimeReadModelUpdateType.ThreadEntryUpdated) &&
+        update.entry.kind === AcpRuntimeThreadEntryKind.ToolCall &&
         update.entry.toolCallId === toolCallId
       ) {
         watcher(bundle);
         return;
       }
       if (
-        update.type === "diff_updated" &&
+        update.type === AcpRuntimeReadModelUpdateType.DiffUpdated &&
         update.diff.toolCallId === toolCallId
       ) {
         watcher(bundle);
         return;
       }
       if (
-        update.type === "terminal_updated" &&
+        update.type === AcpRuntimeReadModelUpdateType.TerminalUpdated &&
         update.terminal.toolCallId === toolCallId
       ) {
         watcher(bundle);
@@ -295,7 +308,7 @@ export class AcpRuntimeSessionTimeline {
   ): () => void {
     return this.watchProjection((update) => {
       if (
-        update.type === "operation_projection_updated" &&
+        update.type === AcpRuntimeProjectionUpdateType.OperationUpdated &&
         update.operation.id === operationId
       ) {
         watcher(update.operation);
@@ -309,7 +322,7 @@ export class AcpRuntimeSessionTimeline {
   ): () => void {
     return this.watchProjection((update) => {
       if (
-        update.type === "permission_projection_updated" &&
+        update.type === AcpRuntimeProjectionUpdateType.PermissionUpdated &&
         update.request.id === requestId
       ) {
         watcher(update.request);
@@ -327,14 +340,14 @@ export class AcpRuntimeSessionTimeline {
         return;
       }
       if (
-        update.type === "operation_projection_updated" &&
+        update.type === AcpRuntimeProjectionUpdateType.OperationUpdated &&
         update.operation.id === operationId
       ) {
         watcher(bundle);
         return;
       }
       if (
-        update.type === "permission_projection_updated" &&
+        update.type === AcpRuntimeProjectionUpdateType.PermissionUpdated &&
         update.request.operationId === operationId
       ) {
         watcher(bundle);
@@ -363,7 +376,9 @@ export class AcpRuntimeSessionTimeline {
       command: input.command ?? previous?.command,
       completedAt:
         input.completedAt ??
-        (status === "completed" ? previous?.completedAt ?? now : previous?.completedAt),
+        (status === "completed"
+          ? previous?.completedAt ?? now
+          : previous?.completedAt),
       createdAt: previous?.createdAt ?? now,
       cwd: input.cwd ?? previous?.cwd,
       exitCode:
@@ -383,7 +398,7 @@ export class AcpRuntimeSessionTimeline {
     this.terminalSnapshots.set(input.terminalId, snapshot);
     this.emit({
       terminal: { ...snapshot },
-      type: "terminal_updated",
+      type: AcpRuntimeReadModelUpdateType.TerminalUpdated,
     });
     return snapshot;
   }
@@ -392,13 +407,16 @@ export class AcpRuntimeSessionTimeline {
     this.appendTimelineEntry({ text, type: "user" });
     const entry = {
       id: this.nextEntryId("user"),
-      kind: "user_message",
+      kind: AcpRuntimeThreadEntryKind.UserMessage,
       text,
-    } satisfies Extract<AcpRuntimeThreadEntry, { kind: "user_message" }>;
+    } satisfies Extract<
+      AcpRuntimeThreadEntry,
+      { kind: typeof AcpRuntimeThreadEntryKind.UserMessage }
+    >;
     this.entriesValue.push(entry);
     this.emit({
       entry: cloneThreadEntry(entry),
-      type: "thread_entry_added",
+      type: AcpRuntimeReadModelUpdateType.ThreadEntryAdded,
     });
   }
 
@@ -409,14 +427,17 @@ export class AcpRuntimeSessionTimeline {
     }
     const entry = {
       id: this.nextEntryId("user"),
-      kind: "user_message",
+      kind: AcpRuntimeThreadEntryKind.UserMessage,
       text,
       turnId,
-    } satisfies Extract<AcpRuntimeThreadEntry, { kind: "user_message" }>;
+    } satisfies Extract<
+      AcpRuntimeThreadEntry,
+      { kind: typeof AcpRuntimeThreadEntryKind.UserMessage }
+    >;
     this.entriesValue.push(entry);
     this.emit({
       entry: cloneThreadEntry(entry),
-      type: "thread_entry_added",
+      type: AcpRuntimeReadModelUpdateType.ThreadEntryAdded,
     });
   }
 
@@ -435,12 +456,15 @@ export class AcpRuntimeSessionTimeline {
 
   upsertToolCall(input: {
     content?: readonly AcpRuntimeThreadToolContent[];
-    locations?: Extract<AcpRuntimeThreadEntry, { kind: "tool_call" }>["locations"];
+    locations?: Extract<
+      AcpRuntimeThreadEntry,
+      { kind: typeof AcpRuntimeThreadEntryKind.ToolCall }
+    >["locations"];
     rawInput?: unknown;
     rawOutput?: unknown;
     status?: Extract<
       AcpRuntimeThreadEntry,
-      { kind: "tool_call" }
+      { kind: typeof AcpRuntimeThreadEntryKind.ToolCall }
     >["status"];
     title?: string;
     toolCallId: string;
@@ -461,15 +485,18 @@ export class AcpRuntimeSessionTimeline {
       }
       this.emit({
         entry: cloneThreadEntry(existing),
-        type: "thread_entry_updated",
+        type: AcpRuntimeReadModelUpdateType.ThreadEntryUpdated,
       });
       return;
     }
 
-    const entry: Extract<AcpRuntimeThreadEntry, { kind: "tool_call" }> = {
+    const entry: Extract<
+      AcpRuntimeThreadEntry,
+      { kind: typeof AcpRuntimeThreadEntryKind.ToolCall }
+    > = {
       content: input.content ?? [],
       id: this.nextEntryId("tool-call"),
-      kind: "tool_call",
+      kind: AcpRuntimeThreadEntryKind.ToolCall,
       locations: input.locations,
       rawInput: input.rawInput,
       rawOutput: input.rawOutput,
@@ -484,7 +511,7 @@ export class AcpRuntimeSessionTimeline {
     this.syncDerivedSnapshots(entry.toolCallId, entry.content);
     this.emit({
       entry: cloneThreadEntry(entry),
-      type: "thread_entry_added",
+      type: AcpRuntimeReadModelUpdateType.ThreadEntryAdded,
     });
   }
 
@@ -544,76 +571,78 @@ export class AcpRuntimeSessionTimeline {
   }
 
   private emit(update: AcpRuntimeReadModelUpdate): void {
-    for (const watcher of this.watchers) {
-      watcher(update);
-    }
+    emitSafely(this.watchers, update);
   }
 
   private emitProjection(update: AcpRuntimeProjectionUpdate): void {
-    for (const watcher of this.projectionWatchers) {
-      watcher(update);
-    }
+    emitSafely(this.projectionWatchers, update);
   }
 
   private applyProjectionEvent(event: Exclude<AcpRuntimeHistoryEntry, { type: "user" }>): void {
     switch (event.type) {
-      case "operation_started":
-      case "operation_updated":
-      case "operation_completed":
-      case "operation_failed": {
+      case AcpRuntimeTurnEventType.OperationStarted:
+      case AcpRuntimeTurnEventType.OperationUpdated:
+      case AcpRuntimeTurnEventType.OperationCompleted:
+      case AcpRuntimeTurnEventType.OperationFailed: {
         const operation = cloneOperation(event.operation);
         this.operationSnapshots.set(operation.id, operation);
         this.emitProjection({
           errorMessage:
-            event.type === "operation_failed" ? event.error.message : undefined,
+            event.type === AcpRuntimeTurnEventType.OperationFailed
+              ? event.error.message
+              : undefined,
           lifecycle:
-            event.type === "operation_started"
-              ? "started"
-              : event.type === "operation_updated"
-                ? "updated"
-                : event.type === "operation_completed"
-                  ? "completed"
-                  : "failed",
+            event.type === AcpRuntimeTurnEventType.OperationStarted
+              ? AcpRuntimeOperationProjectionLifecycle.Started
+              : event.type === AcpRuntimeTurnEventType.OperationUpdated
+                ? AcpRuntimeOperationProjectionLifecycle.Updated
+                : event.type === AcpRuntimeTurnEventType.OperationCompleted
+                  ? AcpRuntimeOperationProjectionLifecycle.Completed
+                  : AcpRuntimeOperationProjectionLifecycle.Failed,
           operation,
           turnId: event.turnId,
-          type: "operation_projection_updated",
+          type: AcpRuntimeProjectionUpdateType.OperationUpdated,
         });
         return;
       }
-      case "permission_requested":
-      case "permission_resolved": {
+      case AcpRuntimeTurnEventType.PermissionRequested:
+      case AcpRuntimeTurnEventType.PermissionResolved: {
         const request = clonePermissionRequest(event.request);
         this.permissionRequestSnapshots.set(request.id, request);
         const operation = cloneOperation(event.operation);
         this.operationSnapshots.set(operation.id, operation);
         this.emitProjection({
           decision:
-            event.type === "permission_resolved" ? event.decision : undefined,
+            event.type === AcpRuntimeTurnEventType.PermissionResolved
+              ? event.decision
+              : undefined,
           lifecycle:
-            event.type === "permission_requested" ? "requested" : "resolved",
+            event.type === AcpRuntimeTurnEventType.PermissionRequested
+              ? AcpRuntimePermissionProjectionLifecycle.Requested
+              : AcpRuntimePermissionProjectionLifecycle.Resolved,
           operation,
           request,
           turnId: event.turnId,
-          type: "permission_projection_updated",
+          type: AcpRuntimeProjectionUpdateType.PermissionUpdated,
         });
         return;
       }
-      case "metadata_updated": {
+      case AcpRuntimeTurnEventType.MetadataUpdated: {
         const metadata = cloneMetadata(event.metadata);
         this.latestMetadataValue = metadata;
         this.emitProjection({
           metadata,
           turnId: event.turnId,
-          type: "metadata_projection_updated",
+          type: AcpRuntimeProjectionUpdateType.MetadataUpdated,
         } satisfies AcpRuntimeMetadataProjectionUpdate);
         return;
       }
-      case "usage_updated": {
+      case AcpRuntimeTurnEventType.UsageUpdated: {
         const usage = { ...event.usage };
         this.latestUsageValue = usage;
         this.emitProjection({
           turnId: event.turnId,
-          type: "usage_projection_updated",
+          type: AcpRuntimeProjectionUpdateType.UsageUpdated,
           usage,
         });
         return;
@@ -638,13 +667,13 @@ export class AcpRuntimeSessionTimeline {
       }
       this.emit({
         entry: cloneThreadEntry(existing),
-        type: "thread_entry_updated",
+        type: AcpRuntimeReadModelUpdateType.ThreadEntryUpdated,
       });
       return;
     }
     const entry: AssistantEntry = {
       id: this.nextEntryId("assistant"),
-      kind: "assistant_message",
+      kind: AcpRuntimeThreadEntryKind.AssistantMessage,
       output,
       status,
       text: textChunk,
@@ -654,7 +683,7 @@ export class AcpRuntimeSessionTimeline {
     this.entriesValue.push(entry);
     this.emit({
       entry: cloneThreadEntry(entry),
-      type: "thread_entry_added",
+      type: AcpRuntimeReadModelUpdateType.ThreadEntryAdded,
     });
   }
 
@@ -664,13 +693,16 @@ export class AcpRuntimeSessionTimeline {
       existing.plan = plan;
       this.emit({
         entry: cloneThreadEntry(existing),
-        type: "thread_entry_updated",
+        type: AcpRuntimeReadModelUpdateType.ThreadEntryUpdated,
       });
       return;
     }
-    const entry: Extract<AcpRuntimeThreadEntry, { kind: "plan" }> = {
+    const entry: Extract<
+      AcpRuntimeThreadEntry,
+      { kind: typeof AcpRuntimeThreadEntryKind.Plan }
+    > = {
       id: this.nextEntryId("plan"),
-      kind: "plan",
+      kind: AcpRuntimeThreadEntryKind.Plan,
       plan,
       turnId,
     };
@@ -678,7 +710,7 @@ export class AcpRuntimeSessionTimeline {
     this.entriesValue.push(entry);
     this.emit({
       entry: cloneThreadEntry(entry),
-      type: "thread_entry_added",
+      type: AcpRuntimeReadModelUpdateType.ThreadEntryAdded,
     });
   }
 
@@ -693,13 +725,13 @@ export class AcpRuntimeSessionTimeline {
       existing.status = status;
       this.emit({
         entry: cloneThreadEntry(existing),
-        type: "thread_entry_updated",
+        type: AcpRuntimeReadModelUpdateType.ThreadEntryUpdated,
       });
       return;
     }
     const entry: ThoughtEntry = {
       id: this.nextEntryId("thought"),
-      kind: "assistant_thought",
+      kind: AcpRuntimeThreadEntryKind.AssistantThought,
       status,
       text: textChunk,
       turnId,
@@ -708,7 +740,7 @@ export class AcpRuntimeSessionTimeline {
     this.entriesValue.push(entry);
     this.emit({
       entry: cloneThreadEntry(entry),
-      type: "thread_entry_added",
+      type: AcpRuntimeReadModelUpdateType.ThreadEntryAdded,
     });
   }
 
@@ -717,7 +749,7 @@ export class AcpRuntimeSessionTimeline {
     content: readonly AcpRuntimeThreadToolContent[],
   ): void {
     for (const item of content) {
-      if (item.kind === "terminal") {
+      if (item.kind === AcpRuntimeThreadToolContentKind.Terminal) {
         this.upsertTerminalSnapshot({
           command: item.command,
           cwd: item.cwd,
@@ -731,7 +763,7 @@ export class AcpRuntimeSessionTimeline {
         continue;
       }
 
-      if (item.kind === "diff") {
+      if (item.kind === AcpRuntimeThreadToolContentKind.Diff) {
         const previous = this.diffSnapshots.get(item.path);
         const now = new Date().toISOString();
         const snapshot = {
@@ -750,7 +782,7 @@ export class AcpRuntimeSessionTimeline {
         this.diffSnapshots.set(item.path, snapshot);
         this.emit({
           diff: { ...snapshot },
-          type: "diff_updated",
+          type: AcpRuntimeReadModelUpdateType.DiffUpdated,
         });
       }
     }
@@ -759,20 +791,20 @@ export class AcpRuntimeSessionTimeline {
 
 function cloneThreadEntry(entry: AcpRuntimeThreadEntry): AcpRuntimeThreadEntry {
   switch (entry.kind) {
-    case "assistant_message":
+    case AcpRuntimeThreadEntryKind.AssistantMessage:
       return {
         ...entry,
         output: entry.output ? [...entry.output] : undefined,
       };
-    case "assistant_thought":
-    case "user_message":
+    case AcpRuntimeThreadEntryKind.AssistantThought:
+    case AcpRuntimeThreadEntryKind.UserMessage:
       return { ...entry };
-    case "plan":
+    case AcpRuntimeThreadEntryKind.Plan:
       return {
         ...entry,
         plan: [...entry.plan],
       };
-    case "tool_call":
+    case AcpRuntimeThreadEntryKind.ToolCall:
       return {
         ...entry,
         content: [...entry.content],
@@ -795,7 +827,10 @@ function mergeToolContent(
       return next;
     }
 
-    if (next.kind === "terminal" && previous.kind === "terminal") {
+    if (
+      next.kind === AcpRuntimeThreadToolContentKind.Terminal &&
+      previous.kind === AcpRuntimeThreadToolContentKind.Terminal
+    ) {
       return {
         ...previous,
         ...next,
@@ -806,7 +841,10 @@ function mergeToolContent(
       };
     }
 
-    if (next.kind === "diff" && previous.kind === "diff") {
+    if (
+      next.kind === AcpRuntimeThreadToolContentKind.Diff &&
+      previous.kind === AcpRuntimeThreadToolContentKind.Diff
+    ) {
       return {
         ...previous,
         ...next,
@@ -820,11 +858,11 @@ function mergeToolContent(
 
 function toolContentKey(content: AcpRuntimeThreadToolContent): string {
   switch (content.kind) {
-    case "terminal":
+    case AcpRuntimeThreadToolContentKind.Terminal:
       return `terminal:${content.terminalId}`;
-    case "diff":
+    case AcpRuntimeThreadToolContentKind.Diff:
       return `diff:${content.path}`;
-    case "content":
+    case AcpRuntimeThreadToolContentKind.Content:
       return `content:${content.id}`;
   }
 }

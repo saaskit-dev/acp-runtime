@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { stdout as output } from "node:process";
 import type { Interface } from "node:readline/promises";
+import { SeverityNumber } from "@opentelemetry/api-logs";
 
 import {
   resolveRuntimeTerminalAuthenticationRequest,
@@ -8,18 +9,11 @@ import {
   type AcpRuntimeAuthorityHandlers,
   type AcpRuntimeTerminalAuthenticationRequest,
 } from "@saaskit-dev/acp-runtime";
+import type { DemoInputCoordinator } from "./runtime-demo-input.js";
+import type { DemoLogSink } from "./runtime-demo-log-sink.js";
 
 type DemoTimelineRenderer = {
   writeLine(label: string, detail: string): void;
-};
-
-type DemoLogSink = {
-  writeJson(record: unknown): void;
-};
-
-type DemoOutputGate = {
-  pause(): void;
-  resume(): void;
 };
 
 type DemoTerminalAuthenticationRequest = AcpRuntimeTerminalAuthenticationRequest & {
@@ -28,8 +22,8 @@ type DemoTerminalAuthenticationRequest = AcpRuntimeTerminalAuthenticationRequest
 
 export async function promptForDemoAuthentication(
   input: {
+    inputCoordinator: DemoInputCoordinator;
     logSink: DemoLogSink;
-    outputGate: DemoOutputGate;
     renderer: DemoTimelineRenderer;
     request: Parameters<
       NonNullable<AcpRuntimeAuthorityHandlers["authentication"]>
@@ -38,15 +32,17 @@ export async function promptForDemoAuthentication(
   },
 ): Promise<{ cancel: true } | { methodId: string }> {
   const method = await promptForAuthenticationMethod(
-    input.rl,
-    input.outputGate,
+    input.inputCoordinator,
     input.request.methods,
   );
   if (!method) {
-    input.logSink.writeJson({
-      agent: input.request.agent,
-      recordType: "authentication_cancelled",
-      timestamp: new Date().toISOString(),
+    input.logSink.emit({
+      attributes: {
+        "acp.agent.type": input.request.agent.type,
+      },
+      body: "Authentication cancelled.",
+      eventName: "acp.demo.authentication.cancelled",
+      severityNumber: SeverityNumber.WARN,
     });
     return { cancel: true };
   }
@@ -56,14 +52,16 @@ export async function promptForDemoAuthentication(
     method,
   });
   if (terminalRequest) {
-    input.logSink.writeJson({
-      method,
-      recordType: "authentication_started",
-      terminalRequest,
-      timestamp: new Date().toISOString(),
+    input.logSink.emit({
+      attributes: {
+        "acp.auth.method_id": method.id,
+        "acp.auth.method_type": method.type,
+      },
+      body: terminalRequest.label,
+      eventName: "acp.demo.authentication.started",
     });
     input.renderer.writeLine("auth", `start ${terminalRequest.label}`);
-    await runTerminalAuthentication(input.rl, input.outputGate, terminalRequest);
+    await runTerminalAuthentication(input.rl, terminalRequest);
     input.renderer.writeLine("auth", `completed ${terminalRequest.label}`);
   } else if (method.type === "env_var") {
     throw new Error(
@@ -71,10 +69,13 @@ export async function promptForDemoAuthentication(
     );
   }
 
-  input.logSink.writeJson({
-    method,
-    recordType: "authentication_selected",
-    timestamp: new Date().toISOString(),
+  input.logSink.emit({
+    attributes: {
+      "acp.auth.method_id": method.id,
+      "acp.auth.method_type": method.type,
+    },
+    body: method.title,
+    eventName: "acp.demo.authentication.selected",
   });
   return { methodId: method.id };
 }
@@ -115,8 +116,7 @@ function resolveDemoAuthenticationSuccessPatterns(input: {
 }
 
 async function promptForAuthenticationMethod(
-  rl: Interface,
-  outputGate: DemoOutputGate,
+  inputCoordinator: DemoInputCoordinator,
   methods: readonly AcpRuntimeAuthenticationMethod[],
 ): Promise<AcpRuntimeAuthenticationMethod | undefined> {
   if (methods.length === 0) {
@@ -128,7 +128,6 @@ async function promptForAuthenticationMethod(
   }
 
   while (true) {
-    outputGate.pause();
     const choices = methods
       .map((method, index) => {
         const type = method.type === "env_var"
@@ -141,13 +140,12 @@ async function promptForAuthenticationMethod(
       })
       .join("\n");
     const answer = (
-      await rl.question(
-        `authentication required\n${choices}\nchoose method [1-${methods.length}] or [n] cancel\n> `,
-      )
+      await inputCoordinator.promptExclusive({
+        promptText: `authentication required\n${choices}\nchoose method [1-${methods.length}] or [n] cancel`,
+      })
     )
       .trim()
       .toLowerCase();
-    outputGate.resume();
 
     if (answer === "n" || answer === "no" || answer === "/exit") {
       return undefined;
@@ -164,10 +162,8 @@ async function promptForAuthenticationMethod(
 
 async function runTerminalAuthentication(
   rl: Interface,
-  outputGate: DemoOutputGate,
   request: DemoTerminalAuthenticationRequest,
 ): Promise<void> {
-  outputGate.pause();
   rl.pause();
   console.log(`[runtime] auth: ${request.label}`);
 
@@ -200,7 +196,6 @@ async function runTerminalAuthentication(
     await waitForTerminalAuthentication(child, () => transcript, request);
   } finally {
     rl.resume();
-    outputGate.resume();
   }
 }
 

@@ -16,9 +16,9 @@ also read [Runtime SDK Read Models](runtime-sdk-read-models.md).
 | API | Coverage |
 | --- | --- |
 | `AcpRuntime` | Stage 1, [runtime-sdk-stage-1-minimal.ts](../../examples/runtime-sdk-stage-1-minimal.ts) |
-| `AcpRuntimeSessionRegistry` | Stage 1, [runtime-sdk-stage-1-minimal.ts](../../examples/runtime-sdk-stage-1-minimal.ts) |
-| `AcpRuntimeJsonSessionRegistryStore` | Stage 1, [runtime-sdk-stage-1-minimal.ts](../../examples/runtime-sdk-stage-1-minimal.ts) |
 | `createStdioAcpConnectionFactory()` | Stage 1, [runtime-sdk-stage-1-minimal.ts](../../examples/runtime-sdk-stage-1-minimal.ts) |
+| `resolveRuntimeHomePath(...)` | Stage 1, [runtime-sdk-stage-1-minimal.ts](../../examples/runtime-sdk-stage-1-minimal.ts) |
+| `resolveRuntimeCachePath(...)` | API guide default-path section |
 | `resolveRuntimeAgentFromRegistry(...)` | Stage 3, [runtime-sdk-stage-3-session-recovery.ts](../../examples/runtime-sdk-stage-3-session-recovery.ts) |
 | `resolveRuntimeTerminalAuthenticationRequest(...)` | Stage 7, [runtime-sdk-stage-7-host-authority.ts](../../examples/runtime-sdk-stage-7-host-authority.ts) |
 
@@ -26,18 +26,10 @@ also read [Runtime SDK Read Models](runtime-sdk-read-models.md).
 
 | API | Coverage |
 | --- | --- |
-| `runtime.sessions.start(...)` | Stage 1 explicit path, [runtime-sdk-stage-1-minimal.ts](../../examples/runtime-sdk-stage-1-minimal.ts) |
-| `runtime.sessions.registry.start(...)` | Stage 1 default path, [runtime-sdk-stage-1-minimal.ts](../../examples/runtime-sdk-stage-1-minimal.ts) |
+| `runtime.sessions.start(...)` | Stage 1, [runtime-sdk-stage-1-minimal.ts](../../examples/runtime-sdk-stage-1-minimal.ts) |
 | `runtime.sessions.load(...)` | Stage 3, [runtime-sdk-stage-3-session-recovery.ts](../../examples/runtime-sdk-stage-3-session-recovery.ts) |
-| `runtime.sessions.registry.load(...)` | Stage 3, [runtime-sdk-stage-3-session-recovery.ts](../../examples/runtime-sdk-stage-3-session-recovery.ts) |
 | `runtime.sessions.resume(...)` | Stage 3, [runtime-sdk-stage-3-session-recovery.ts](../../examples/runtime-sdk-stage-3-session-recovery.ts) |
-| `runtime.sessions.remote.list(...)` | Stage 3, [runtime-sdk-stage-3-session-recovery.ts](../../examples/runtime-sdk-stage-3-session-recovery.ts) |
-| `runtime.sessions.registry.remote.list(...)` | Stage 3, [runtime-sdk-stage-3-session-recovery.ts](../../examples/runtime-sdk-stage-3-session-recovery.ts) |
-| `runtime.sessions.stored.list(...)` | Stage 6, [runtime-sdk-stage-6-stored-sessions.ts](../../examples/runtime-sdk-stage-6-stored-sessions.ts) |
-| `runtime.sessions.stored.delete(...)` | Stage 6, [runtime-sdk-stage-6-stored-sessions.ts](../../examples/runtime-sdk-stage-6-stored-sessions.ts) |
-| `runtime.sessions.stored.deleteMany(...)` | Stage 6, [runtime-sdk-stage-6-stored-sessions.ts](../../examples/runtime-sdk-stage-6-stored-sessions.ts) |
-| `runtime.sessions.stored.watch(...)` | Stage 6, [runtime-sdk-stage-6-stored-sessions.ts](../../examples/runtime-sdk-stage-6-stored-sessions.ts) |
-| `runtime.sessions.stored.refresh()` | Stage 6, [runtime-sdk-stage-6-stored-sessions.ts](../../examples/runtime-sdk-stage-6-stored-sessions.ts) |
+| `runtime.sessions.list(...)` | Stage 3 and Stage 6, [runtime-sdk-stage-6-stored-sessions.ts](../../examples/runtime-sdk-stage-6-stored-sessions.ts) |
 
 ## Session Getters
 
@@ -64,63 +56,66 @@ also read [Runtime SDK Read Models](runtime-sdk-read-models.md).
 | `session.turn.run(...)` | Stage 1 and Stage 5 |
 | `session.turn.send(...)` | Stage 2, [runtime-sdk-stage-2-interactive.ts](../../examples/runtime-sdk-stage-2-interactive.ts) |
 | `session.turn.stream(...)` | Stage 2, [runtime-sdk-stage-2-interactive.ts](../../examples/runtime-sdk-stage-2-interactive.ts) |
+| `session.turn.queue.clear()/sendNow()/get()/list()/remove()` | Interactive smoke CLI, [runtime-sdk-demo.ts](../../examples/runtime-sdk-demo.ts) |
+| `session.queue.policy()/setPolicy(...)` | Interactive smoke CLI, [runtime-sdk-demo.ts](../../examples/runtime-sdk-demo.ts) |
 
 ## Session Read Model
 
 | API | Coverage |
 | --- | --- |
-| `session.model.history.drain()` | Stage 3 and Stage 5 |
-| `session.model.thread.entries()` | Stage 5, [runtime-sdk-stage-5-read-model.ts](../../examples/runtime-sdk-stage-5-read-model.ts) |
-| `session.model.diffs.keys()` | Stage 5 |
-| `session.model.diffs.get()` | Stage 5 |
-| `session.model.diffs.list()` | Stage 5 |
-| `session.model.diffs.watch()` | Stage 5 |
-| `session.model.terminals.ids()` | Stage 5 |
-| `session.model.terminals.get()` | Stage 5 |
-| `session.model.terminals.list()` | Stage 5 |
-| `session.model.terminals.watch()` | Stage 5 |
-| `session.model.terminals.refresh()` | Stage 5 |
-| `session.model.terminals.wait()` | Stage 5 |
-| `session.model.terminals.kill()` | Stage 5 |
-| `session.model.terminals.release()` | Stage 5 |
-| `session.model.toolCalls.ids()` | Stage 5 |
-| `session.model.toolCalls.get()` | Stage 5 |
-| `session.model.toolCalls.list()` | Stage 5 |
-| `session.model.toolCalls.bundle()` | Stage 5 |
-| `session.model.toolCalls.bundles()` | Stage 5 |
-| `session.model.toolCalls.diffs()` | Stage 5 |
-| `session.model.toolCalls.terminals()` | Stage 5 |
-| `session.model.toolCalls.watch()` | Stage 5 |
-| `session.model.toolCalls.watchObjects()` | Stage 5 |
-| `session.model.operations.ids()` | Stage 5 |
-| `session.model.operations.get()` | Stage 5 |
-| `session.model.operations.list()` | Stage 5 |
-| `session.model.operations.bundle()` | Stage 5 |
-| `session.model.operations.bundles()` | Stage 5 |
-| `session.model.operations.permissions()` | Stage 5 |
-| `session.model.operations.watch()` | Stage 5 |
-| `session.model.operations.watchBundle()` | Stage 5 |
-| `session.model.permissions.ids()` | Stage 5 |
-| `session.model.permissions.get()` | Stage 5 |
-| `session.model.permissions.list()` | Stage 5 |
-| `session.model.permissions.watch()` | Stage 5 |
-| `session.model.watch(...)` | Stage 5 |
+| `session.state.history.drain()` | Stage 3 and Stage 5 |
+| `session.state.thread.entries()` | Stage 5, [runtime-sdk-stage-5-read-model.ts](../../examples/runtime-sdk-stage-5-read-model.ts) |
+| `session.state.diffs.keys()` | Stage 5 |
+| `session.state.diffs.get()` | Stage 5 |
+| `session.state.diffs.list()` | Stage 5 |
+| `session.state.diffs.watch()` | Stage 5 |
+| `session.state.terminals.ids()` | Stage 5 |
+| `session.state.terminals.get()` | Stage 5 |
+| `session.state.terminals.list()` | Stage 5 |
+| `session.state.terminals.watch()` | Stage 5 |
+| `session.state.terminals.refresh()` | Stage 5 |
+| `session.state.terminals.wait()` | Stage 5 |
+| `session.state.terminals.kill()` | Stage 5 |
+| `session.state.terminals.release()` | Stage 5 |
+| `session.state.toolCalls.ids()` | Stage 5 |
+| `session.state.toolCalls.get()` | Stage 5 |
+| `session.state.toolCalls.list()` | Stage 5 |
+| `session.state.toolCalls.bundle()` | Stage 5 |
+| `session.state.toolCalls.bundles()` | Stage 5 |
+| `session.state.toolCalls.diffs()` | Stage 5 |
+| `session.state.toolCalls.terminals()` | Stage 5 |
+| `session.state.toolCalls.watch()` | Stage 5 |
+| `session.state.toolCalls.watchObjects()` | Stage 5 |
+| `session.state.operations.ids()` | Stage 5 |
+| `session.state.operations.get()` | Stage 5 |
+| `session.state.operations.list()` | Stage 5 |
+| `session.state.operations.bundle()` | Stage 5 |
+| `session.state.operations.bundles()` | Stage 5 |
+| `session.state.operations.permissions()` | Stage 5 |
+| `session.state.operations.watch()` | Stage 5 |
+| `session.state.operations.watchBundle()` | Stage 5 |
+| `session.state.permissions.ids()` | Stage 5 |
+| `session.state.permissions.get()` | Stage 5 |
+| `session.state.permissions.list()` | Stage 5 |
+| `session.state.permissions.watch()` | Stage 5 |
+| `session.state.watch(...)` | Stage 5 |
 
-## Session Live Projection
-
-| API | Coverage |
-| --- | --- |
-| `session.live.metadata()` | Stage 2 and Stage 5 |
-| `session.live.usage()` | Stage 2 and Stage 5 |
-| `session.live.watch(...)` | Stage 2 and Stage 5 |
-
-## Session Lifecycle
+## Session State Projection
 
 | API | Coverage |
 | --- | --- |
-| `session.lifecycle.snapshot()` | Stage 1 and Stage 3 |
-| `session.lifecycle.cancel()` | Stage 2, [runtime-sdk-stage-2-interactive.ts](../../examples/runtime-sdk-stage-2-interactive.ts) |
-| `session.lifecycle.close()` | Stage 1 and all later stages |
+| `session.state.metadata()` | Stage 2 and Stage 5 |
+| `session.state.usage()` | Stage 2 and Stage 5 |
+| `session.state.watch(...)` | Stage 2 and Stage 5 |
+
+## Session Handle
+
+| API | Coverage |
+| --- | --- |
+| `session.snapshot()` | Stage 1 and Stage 3 |
+| `session.turn.start()` | Stage 2, [runtime-sdk-stage-2-interactive.ts](../../examples/runtime-sdk-stage-2-interactive.ts) |
+| `session.turn.cancel(turnId)` | Stage 2, [runtime-sdk-stage-2-interactive.ts](../../examples/runtime-sdk-stage-2-interactive.ts) |
+| `session.close()` | Stage 1 and all later stages |
 
 ## Authority and Host Integration
 
@@ -167,6 +162,6 @@ The package root also exports the runtime-facing type families used by the stage
 - read-model types such as `AcpRuntimeThreadEntry`, `AcpRuntimeDiffSnapshot`, `AcpRuntimeTerminalSnapshot`, `AcpRuntimeToolCallBundle`, `AcpRuntimeOperationBundle`, and `AcpRuntimePermissionRequest`
 - live projection types such as `AcpRuntimeProjectionUpdate` and `AcpRuntimeUsage`
 - authority types such as `AcpRuntimeAuthorityHandlers` and the handler specializations
-- registry and recovery types such as `AcpRuntimeSnapshot`, `AcpRuntimeSessionReference`, `AcpRuntimeSessionList`, and `AcpRuntimeRegistryListOptions`
+- recovery types such as `AcpRuntimeSnapshot`, `AcpRuntimeSessionReference`, and `AcpRuntimeSessionList`
 
 See [Runtime SDK API](runtime-sdk-api.md) for the grouped type catalog and semantic notes.

@@ -23,14 +23,11 @@
 
 覆盖：
 - `AcpRuntime`
-- `AcpRuntimeSessionRegistry`
-- `AcpRuntimeJsonSessionRegistryStore`
 - `createStdioAcpConnectionFactory()`
-- `runtime.sessions.registry.start(...)`
 - `runtime.sessions.start(...)`
 - `session.turn.run(...)`
-- `session.lifecycle.snapshot()`
-- `session.lifecycle.close()`
+- `session.snapshot()`
+- `session.close()`
 - `session.capabilities`
 - `session.diagnostics`
 - `session.metadata`
@@ -42,37 +39,38 @@
 - 实时输出
 - 结构化 prompt
 - 流式事件处理
-- 取消与超时
+- 显式 turn handle
+- 超时控制
+- 宿主主动取消 turn
 
 源码：
 - [runtime-sdk-stage-2-interactive.ts](../../../examples/runtime-sdk-stage-2-interactive.ts)
 
 覆盖：
+- `session.turn.start(...)`
+- `session.turn.cancel(turnId)`
 - `session.turn.send(...)`
 - `session.turn.stream(...)`
-- `session.live.watch(...)`
-- `session.live.metadata()`
-- `session.live.usage()`
-- `session.lifecycle.cancel()`
+- `session.state.watch(...)`
+- `session.state.metadata()`
+- `session.state.usage()`
 
 ## 阶段 3：恢复与远端 session
 
 适合：
 - 查看某个 agent 已知的旧会话
 - `load` / `resume`
-- registry 路径与显式 agent 路径并存
+- registry id 路径与显式 agent 路径并存
 
 源码：
 - [runtime-sdk-stage-3-session-recovery.ts](../../../examples/runtime-sdk-stage-3-session-recovery.ts)
 
 覆盖：
 - `resolveRuntimeAgentFromRegistry(...)`
-- `runtime.sessions.remote.list(...)`
-- `runtime.sessions.registry.remote.list(...)`
+- `runtime.sessions.list(...)`
 - `runtime.sessions.load(...)`
-- `runtime.sessions.registry.load(...)`
 - `runtime.sessions.resume(...)`
-- `session.model.history.drain()`
+- `session.state.history.drain()`
 
 ## 阶段 4：agent 原生控制
 
@@ -108,34 +106,31 @@
 - [Runtime SDK 读模型说明](runtime-sdk-read-models.md)
 
 覆盖：
-- `session.model.thread.entries()`
-- `session.model.diffs.*`
-- `session.model.terminals.*`
-- `session.model.toolCalls.*`
-- `session.model.operations.*`
-- `session.model.permissions.*`
-- `session.model.watch(...)`
-- `session.live.metadata()`
-- `session.live.usage()`
-- `session.live.watch(...)`
+- `session.state.thread.entries()`
+- `session.state.diffs.*`
+- `session.state.terminals.*`
+- `session.state.toolCalls.*`
+- `session.state.operations.*`
+- `session.state.permissions.*`
+- `session.state.watch(...)`
+- `session.state.metadata()`
+- `session.state.usage()`
+- `session.state.watch(...)`
 
-## 阶段 6：stored session 历史
+## 阶段 6：统一 session 列表
 
 适合：
 - 本地最近会话列表
-- 删除 / 批量删除
-- refresh
-- watcher 驱动的历史面板
+- 远端 session 列表
+- 本地/远端合并视图
 
 源码：
 - [runtime-sdk-stage-6-stored-sessions.ts](../../../examples/runtime-sdk-stage-6-stored-sessions.ts)
 
 覆盖：
-- `runtime.sessions.stored.list(...)`
-- `runtime.sessions.stored.delete(...)`
-- `runtime.sessions.stored.deleteMany(...)`
-- `runtime.sessions.stored.watch(...)`
-- `runtime.sessions.stored.refresh()`
+- `runtime.sessions.list({ source: "local" })`
+- `runtime.sessions.list({ source: "remote", agent, cwd })`
+- `runtime.sessions.list({ source: "all", agent, cwd })`
 
 ## 阶段 7：宿主 authority 与认证
 

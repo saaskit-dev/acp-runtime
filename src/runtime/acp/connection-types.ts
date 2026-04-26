@@ -23,6 +23,7 @@ import type {
   SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
 import type { AcpRuntimeAgent } from "../core/types.js";
+import type { AcpRuntimeObservabilityOptions } from "../core/types.js";
 
 export type AcpConnection = {
   readonly closed: Promise<void>;
@@ -59,6 +60,8 @@ export type AcpConnectionFactory = (input: {
   agent: AcpRuntimeAgent;
   client: Client;
   cwd: string;
+  observability?: AcpRuntimeObservabilityOptions;
+  traceContext?: import("@opentelemetry/api").Context;
 }) => Promise<AcpConnectionHandle>;
 
 export type AcpClientInfo = {

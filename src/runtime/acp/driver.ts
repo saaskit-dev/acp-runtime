@@ -2,15 +2,36 @@ import type {
   PromptResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
+  SessionConfigOption,
   SessionNotification,
   ToolCallLocation,
   ToolCallContent,
   ToolKind,
 } from "@agentclientprotocol/sdk";
+import { context, type Context, type Span } from "@opentelemetry/api";
+import { SeverityNumber } from "@opentelemetry/api-logs";
 
-import { AcpProcessError, AcpProtocolError } from "../core/errors.js";
-import type { AcpSessionDriver } from "../core/session-driver.js";
 import {
+  AcpProcessError,
+  AcpProtocolError,
+  AcpTurnCancelledError,
+  AcpTurnCoalescedError,
+  AcpTurnTimeoutError,
+  AcpTurnWithdrawnError,
+} from "../core/errors.js";
+import type {
+  AcpSessionDriver,
+  AcpSessionDriverTurnHandle,
+} from "../core/session-driver.js";
+import {
+  AcpRuntimeObservabilityRedactionKind,
+  AcpRuntimePermissionDecisionValue,
+  AcpRuntimePermissionRequestPhase,
+  AcpRuntimePermissionResolution,
+  AcpRuntimeQueuedTurnStatus,
+  AcpRuntimeThreadToolContentKind,
+  AcpRuntimeTurnEventType,
+  type AcpRuntimeObservabilityOptions,
   type AcpRuntimeDiagnostics,
   type AcpRuntimeDiffWatcher,
   type AcpRuntimeHistoryEntry,
@@ -21,7 +42,12 @@ import {
   type AcpRuntimePermissionRequest,
   type AcpRuntimePermissionRequestWatcher,
   type AcpRuntimePrompt,
+  type AcpRuntimePromptMessage,
+  type AcpRuntimePromptPart,
   type AcpRuntimeProjectionWatcher,
+  type AcpRuntimeQueuedTurn,
+  type AcpRuntimeQueuePolicy,
+  type AcpRuntimeQueuePolicyInput,
   type AcpRuntimeReadModelWatcher,
   type AcpRuntimeSessionMetadata,
   type AcpRuntimeSessionStatus,
@@ -39,15 +65,35 @@ import {
   type AcpRuntimeTurnEvent,
   type AcpRuntimeUsage,
   type AcpRuntimeAuthorityHandlers,
+  type AcpRuntimeConfigValue,
 } from "../core/types.js";
 import { ACP_RUNTIME_SNAPSHOT_VERSION } from "../core/constants.js";
 import { AcpRuntimeSessionTimeline } from "../core/session-timeline.js";
 import type { AcpSessionBootstrap } from "./connection-types.js";
 import { AcpClientBridge } from "./authority-bridge.js";
+import { emitRuntimeLog, observedLogBody } from "../observability/logging.js";
+import {
+  captureContentAttribute,
+  captureContentEvent,
+  childSpan,
+  mergeTraceMeta,
+  operationAttributes,
+  permissionAttributes,
+  promptAttributes,
+  recordException,
+  resolveObservabilityOptions,
+  usageAttributes,
+} from "../observability/tracing.js";
 import {
   createInitialMetadata,
+  extractRuntimeConfig,
   mapInitializeResponseToCapabilities,
+  mapSessionConfigOptions,
 } from "./capability-mapper.js";
+import {
+  normalizeRuntimeConfigValue,
+  resolveRuntimeConfigOption,
+} from "../core/config-options.js";
 import type { AcpAgentProfile } from "./profiles/index.js";
 import {
   applyPermissionDecision,
@@ -108,15 +154,41 @@ class AsyncEventQueue<T> {
 }
 
 type ActiveTurn = {
+  complete: (completion: import("../core/types.js").AcpRuntimeTurnCompletion) => void;
+  fail: (error: Error) => void;
+  hasTerminalEvent: boolean;
+  telemetry: {
+    operationSpans: Map<string, Span>;
+    permissionSpans: Map<string, Span>;
+    turnContext: Context;
+    turnSpan: Span;
+  };
   queue: AsyncEventQueue<AcpRuntimeTurnEvent>;
   state: AcpRuntimeTurnState;
 };
 
+type QueuedTurn = {
+  activeTurn: ActiveTurn;
+  cleanupTimeout: () => void;
+  dispatchRequested: boolean;
+  prompt: AcpRuntimePrompt;
+  queuedAt: string;
+  started: boolean;
+};
+
+const DEFAULT_QUEUE_POLICY = {
+  delivery: "sequential",
+} as const satisfies AcpRuntimeQueuePolicy;
+
 export class AcpSdkSessionDriver implements AcpSessionDriver {
   private currentTurn: ActiveTurn | undefined;
+  private currentTurnExecution: QueuedTurn | undefined;
   private readonly diagnosticsValue: AcpRuntimeDiagnostics = {};
   private readonly historyTurn = createTurnState();
   private readonly metadataValue: AcpRuntimeSessionMetadata;
+  private readonly observability;
+  private readonly pendingTurns: QueuedTurn[] = [];
+  private queuePolicyValue: AcpRuntimeQueuePolicy;
   private statusValue: AcpRuntimeSessionStatus = "ready";
   private readonly timeline = new AcpRuntimeSessionTimeline();
 
@@ -127,7 +199,9 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     private readonly bootstrap: AcpSessionBootstrap & {
       handlers?: AcpRuntimeAuthorityHandlers;
       initializeResponse: import("@agentclientprotocol/sdk").InitializeResponse;
+      observability?: AcpRuntimeObservabilityOptions;
       profile: AcpAgentProfile;
+      queue?: AcpRuntimeQueuePolicyInput;
     },
   ) {
     this.capabilities = mapInitializeResponseToCapabilities({
@@ -139,6 +213,8 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
       modes: bootstrap.response.modes,
       sessionId: bootstrap.sessionId,
     });
+    this.observability = resolveObservabilityOptions(bootstrap.observability);
+    this.queuePolicyValue = normalizeQueuePolicy(bootstrap.queue);
     this.bridge.setPermissionHandler((params) =>
       this.handlePermissionRequest(params),
     );
@@ -157,6 +233,16 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
 
   get status(): AcpRuntimeSessionStatus {
     return this.statusValue;
+  }
+
+  queuePolicy(): AcpRuntimeQueuePolicy {
+    return { ...this.queuePolicyValue };
+  }
+
+  setQueuePolicy(policy: AcpRuntimeQueuePolicyInput): AcpRuntimeQueuePolicy {
+    this.queuePolicyValue = normalizeQueuePolicy(policy, this.queuePolicyValue);
+    this.startNextQueuedTurn();
+    return this.queuePolicy();
   }
 
   listAgentConfigOptions() {
@@ -227,6 +313,20 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
 
   projectionUsage(): AcpRuntimeUsage | undefined {
     return this.timeline.projectionUsage;
+  }
+
+  queuedTurn(turnId: string): AcpRuntimeQueuedTurn | undefined {
+    const queuedTurn = this.pendingTurns.find(
+      (candidate) => candidate.activeTurn.state.turnId === turnId,
+    );
+    if (!queuedTurn) {
+      return undefined;
+    }
+    return this.mapQueuedTurn(queuedTurn);
+  }
+
+  queuedTurns(): readonly AcpRuntimeQueuedTurn[] {
+    return this.pendingTurns.map((queuedTurn) => this.mapQueuedTurn(queuedTurn));
   }
 
   sealHistoryReplay(): void {
@@ -395,13 +495,25 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     });
   }
 
-  async cancel(): Promise<void> {
-    if (this.currentTurn) {
-      this.currentTurn.state.cancelRequested = true;
+  async cancelTurn(turnId: string): Promise<boolean> {
+    if (
+      !this.currentTurn ||
+      !this.currentTurnExecution ||
+      this.currentTurn.state.turnId !== turnId ||
+      this.currentTurnExecution.activeTurn.state.turnId !== turnId
+    ) {
+      return false;
     }
-    await this.bootstrap.connection.cancel({
-      sessionId: this.bootstrap.sessionId,
-    });
+    this.currentTurn.state.cancelRequested = true;
+    await this.bootstrap.connection.cancel(
+      mergeTraceMeta(
+        {
+          sessionId: this.bootstrap.sessionId,
+        },
+        this.currentTurn?.telemetry.turnContext,
+      ),
+    );
+    return true;
   }
 
   async close(): Promise<void> {
@@ -410,13 +522,35 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     }
 
     this.statusValue = "closed";
-    this.currentTurn?.queue.close();
+    const runningTurn = this.currentTurnExecution;
+    if (runningTurn) {
+      runningTurn.cleanupTimeout();
+      runningTurn.activeTurn.state.cancelRequested = true;
+      this.finishTurnWithTerminalEvent(runningTurn.activeTurn, {
+        error: new AcpTurnCancelledError("Session closed."),
+        turnId: runningTurn.activeTurn.state.turnId,
+        type: AcpRuntimeTurnEventType.Cancelled,
+      });
+    }
+    this.currentTurn = undefined;
+    this.currentTurnExecution = undefined;
+    for (const queuedTurn of this.pendingTurns.splice(0)) {
+      queuedTurn.cleanupTimeout();
+      queuedTurn.activeTurn.state.cancelRequested = true;
+      this.finishTurnWithTerminalEvent(queuedTurn.activeTurn, {
+        error: new AcpTurnWithdrawnError("Session closed before turn started."),
+        turnId: queuedTurn.activeTurn.state.turnId,
+        type: AcpRuntimeTurnEventType.Withdrawn,
+      });
+    }
     if (this.bootstrap.connection.closeSession) {
       await Promise.race([
         this.bootstrap.connection
-          .closeSession({
-            sessionId: this.bootstrap.sessionId,
-          })
+          .closeSession(
+            mergeTraceMeta({
+              sessionId: this.bootstrap.sessionId,
+            }),
+          )
           .catch(() => {}),
         waitFor(1_000),
       ]);
@@ -426,7 +560,7 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
 
   async setAgentConfigOption(
     id: string,
-    value: string,
+    value: AcpRuntimeConfigValue,
   ): Promise<void> {
     if (!this.bootstrap.connection.setSessionConfigOption) {
       throw new AcpProtocolError(
@@ -434,12 +568,29 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
       );
     }
 
-    await this.bootstrap.connection.setSessionConfigOption({
-      configId: id,
-      sessionId: this.bootstrap.sessionId,
-      value,
-    });
-    this.updateConfigOptionValue(id, value);
+    const option = resolveRuntimeConfigOption(
+      this.metadataValue.agentConfigOptions ?? [],
+      id,
+    );
+    const normalizedValue = normalizeRuntimeConfigValue(option, value);
+    const params =
+      option.type === "boolean"
+        ? {
+            configId: option.id,
+            sessionId: this.bootstrap.sessionId,
+            type: "boolean" as const,
+            value: normalizedValue as boolean,
+          }
+        : {
+            configId: option.id,
+            sessionId: this.bootstrap.sessionId,
+            value: String(normalizedValue),
+          };
+
+    const response = await this.bootstrap.connection.setSessionConfigOption(
+      mergeTraceMeta(params, this.currentTurn?.telemetry.turnContext),
+    );
+    this.replaceConfigOptions(response.configOptions);
   }
 
   async setAgentMode(modeId: string): Promise<void> {
@@ -448,8 +599,16 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     }
 
     await this.bootstrap.connection.setSessionMode({
-      modeId,
-      sessionId: this.bootstrap.sessionId,
+      ...(mergeTraceMeta(
+        {
+          modeId,
+          sessionId: this.bootstrap.sessionId,
+        },
+        this.currentTurn?.telemetry.turnContext,
+      ) as {
+        modeId: string;
+        sessionId: string;
+      }),
     });
     this.metadataValue.currentModeId = modeId;
   }
@@ -468,52 +627,151 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     };
   }
 
-  async *stream(
+  startTurn(
     prompt: AcpRuntimePrompt,
     options?: AcpRuntimeStreamOptions,
-  ): AsyncIterable<AcpRuntimeTurnEvent> {
+  ): AcpSessionDriverTurnHandle {
+    const turn = this.enqueueTurn(prompt, options);
+    this.dispatchQueuedTurn(turn.turnId);
+    return turn;
+  }
+
+  private enqueueTurn(
+    prompt: AcpRuntimePrompt,
+    options?: AcpRuntimeStreamOptions,
+  ): AcpSessionDriverTurnHandle {
     if (this.statusValue === "closed") {
       throw new AcpProcessError("Session is closed.");
     }
-    if (this.currentTurn) {
-      throw new AcpProtocolError("Session already has an active turn.");
-    }
 
+    const state = createTurnState();
+    let settleCompletion:
+      | ((value: import("../core/types.js").AcpRuntimeTurnCompletion) => void)
+      | undefined;
+    let rejectCompletion: ((reason?: unknown) => void) | undefined;
+    const completion = new Promise<import("../core/types.js").AcpRuntimeTurnCompletion>(
+      (resolve, reject) => {
+        settleCompletion = resolve;
+        rejectCompletion = reject;
+      },
+    );
+    void completion.catch(() => {});
+    const { context: turnContext, span: turnSpan } = childSpan(
+      "acp.turn",
+      context.active(),
+      {
+        "acp.agent.type": this.bootstrap.agent.type,
+        "acp.session.id": this.bootstrap.sessionId,
+        "acp.turn.id": state.turnId,
+        ...promptAttributes(prompt),
+      },
+    );
     const activeTurn: ActiveTurn = {
+      complete: (value) => settleCompletion?.(value),
+      fail: (error) => rejectCompletion?.(error),
+      hasTerminalEvent: false,
+      telemetry: {
+        operationSpans: new Map(),
+        permissionSpans: new Map(),
+        turnContext,
+        turnSpan,
+      },
       queue: new AsyncEventQueue<AcpRuntimeTurnEvent>(),
-      state: createTurnState(),
+      state,
     };
-    this.currentTurn = activeTurn;
-    this.statusValue = "running";
-
-    const cleanupAbort = this.installAbortHandlers(activeTurn, options);
-    this.timeline.appendPrompt(prompt, activeTurn.state.turnId);
-    this.emitTurnEvent(activeTurn, {
-      turnId: activeTurn.state.turnId,
-      type: "started",
+    const queuedTurn: QueuedTurn = {
+      activeTurn,
+      cleanupTimeout: () => {},
+      dispatchRequested: false,
+      prompt,
+      queuedAt: new Date().toISOString(),
+      started: false,
+    };
+    captureContentAttribute({
+      key: "acp.prompt.content",
+      options: this.observability,
+      redactContext: {
+        kind: "prompt",
+        sessionId: this.bootstrap.sessionId,
+        turnId: state.turnId,
+      },
+      span: turnSpan,
+      value: prompt,
+    });
+    emitRuntimeLog({
+      attributes: {
+        "acp.agent.type": this.bootstrap.agent.type,
+        "acp.session.id": this.bootstrap.sessionId,
+        "acp.turn.id": state.turnId,
+        ...promptAttributes(prompt),
+      },
+      body: observedLogBody({
+        options: this.observability,
+        redactContext: {
+          kind: "prompt",
+          sessionId: this.bootstrap.sessionId,
+          turnId: state.turnId,
+        },
+        value: prompt,
+      }) ?? "Turn queued.",
+      context: turnContext,
+      eventName: "acp.turn.queued",
     });
 
-    void this.startPrompt(activeTurn, prompt);
+    activeTurn.queue.push({
+      position: this.pendingTurns.length,
+      turnId: activeTurn.state.turnId,
+      type: "queued",
+    });
+    this.pendingTurns.push(queuedTurn);
+    queuedTurn.cleanupTimeout = this.installTimeoutHandlers(queuedTurn, options);
 
-    try {
-      while (true) {
-        const next = await activeTurn.queue.next();
-        if (next.done) {
-          break;
-        }
-        yield next.value;
-      }
-    } finally {
-      cleanupAbort();
-      this.currentTurn = undefined;
-      this.restoreReadyStatus();
+    const events = this.createTurnEventStream(queuedTurn);
+    return {
+      completion,
+      events,
+      turnId: state.turnId,
+    };
+  }
+
+  stream(
+    prompt: AcpRuntimePrompt,
+    options?: AcpRuntimeStreamOptions,
+  ): AsyncIterable<AcpRuntimeTurnEvent> {
+    return this.startTurn(prompt, options).events;
+  }
+
+  private dispatchQueuedTurn(turnId: string): boolean {
+    const queuedTurn = this.findDispatchableQueuedTurn(turnId);
+    if (!queuedTurn) {
+      return false;
     }
+    queuedTurn.dispatchRequested = true;
+    this.startNextQueuedTurn();
+    return true;
+  }
+
+  async sendQueuedTurnNow(turnId: string): Promise<boolean> {
+    const queuedTurn = this.findDispatchableQueuedTurn(turnId);
+    if (!queuedTurn) {
+      return false;
+    }
+    queuedTurn.dispatchRequested = true;
+    this.moveQueuedTurnToFront(queuedTurn);
+    if (this.currentTurnExecution && this.currentTurn) {
+      this.currentTurn.state.cancelRequested = true;
+      await this.cancelTurn(this.currentTurn.state.turnId);
+      return true;
+    }
+    this.startNextQueuedTurn();
+    return true;
   }
 
   private async handlePermissionRequest(
     params: RequestPermissionRequest,
   ): Promise<RequestPermissionResponse> {
-    if (!this.currentTurn) {
+    const activeTurn = this.currentTurn;
+    if (!activeTurn) {
       return {
         outcome: {
           outcome: "cancelled",
@@ -524,37 +782,50 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     const mapped = mapPermissionRequest({
       params,
       profile: this.bootstrap.profile,
-      turn: this.currentTurn.state,
+      turn: activeTurn.state,
     });
-    this.emitTurnEvent(this.currentTurn, {
+    this.emitTurnEvent(activeTurn, {
       operation: mapped.operation,
-      turnId: this.currentTurn.state.turnId,
-      type: "operation_updated",
+      turnId: activeTurn.state.turnId,
+      type: AcpRuntimeTurnEventType.OperationUpdated,
     });
-    this.emitTurnEvent(this.currentTurn, {
+    this.emitTurnEvent(activeTurn, {
       operation: mapped.operation,
       request: mapped.request,
-      turnId: this.currentTurn.state.turnId,
-      type: "permission_requested",
+      turnId: activeTurn.state.turnId,
+      type: AcpRuntimeTurnEventType.PermissionRequested,
     });
 
     const decision = await this.resolvePermissionDecision(mapped.request);
-    mapped.request.phase = decision.decision === "allow" ? "allowed" : "denied";
-    if (decision.decision === "deny") {
-      this.currentTurn.state.deniedOperationIds.add(mapped.operation.id);
+    if (this.currentTurn !== activeTurn || activeTurn.hasTerminalEvent) {
+      return {
+        outcome: {
+          outcome: "cancelled",
+        },
+      };
+    }
+    mapped.request.phase =
+      decision.decision === AcpRuntimePermissionDecisionValue.Allow
+        ? AcpRuntimePermissionRequestPhase.Allowed
+        : AcpRuntimePermissionRequestPhase.Denied;
+    if (decision.decision === AcpRuntimePermissionDecisionValue.Deny) {
+      activeTurn.state.deniedOperationIds.add(mapped.operation.id);
     }
     const resolvedOperation = applyPermissionDecision({
       decision,
       operationId: mapped.operation.id,
-      turn: this.currentTurn.state,
+      turn: activeTurn.state,
     });
 
-    this.emitTurnEvent(this.currentTurn, {
-      decision: decision.decision === "allow" ? "allowed" : "denied",
+    this.emitTurnEvent(activeTurn, {
+      decision:
+        decision.decision === AcpRuntimePermissionDecisionValue.Allow
+          ? AcpRuntimePermissionResolution.Allowed
+          : AcpRuntimePermissionResolution.Denied,
       operation: resolvedOperation,
       request: mapped.request,
-      turnId: this.currentTurn.state.turnId,
-      type: "permission_resolved",
+      turnId: activeTurn.state.turnId,
+      type: AcpRuntimeTurnEventType.PermissionResolved,
     });
 
     return mapPermissionDecisionToAcp(params.options, decision);
@@ -567,12 +838,21 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
       return;
     }
 
-    await this.syncThreadEntriesFromSessionUpdate(
+    const activeTurn = this.currentTurn;
+    const turnState = activeTurn?.state ?? this.historyTurn;
+    const committed = await this.syncThreadEntriesFromSessionUpdate(
       params,
-      this.currentTurn?.state.turnId ?? this.historyTurn.turnId,
+      turnState.turnId,
+      () =>
+        activeTurn
+          ? this.currentTurn === activeTurn && !activeTurn.hasTerminalEvent
+          : !this.currentTurn,
     );
+    if (!committed) {
+      return;
+    }
 
-    if (!this.currentTurn) {
+    if (!activeTurn) {
       if (params.update.sessionUpdate === "user_message_chunk") {
         const text = extractHistoryText(params.update.content);
         if (text) {
@@ -585,9 +865,13 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
         metadata: this.metadataValue,
         notification: params,
         profile: this.bootstrap.profile,
-        turn: this.historyTurn,
+        turn: turnState,
       });
       this.timeline.appendTimelineEntries(historyEvents);
+      return;
+    }
+
+    if (activeTurn.hasTerminalEvent || this.currentTurn !== activeTurn) {
       return;
     }
 
@@ -596,40 +880,296 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
       metadata: this.metadataValue,
       notification: params,
       profile: this.bootstrap.profile,
-      turn: this.currentTurn.state,
+      turn: activeTurn.state,
     });
     for (const event of events) {
-      this.emitTurnEvent(this.currentTurn, event);
+      this.emitTurnEvent(activeTurn, event);
     }
   }
 
-  private installAbortHandlers(
-    activeTurn: ActiveTurn,
+  private createTurnEventStream(
+    queuedTurn: QueuedTurn,
+  ): AsyncIterable<AcpRuntimeTurnEvent> {
+    const activeTurn = queuedTurn.activeTurn;
+    const self = this;
+    return {
+      async *[Symbol.asyncIterator]() {
+        try {
+          while (true) {
+            const next = await activeTurn.queue.next();
+            if (next.done) {
+              break;
+            }
+            yield next.value;
+          }
+        } finally {
+          queuedTurn.cleanupTimeout();
+          if (!queuedTurn.started) {
+            if (self.removePendingTurn(queuedTurn)) {
+              activeTurn.state.cancelRequested = true;
+              self.finishTurnWithTerminalEvent(activeTurn, {
+                error: new AcpTurnWithdrawnError(
+                  "Turn stream closed before turn started.",
+                ),
+                turnId: activeTurn.state.turnId,
+                type: AcpRuntimeTurnEventType.Withdrawn,
+              });
+            } else {
+              activeTurn.queue.close();
+            }
+            return;
+          }
+          if (
+            self.currentTurnExecution === queuedTurn &&
+            !activeTurn.hasTerminalEvent
+          ) {
+            activeTurn.state.cancelRequested = true;
+            self.finishTurnWithTerminalEvent(activeTurn, {
+              error: new AcpTurnCancelledError("Turn stream closed."),
+              turnId: activeTurn.state.turnId,
+              type: AcpRuntimeTurnEventType.Cancelled,
+            });
+            void self.cancelTurn(activeTurn.state.turnId);
+          }
+        }
+      },
+    };
+  }
+
+  private installTimeoutHandlers(
+    queuedTurn: QueuedTurn,
     options: AcpRuntimeStreamOptions | undefined,
   ): () => void {
-    const onAbort = () => {
-      activeTurn.state.cancelRequested = true;
-      void this.cancel();
-    };
-    if (options?.signal?.aborted) {
-      onAbort();
-    } else {
-      options?.signal?.addEventListener("abort", onAbort, { once: true });
-    }
-
     const timeout = options?.timeoutMs
       ? setTimeout(() => {
-          activeTurn.state.cancelRequested = true;
-          activeTurn.state.timedOut = true;
-          void this.cancel();
+          queuedTurn.activeTurn.state.cancelRequested = true;
+          queuedTurn.activeTurn.state.timedOut = true;
+          if (this.currentTurnExecution === queuedTurn) {
+            this.finishTurnWithTerminalEvent(queuedTurn.activeTurn, {
+              error: new AcpTurnTimeoutError("Turn timed out."),
+              turnId: queuedTurn.activeTurn.state.turnId,
+              type: AcpRuntimeTurnEventType.Failed,
+            });
+            void this.cancelTurn(queuedTurn.activeTurn.state.turnId);
+            return;
+          }
+          if (!this.removePendingTurn(queuedTurn)) {
+            return;
+          }
+          this.finishWithdrawnQueuedTurn(queuedTurn);
         }, options.timeoutMs)
       : undefined;
 
     return () => {
-      options?.signal?.removeEventListener("abort", onAbort);
       if (timeout) {
         clearTimeout(timeout);
       }
+    };
+  }
+
+  private findDispatchableQueuedTurn(turnId: string): QueuedTurn | undefined {
+    return this.pendingTurns.find(
+      (candidate) =>
+        !candidate.started && candidate.activeTurn.state.turnId === turnId,
+    );
+  }
+
+  private moveQueuedTurnToFront(queuedTurn: QueuedTurn): void {
+    if (!this.removePendingTurn(queuedTurn)) {
+      return;
+    }
+    this.pendingTurns.unshift(queuedTurn);
+  }
+
+  private removePendingTurn(queuedTurn: QueuedTurn): boolean {
+    const index = this.pendingTurns.indexOf(queuedTurn);
+    if (index === -1) {
+      return false;
+    }
+    this.pendingTurns.splice(index, 1);
+    return true;
+  }
+
+  withdrawQueuedTurn(turnId: string): boolean {
+    const queuedTurn = this.pendingTurns.find(
+      (candidate) => candidate.activeTurn.state.turnId === turnId,
+    );
+    if (!queuedTurn || queuedTurn.started) {
+      return false;
+    }
+    queuedTurn.activeTurn.state.cancelRequested = true;
+    queuedTurn.cleanupTimeout();
+    if (!this.removePendingTurn(queuedTurn)) {
+      return false;
+    }
+    this.finishWithdrawnQueuedTurn(queuedTurn);
+    return true;
+  }
+
+  clearQueuedTurns(): number {
+    const queuedTurns = this.pendingTurns.filter(
+      (candidate) => !candidate.started,
+    );
+    let withdrawn = 0;
+    for (const queuedTurn of queuedTurns) {
+      queuedTurn.activeTurn.state.cancelRequested = true;
+      queuedTurn.cleanupTimeout();
+      if (!this.removePendingTurn(queuedTurn)) {
+        continue;
+      }
+      this.finishWithdrawnQueuedTurn(queuedTurn);
+      withdrawn += 1;
+    }
+    return withdrawn;
+  }
+
+  private startNextQueuedTurn(): void {
+    if (
+      this.statusValue === "closed" ||
+      this.currentTurnExecution ||
+      this.pendingTurns.length === 0
+    ) {
+      return;
+    }
+
+    const queuedTurns = this.takeReadyTurnsForDelivery();
+    const queuedTurn = queuedTurns[0];
+    if (!queuedTurn) {
+      return;
+    }
+    queuedTurn.started = true;
+    this.currentTurnExecution = queuedTurn;
+    this.currentTurn = queuedTurn.activeTurn;
+    this.statusValue = "running";
+    const prompt =
+      queuedTurns.length > 1
+        ? coalescePrompts(queuedTurns.map((turn) => turn.prompt))
+        : queuedTurn.prompt;
+    for (const coalescedTurn of queuedTurns.slice(1)) {
+      this.finishCoalescedQueuedTurn(
+        coalescedTurn,
+        queuedTurn.activeTurn.state.turnId,
+      );
+    }
+    this.timeline.appendPrompt(
+      prompt,
+      queuedTurn.activeTurn.state.turnId,
+    );
+    emitRuntimeLog({
+      attributes: {
+        "acp.agent.type": this.bootstrap.agent.type,
+        "acp.session.id": this.bootstrap.sessionId,
+        "acp.turn.id": queuedTurn.activeTurn.state.turnId,
+        ...promptAttributes(prompt),
+      },
+      body: observedLogBody({
+        options: this.observability,
+        redactContext: {
+          kind: "prompt",
+          sessionId: this.bootstrap.sessionId,
+          turnId: queuedTurn.activeTurn.state.turnId,
+        },
+        value: prompt,
+      }) ?? "Turn started.",
+      context: queuedTurn.activeTurn.telemetry.turnContext,
+      eventName: "acp.turn.started",
+    });
+    this.emitTurnEvent(queuedTurn.activeTurn, {
+      turnId: queuedTurn.activeTurn.state.turnId,
+      type: "started",
+    });
+    void this.runQueuedTurn(queuedTurn, prompt);
+  }
+
+  private takeReadyTurnsForDelivery(): QueuedTurn[] {
+    if (this.queuePolicyValue.delivery === "coalesce") {
+      const queuedTurns = this.pendingTurns.filter(
+        (candidate) => candidate.dispatchRequested,
+      );
+      for (const queuedTurn of queuedTurns) {
+        this.removePendingTurn(queuedTurn);
+      }
+      return queuedTurns;
+    }
+
+    const queuedTurn = this.pendingTurns.find(
+      (candidate) => candidate.dispatchRequested,
+    );
+    if (!queuedTurn || !this.removePendingTurn(queuedTurn)) {
+      return [];
+    }
+    return [queuedTurn];
+  }
+
+  private async runQueuedTurn(
+    queuedTurn: QueuedTurn,
+    prompt: AcpRuntimePrompt,
+  ): Promise<void> {
+    try {
+      await this.startPrompt(queuedTurn.activeTurn, prompt);
+    } finally {
+      if (this.currentTurnExecution === queuedTurn) {
+        this.currentTurnExecution = undefined;
+      }
+      if (this.currentTurn === queuedTurn.activeTurn) {
+        this.currentTurn = undefined;
+      }
+
+      if (this.statusValue === "closed") {
+        return;
+      }
+
+      if (this.pendingTurns.length > 0) {
+        this.startNextQueuedTurn();
+        return;
+      }
+
+      this.restoreReadyStatus();
+    }
+  }
+
+  private finishWithdrawnQueuedTurn(queuedTurn: QueuedTurn): void {
+    const event: AcpRuntimeTurnEvent = queuedTurn.activeTurn.state.timedOut
+      ? {
+          error: new AcpTurnTimeoutError("Turn timed out."),
+          turnId: queuedTurn.activeTurn.state.turnId,
+          type: AcpRuntimeTurnEventType.Failed,
+        }
+      : {
+          error: new AcpTurnWithdrawnError("Turn withdrawn from queue."),
+          turnId: queuedTurn.activeTurn.state.turnId,
+          type: AcpRuntimeTurnEventType.Withdrawn,
+        };
+    this.finishTurnWithTerminalEvent(queuedTurn.activeTurn, event);
+  }
+
+  private finishCoalescedQueuedTurn(
+    queuedTurn: QueuedTurn,
+    intoTurnId: string,
+  ): void {
+    queuedTurn.cleanupTimeout();
+    const error = new AcpTurnCoalescedError(
+      `Turn coalesced into ${intoTurnId}.`,
+      intoTurnId,
+    );
+    const event = {
+      error,
+      intoTurnId,
+      turnId: queuedTurn.activeTurn.state.turnId,
+      type: AcpRuntimeTurnEventType.Coalesced,
+    } satisfies AcpRuntimeTurnEvent;
+    this.finishTurnWithTerminalEvent(queuedTurn.activeTurn, event);
+  }
+
+  private mapQueuedTurn(queuedTurn: QueuedTurn): AcpRuntimeQueuedTurn {
+    return {
+      position: this.pendingTurns.indexOf(queuedTurn),
+      prompt: queuedTurn.prompt,
+      queuedAt: queuedTurn.queuedAt,
+      status: queuedTurn.dispatchRequested
+        ? AcpRuntimeQueuedTurnStatus.Ready
+        : AcpRuntimeQueuedTurnStatus.Queued,
+      turnId: queuedTurn.activeTurn.state.turnId,
     };
   }
 
@@ -640,10 +1180,21 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     let response: PromptResponse;
     try {
       response = await this.bootstrap.connection.prompt({
-        prompt: mapPromptToAcp(prompt),
-        sessionId: this.bootstrap.sessionId,
+        ...(mergeTraceMeta(
+          {
+            prompt: mapPromptToAcp(prompt),
+            sessionId: this.bootstrap.sessionId,
+          },
+          activeTurn.telemetry.turnContext,
+        ) as {
+          prompt: ReturnType<typeof mapPromptToAcp>;
+          sessionId: string;
+        }),
       });
     } catch (error) {
+      if (activeTurn.hasTerminalEvent) {
+        return;
+      }
       const normalizedResponse = this.bootstrap.profile.normalizePromptError?.({
         error,
         turn: activeTurn.state,
@@ -651,38 +1202,48 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
       if (normalizedResponse) {
         response = normalizedResponse;
       } else {
-      this.diagnosticsValue.lastError = {
-        code: "PROCESS_ERROR",
-        message: error instanceof Error ? error.message : String(error),
-      };
-      const failedEvent = {
-        error: new AcpProcessError("ACP prompt request failed.", error),
-        turnId: activeTurn.state.turnId,
-        type: "failed",
-      } satisfies AcpRuntimeTurnEvent;
-      this.timeline.completeTurn(activeTurn.state.turnId, undefined, "failed");
-      this.emitTurnEvent(activeTurn, failedEvent);
-      activeTurn.queue.close();
-      return;
+        this.diagnosticsValue.lastError = {
+          code: "PROCESS_ERROR",
+          message: error instanceof Error ? error.message : String(error),
+        };
+        const failedEvent = {
+          error: new AcpProcessError("ACP prompt request failed.", error),
+          turnId: activeTurn.state.turnId,
+          type: AcpRuntimeTurnEventType.Failed,
+        } satisfies AcpRuntimeTurnEvent;
+        this.finishTurnWithTerminalEvent(activeTurn, failedEvent);
+        return;
       }
+    }
+
+    if (activeTurn.hasTerminalEvent) {
+      return;
     }
 
     const usage = mapUsage(response.usage ?? undefined);
     if (usage) {
       this.diagnosticsValue.lastUsage = usage;
+      this.emitTurnEvent(activeTurn, {
+        turnId: activeTurn.state.turnId,
+        type: AcpRuntimeTurnEventType.UsageUpdated,
+        usage,
+      });
     }
 
     for (const event of finalizePromptResponse({
       response,
       turn: activeTurn.state,
     })) {
-      if (event.type === "completed") {
+      if (activeTurn.hasTerminalEvent) {
+        return;
+      }
+      if (event.type === AcpRuntimeTurnEventType.Completed) {
         this.timeline.completeTurn(
           activeTurn.state.turnId,
           event.output,
           "completed",
         );
-      } else if (event.type === "failed") {
+      } else if (event.type === AcpRuntimeTurnEventType.Failed) {
         this.timeline.completeTurn(activeTurn.state.turnId, undefined, "failed");
       }
       this.emitTurnEvent(activeTurn, event);
@@ -701,24 +1262,11 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     };
   }
 
-  private updateConfigOptionValue(
-    id: string,
-    value: string,
+  private replaceConfigOptions(
+    configOptions: readonly SessionConfigOption[],
   ): void {
-    this.metadataValue.config = {
-      ...(this.metadataValue.config ?? {}),
-      [id]: value,
-    };
-    this.metadataValue.agentConfigOptions = (
-      this.metadataValue.agentConfigOptions ?? []
-    ).map((option) =>
-      option.id === id
-        ? {
-            ...option,
-            value,
-          }
-        : option,
-    );
+    this.metadataValue.config = extractRuntimeConfig(configOptions);
+    this.metadataValue.agentConfigOptions = mapSessionConfigOptions(configOptions);
   }
 
   private restoreReadyStatus(): void {
@@ -727,36 +1275,578 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     }
   }
 
+  private finishTurnWithTerminalEvent(
+    activeTurn: ActiveTurn,
+    event: AcpRuntimeTurnEvent,
+  ): void {
+    if (!activeTurn.hasTerminalEvent) {
+      this.timeline.completeTurn(activeTurn.state.turnId, undefined, "failed");
+      this.emitTurnEvent(activeTurn, event);
+    }
+    activeTurn.queue.close();
+  }
+
   private emitTurnEvent(
     activeTurn: ActiveTurn,
     event: AcpRuntimeTurnEvent,
   ): void {
+    this.observeTurnEvent(activeTurn, event);
     this.timeline.appendTimelineEntry(event);
+    if (!activeTurn.hasTerminalEvent) {
+      if (event.type === AcpRuntimeTurnEventType.Completed) {
+        activeTurn.hasTerminalEvent = true;
+        activeTurn.complete({
+          output: event.output,
+          outputText: event.outputText,
+          turnId: event.turnId,
+        });
+      } else if (
+        event.type === AcpRuntimeTurnEventType.Cancelled ||
+        event.type === AcpRuntimeTurnEventType.Coalesced ||
+        event.type === AcpRuntimeTurnEventType.Withdrawn ||
+        event.type === AcpRuntimeTurnEventType.Failed
+      ) {
+        activeTurn.hasTerminalEvent = true;
+        activeTurn.fail(event.error);
+      }
+    }
     activeTurn.queue.push(event);
+  }
+
+  private observeTurnEvent(activeTurn: ActiveTurn, event: AcpRuntimeTurnEvent): void {
+    switch (event.type) {
+      case AcpRuntimeTurnEventType.Thinking:
+        emitRuntimeLog({
+          attributes: {
+            "acp.turn.id": event.turnId,
+            "acp.session.id": this.bootstrap.sessionId,
+          },
+          body: observedLogBody({
+            options: this.observability,
+            redactContext: {
+              kind: AcpRuntimeObservabilityRedactionKind.AssistantThought,
+              sessionId: this.bootstrap.sessionId,
+              turnId: event.turnId,
+            },
+            value: event.text,
+          }) ?? "Assistant thought chunk.",
+          context: activeTurn.telemetry.turnContext,
+          eventName: "acp.turn.thought",
+        });
+        captureContentEvent({
+          eventName: "acp.turn.thought",
+          extraAttributes: {
+            "acp.turn.id": event.turnId,
+          },
+          options: this.observability,
+          redactContext: {
+            kind: AcpRuntimeObservabilityRedactionKind.AssistantThought,
+            sessionId: this.bootstrap.sessionId,
+            turnId: event.turnId,
+          },
+          span: activeTurn.telemetry.turnSpan,
+          value: event.text,
+        });
+        return;
+      case AcpRuntimeTurnEventType.Text:
+        emitRuntimeLog({
+          attributes: {
+            "acp.turn.id": event.turnId,
+            "acp.session.id": this.bootstrap.sessionId,
+          },
+          body: observedLogBody({
+            options: this.observability,
+            redactContext: {
+              kind: AcpRuntimeObservabilityRedactionKind.AssistantOutput,
+              sessionId: this.bootstrap.sessionId,
+              turnId: event.turnId,
+            },
+            value: event.text,
+          }) ?? "Assistant output chunk.",
+          context: activeTurn.telemetry.turnContext,
+          eventName: "acp.turn.output",
+        });
+        captureContentEvent({
+          eventName: "acp.turn.output",
+          extraAttributes: {
+            "acp.turn.id": event.turnId,
+          },
+          options: this.observability,
+          redactContext: {
+            kind: AcpRuntimeObservabilityRedactionKind.AssistantOutput,
+            sessionId: this.bootstrap.sessionId,
+            turnId: event.turnId,
+          },
+          span: activeTurn.telemetry.turnSpan,
+          value: event.text,
+        });
+        return;
+      case AcpRuntimeTurnEventType.PlanUpdated:
+        emitRuntimeLog({
+          attributes: {
+            "acp.turn.id": event.turnId,
+            "acp.session.id": this.bootstrap.sessionId,
+          },
+          body: observedLogBody({
+            options: this.observability,
+            redactContext: {
+              kind: AcpRuntimeObservabilityRedactionKind.Plan,
+              sessionId: this.bootstrap.sessionId,
+              turnId: event.turnId,
+            },
+            value: event.plan,
+          }) ?? "Turn plan updated.",
+          context: activeTurn.telemetry.turnContext,
+          eventName: "acp.turn.plan",
+        });
+        captureContentAttribute({
+          key: "acp.turn.plan",
+          options: this.observability,
+          redactContext: {
+            kind: AcpRuntimeObservabilityRedactionKind.Plan,
+            sessionId: this.bootstrap.sessionId,
+            turnId: event.turnId,
+          },
+          span: activeTurn.telemetry.turnSpan,
+          value: event.plan,
+        });
+        return;
+      case AcpRuntimeTurnEventType.UsageUpdated:
+        activeTurn.telemetry.turnSpan.setAttributes(usageAttributes(event.usage));
+        return;
+      case AcpRuntimeTurnEventType.MetadataUpdated:
+        activeTurn.telemetry.turnSpan.setAttributes({
+          "acp.agent.mode": event.metadata.currentModeId,
+          "acp.session.id": event.metadata.id,
+        });
+        return;
+      case AcpRuntimeTurnEventType.OperationStarted:
+      case AcpRuntimeTurnEventType.OperationUpdated: {
+        const span = this.ensureOperationSpan(activeTurn, event.operation);
+        this.observeToolCallSnapshot(activeTurn, event.operation.id, span);
+        emitRuntimeLog({
+          attributes: {
+            ...operationAttributes(event.operation),
+            "acp.session.id": this.bootstrap.sessionId,
+            "acp.turn.id": event.turnId,
+          },
+          body: event.operation.title,
+          context: activeTurn.telemetry.turnContext,
+          eventName:
+            event.type === AcpRuntimeTurnEventType.OperationStarted
+              ? "acp.tool.started"
+              : "acp.tool.updated",
+        });
+        return;
+      }
+      case AcpRuntimeTurnEventType.OperationCompleted:
+        this.observeToolCallSnapshot(
+          activeTurn,
+          event.operation.id,
+          this.ensureOperationSpan(activeTurn, event.operation),
+        );
+        this.completeOperationSpan(activeTurn, event.operation.id, {
+          "acp.operation.outcome": "completed",
+          ...operationAttributes(event.operation),
+        });
+        emitRuntimeLog({
+          attributes: {
+            ...operationAttributes(event.operation),
+            "acp.operation.outcome": "completed",
+            "acp.session.id": this.bootstrap.sessionId,
+            "acp.turn.id": event.turnId,
+          },
+          body: event.operation.title,
+          context: activeTurn.telemetry.turnContext,
+          eventName: "acp.tool.completed",
+        });
+        return;
+      case AcpRuntimeTurnEventType.OperationFailed: {
+        const span = this.ensureOperationSpan(activeTurn, event.operation);
+        this.observeToolCallSnapshot(activeTurn, event.operation.id, span);
+        recordException(span, event.error);
+        this.completeOperationSpan(activeTurn, event.operation.id, {
+          "acp.operation.outcome":
+            event.operation.failureReason ?? "failed",
+          ...operationAttributes(event.operation),
+        });
+        emitRuntimeLog({
+          attributes: {
+            ...operationAttributes(event.operation),
+            "acp.operation.outcome":
+              event.operation.failureReason ?? "failed",
+            "acp.session.id": this.bootstrap.sessionId,
+            "acp.turn.id": event.turnId,
+          },
+          body: event.error instanceof Error ? event.error.message : String(event.error),
+          context: activeTurn.telemetry.turnContext,
+          eventName: "acp.tool.failed",
+          exception: event.error,
+          severityNumber: SeverityNumber.ERROR,
+        });
+        return;
+      }
+      case AcpRuntimeTurnEventType.PermissionRequested: {
+        const { span } = childSpan(
+          "acp.permission",
+          activeTurn.telemetry.turnContext,
+          permissionAttributes(event.request),
+        );
+        activeTurn.telemetry.permissionSpans.set(event.request.id, span);
+        emitRuntimeLog({
+          attributes: {
+            ...permissionAttributes(event.request),
+            "acp.session.id": this.bootstrap.sessionId,
+            "acp.turn.id": event.turnId,
+          },
+          body: event.request.title,
+          context: activeTurn.telemetry.turnContext,
+          eventName: "acp.permission.requested",
+        });
+        return;
+      }
+      case AcpRuntimeTurnEventType.PermissionResolved: {
+        const permissionSpan = activeTurn.telemetry.permissionSpans.get(
+          event.request.id,
+        );
+        if (permissionSpan) {
+          permissionSpan.setAttributes({
+            "acp.permission.decision": event.decision,
+            ...permissionAttributes(event.request),
+          });
+          permissionSpan.end();
+          activeTurn.telemetry.permissionSpans.delete(event.request.id);
+        }
+        emitRuntimeLog({
+          attributes: {
+            ...permissionAttributes(event.request),
+            "acp.permission.decision": event.decision,
+            "acp.session.id": this.bootstrap.sessionId,
+            "acp.turn.id": event.turnId,
+          },
+          body: event.request.title,
+          context: activeTurn.telemetry.turnContext,
+          eventName: "acp.permission.resolved",
+          severityNumber:
+            event.decision === AcpRuntimePermissionResolution.Allowed
+              ? SeverityNumber.INFO
+              : SeverityNumber.WARN,
+        });
+        return;
+      }
+      case AcpRuntimeTurnEventType.Completed:
+        emitRuntimeLog({
+          attributes: {
+            "acp.session.id": this.bootstrap.sessionId,
+            "acp.turn.id": event.turnId,
+            "acp.turn.outcome": "completed",
+          },
+          body: observedLogBody({
+            options: this.observability,
+            redactContext: {
+              kind: AcpRuntimeObservabilityRedactionKind.AssistantOutput,
+              sessionId: this.bootstrap.sessionId,
+              turnId: event.turnId,
+            },
+            value: event.outputText,
+          }) ?? "Turn completed.",
+          context: activeTurn.telemetry.turnContext,
+          eventName: "acp.turn.completed",
+        });
+        captureContentAttribute({
+          key: "acp.turn.output_text",
+          options: this.observability,
+          redactContext: {
+            kind: AcpRuntimeObservabilityRedactionKind.AssistantOutput,
+            sessionId: this.bootstrap.sessionId,
+            turnId: event.turnId,
+          },
+          span: activeTurn.telemetry.turnSpan,
+          value: event.outputText,
+        });
+        activeTurn.telemetry.turnSpan.setAttributes({
+          "acp.turn.outcome": "completed",
+          "acp.turn.output_part_count": event.output.length,
+        });
+        this.endTurnTelemetry(activeTurn);
+        return;
+      case AcpRuntimeTurnEventType.Cancelled:
+        emitRuntimeLog({
+          attributes: {
+            "acp.session.id": this.bootstrap.sessionId,
+            "acp.turn.id": event.turnId,
+            "acp.turn.outcome": "cancelled",
+          },
+          body: event.error instanceof Error ? event.error.message : String(event.error),
+          context: activeTurn.telemetry.turnContext,
+          eventName: "acp.turn.cancelled",
+          severityNumber: SeverityNumber.WARN,
+        });
+        activeTurn.telemetry.turnSpan.setAttribute(
+          "acp.turn.outcome",
+          "cancelled",
+        );
+        this.endTurnTelemetry(activeTurn);
+        return;
+      case AcpRuntimeTurnEventType.Withdrawn:
+        emitRuntimeLog({
+          attributes: {
+            "acp.session.id": this.bootstrap.sessionId,
+            "acp.turn.id": event.turnId,
+            "acp.turn.outcome": "withdrawn",
+          },
+          body: event.error instanceof Error ? event.error.message : String(event.error),
+          context: activeTurn.telemetry.turnContext,
+          eventName: "acp.turn.withdrawn",
+          severityNumber: SeverityNumber.WARN,
+        });
+        activeTurn.telemetry.turnSpan.setAttribute(
+          "acp.turn.outcome",
+          "withdrawn",
+        );
+        this.endTurnTelemetry(activeTurn);
+        return;
+      case AcpRuntimeTurnEventType.Failed:
+        emitRuntimeLog({
+          attributes: {
+            "acp.session.id": this.bootstrap.sessionId,
+            "acp.turn.id": event.turnId,
+            "acp.turn.outcome": "failed",
+          },
+          body: event.error instanceof Error ? event.error.message : String(event.error),
+          context: activeTurn.telemetry.turnContext,
+          eventName: "acp.turn.failed",
+          exception: event.error,
+          severityNumber: SeverityNumber.ERROR,
+        });
+        recordException(activeTurn.telemetry.turnSpan, event.error);
+        activeTurn.telemetry.turnSpan.setAttribute("acp.turn.outcome", "failed");
+        this.endTurnTelemetry(activeTurn);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private ensureOperationSpan(
+    activeTurn: ActiveTurn,
+    operation: AcpRuntimeOperation,
+  ): Span {
+    const existing = activeTurn.telemetry.operationSpans.get(operation.id);
+    if (existing) {
+      existing.setAttributes(operationAttributes(operation));
+      return existing;
+    }
+
+    const { span } = childSpan(
+      "acp.tool",
+      activeTurn.telemetry.turnContext,
+      operationAttributes(operation),
+    );
+    activeTurn.telemetry.operationSpans.set(operation.id, span);
+    return span;
+  }
+
+  private observeToolCallSnapshot(
+    activeTurn: ActiveTurn,
+    operationId: string,
+    span: Span,
+  ): void {
+    const toolCallId = this.findToolCallIdForOperation(activeTurn, operationId);
+    if (!toolCallId) {
+      return;
+    }
+
+    span.setAttribute("acp.tool.tool_call_id", toolCallId);
+    const snapshot = this.timeline.getToolCall(toolCallId);
+    if (!snapshot) {
+      return;
+    }
+
+    captureContentAttribute({
+      key: "acp.tool.raw_input",
+      options: this.observability,
+      redactContext: {
+        kind: AcpRuntimeObservabilityRedactionKind.ToolRawInput,
+        operationId,
+        sessionId: this.bootstrap.sessionId,
+        toolCallId,
+        turnId: snapshot.turnId,
+      },
+      span,
+      value: snapshot.rawInput,
+    });
+    captureContentAttribute({
+      key: "acp.tool.raw_output",
+      options: this.observability,
+      redactContext: {
+        kind: AcpRuntimeObservabilityRedactionKind.ToolRawOutput,
+        operationId,
+        sessionId: this.bootstrap.sessionId,
+        toolCallId,
+        turnId: snapshot.turnId,
+      },
+      span,
+      value: snapshot.rawOutput,
+    });
+
+    snapshot.content.forEach((content, index) => {
+      const contentIndex = index + 1;
+      switch (content.kind) {
+        case AcpRuntimeThreadToolContentKind.Diff:
+          span.setAttributes({
+            [`acp.tool.diff.${contentIndex}.path`]: content.path,
+            [`acp.tool.diff.${contentIndex}.change_type`]: content.changeType,
+          });
+          captureContentAttribute({
+            key: `acp.tool.diff.${contentIndex}.new_text`,
+            options: this.observability,
+            redactContext: {
+              kind: AcpRuntimeObservabilityRedactionKind.DiffNewText,
+              operationId,
+              path: content.path,
+              sessionId: this.bootstrap.sessionId,
+              toolCallId,
+              turnId: snapshot.turnId,
+            },
+            span,
+            value: content.newText,
+          });
+          captureContentAttribute({
+            key: `acp.tool.diff.${contentIndex}.old_text`,
+            options: this.observability,
+            redactContext: {
+              kind: AcpRuntimeObservabilityRedactionKind.DiffOldText,
+              operationId,
+              path: content.path,
+              sessionId: this.bootstrap.sessionId,
+              toolCallId,
+              turnId: snapshot.turnId,
+            },
+            span,
+            value: content.oldText,
+          });
+          break;
+        case AcpRuntimeThreadToolContentKind.Terminal:
+          span.setAttributes({
+            [`acp.tool.terminal.${contentIndex}.id`]: content.terminalId,
+            [`acp.tool.terminal.${contentIndex}.status`]: content.status,
+            [`acp.tool.terminal.${contentIndex}.command`]: content.command,
+            [`acp.tool.terminal.${contentIndex}.cwd`]: content.cwd,
+          });
+          captureContentAttribute({
+            key: `acp.tool.terminal.${contentIndex}.output`,
+            options: this.observability,
+            redactContext: {
+              kind: AcpRuntimeObservabilityRedactionKind.TerminalOutput,
+              operationId,
+              sessionId: this.bootstrap.sessionId,
+              terminalId: content.terminalId,
+              toolCallId,
+              turnId: snapshot.turnId,
+            },
+            span,
+            value: content.output,
+          });
+          break;
+        case AcpRuntimeThreadToolContentKind.Content:
+          if (!content.text) {
+            break;
+          }
+          captureContentAttribute({
+            key: `acp.tool.content.${contentIndex}.text`,
+            options: this.observability,
+            redactContext: {
+              kind: AcpRuntimeObservabilityRedactionKind.ToolRawOutput,
+              operationId,
+              sessionId: this.bootstrap.sessionId,
+              toolCallId,
+              turnId: snapshot.turnId,
+            },
+            span,
+            value: content.text,
+          });
+          break;
+        default:
+          break;
+      }
+    });
+  }
+
+  private findToolCallIdForOperation(
+    activeTurn: ActiveTurn,
+    operationId: string,
+  ): string | undefined {
+    for (const [toolCallId, mappedOperationId] of activeTurn.state.vendorToolCallToOperationId.entries()) {
+      if (mappedOperationId === operationId) {
+        return toolCallId;
+      }
+    }
+    return undefined;
+  }
+
+  private completeOperationSpan(
+    activeTurn: ActiveTurn,
+    operationId: string,
+    attributes: Record<string, string | number | boolean | undefined>,
+  ): void {
+    const span = activeTurn.telemetry.operationSpans.get(operationId);
+    if (!span) {
+      return;
+    }
+    span.setAttributes(attributes);
+    span.end();
+    activeTurn.telemetry.operationSpans.delete(operationId);
+  }
+
+  private endTurnTelemetry(activeTurn: ActiveTurn): void {
+    for (const span of activeTurn.telemetry.permissionSpans.values()) {
+      span.setAttribute("acp.permission.outcome", "unfinished");
+      span.end();
+    }
+    activeTurn.telemetry.permissionSpans.clear();
+
+    for (const span of activeTurn.telemetry.operationSpans.values()) {
+      span.setAttribute("acp.operation.outcome", "unfinished");
+      span.end();
+    }
+    activeTurn.telemetry.operationSpans.clear();
+
+    activeTurn.telemetry.turnSpan.end();
   }
 
   private async syncThreadEntriesFromSessionUpdate(
     params: SessionNotification,
     turnId: string,
-  ): Promise<void> {
+    shouldCommit: () => boolean = () => true,
+  ): Promise<boolean> {
     const update = params.update;
     if (update.sessionUpdate === "agent_message_chunk") {
+      if (!shouldCommit()) {
+        return false;
+      }
       const text = extractHistoryText(update.content);
       if (text) {
         this.timeline.appendAssistantText(turnId, text);
       }
-      return;
+      return true;
     }
 
     if (update.sessionUpdate === "agent_thought_chunk") {
+      if (!shouldCommit()) {
+        return false;
+      }
       const text = extractHistoryText(update.content);
       if (text) {
         this.timeline.appendThoughtText(turnId, text);
       }
-      return;
+      return true;
     }
 
     if (update.sessionUpdate === "plan") {
+      if (!shouldCommit()) {
+        return false;
+      }
       this.timeline.updatePlan(
         turnId,
         update.entries.map((entry, index) => ({
@@ -766,7 +1856,7 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
           status: entry.status,
         })),
       );
-      return;
+      return true;
     }
 
     if (update.sessionUpdate === "tool_call") {
@@ -775,6 +1865,9 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
         rawInput: update.rawInput ?? undefined,
         terminalHandler: this.bootstrap.handlers?.terminal,
       });
+      if (!shouldCommit()) {
+        return false;
+      }
       this.timeline.upsertToolCall({
         content,
         locations: mapToolCallLocations(update.locations ?? undefined),
@@ -786,7 +1879,7 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
         toolKind: mapToolKind(update.kind ?? undefined),
         turnId,
       });
-      return;
+      return true;
     }
 
     if (update.sessionUpdate === "tool_call_update") {
@@ -800,6 +1893,9 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
               terminalHandler: this.bootstrap.handlers?.terminal,
             })
           : undefined;
+      if (!shouldCommit()) {
+        return false;
+      }
       this.timeline.upsertToolCall({
         content,
         locations: mapToolCallLocations(update.locations ?? undefined),
@@ -811,7 +1907,9 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
         toolKind: mapToolKind(update.kind ?? undefined),
         turnId,
       });
+      return true;
     }
+    return true;
   }
 
   private requireTerminalHandler(): AcpRuntimeTerminalHandler {
@@ -1043,4 +2141,56 @@ function mapTerminalStatus(
     return undefined;
   }
   return exitCode === null ? "running" : "completed";
+}
+
+function normalizeQueuePolicy(
+  input: AcpRuntimeQueuePolicyInput | undefined,
+  base: AcpRuntimeQueuePolicy = DEFAULT_QUEUE_POLICY,
+): AcpRuntimeQueuePolicy {
+  const delivery = input?.delivery ?? base.delivery;
+  if (delivery !== "sequential" && delivery !== "coalesce") {
+    throw new AcpProtocolError(`Unknown queue delivery policy: ${String(delivery)}`);
+  }
+  return { delivery };
+}
+
+function coalescePrompts(prompts: readonly AcpRuntimePrompt[]): AcpRuntimePrompt {
+  if (prompts.length === 0) {
+    return "";
+  }
+  if (prompts.length === 1) {
+    return prompts[0];
+  }
+  if (prompts.every((prompt) => typeof prompt === "string")) {
+    return (prompts as readonly string[]).join("\n\n");
+  }
+
+  const messages: AcpRuntimePromptMessage[] = [];
+  for (const prompt of prompts) {
+    if (typeof prompt === "string") {
+      messages.push({ content: prompt, role: "user" });
+      continue;
+    }
+    if (isPromptMessageArray(prompt)) {
+      messages.push(...prompt);
+      continue;
+    }
+    messages.push({
+      content: prompt as readonly AcpRuntimePromptPart[],
+      role: "user",
+    });
+  }
+  return messages;
+}
+
+function isPromptMessageArray(
+  prompt: readonly AcpRuntimePromptPart[] | readonly AcpRuntimePromptMessage[],
+): prompt is readonly AcpRuntimePromptMessage[] {
+  const first = prompt[0];
+  return Boolean(
+    first &&
+      typeof first === "object" &&
+      "role" in first &&
+      "content" in first,
+  );
 }

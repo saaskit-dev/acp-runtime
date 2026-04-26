@@ -42,10 +42,10 @@
 
 当前代码里的直接对应关系是：
 
-- `session.lifecycle.snapshot()`：公共 snapshot 生成入口
+- `session.snapshot()`：公共 snapshot 生成入口
 - `session-registry.ts`：维护 `session.id -> snapshot`
 - `session-registry-store.ts`：JSON 持久化存储
-- `runtime.sessions.resume()`：接收 runtime snapshot，而不是协议碎片
+- public `runtime.sessions.resume()`：接收 `sessionId`；内部恢复路径使用 runtime-owned snapshot，而不是协议碎片
 - `acp/profiles/`：把 runtime policy 投影到具体 agent 的 ACP mode/config 操作
 
 `Snapshot` 不是：
@@ -158,8 +158,8 @@ runtime 不负责：
 
 从 Public SDK 的视角：
 
-- 应暴露 `session.lifecycle.snapshot()` 或等价 API
-- `runtime.sessions.resume()` 的输入应是 runtime snapshot，而不是协议碎片
+- 应暴露 `session.snapshot()` 或等价 API
+- public `runtime.sessions.resume()` 的输入应是 `sessionId`；内部恢复路径使用 runtime-owned snapshot，而不是协议碎片
 - 顶层不应把 raw vendor state 当作恢复对象
 
 ## 11. 最终结论

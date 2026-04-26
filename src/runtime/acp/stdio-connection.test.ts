@@ -1,15 +1,101 @@
 import { Readable, Writable } from "node:stream";
 
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 
 import type { AnyMessage } from "@agentclientprotocol/sdk";
 
 import {
   formatUnexpectedStdioExitError,
+  emitAcpProtocolMessageLog,
   nodeReadableToWeb,
   nodeWritableToWeb,
   normalizeInboundAcpMessage,
 } from "./stdio-connection.js";
+import { testLogExporter } from "../test-otel.js";
+
+beforeEach(() => {
+  testLogExporter.reset();
+});
+
+describe("stdio ACP protocol logging", () => {
+  it("emits raw ACP JSON-RPC messages into runtime logs", () => {
+    emitAcpProtocolMessageLog({
+      agent: {
+        command: "codex-acp",
+        type: "codex-acp",
+      },
+      cwd: "/tmp/project",
+      direction: "outbound",
+      message: {
+        id: 7,
+        jsonrpc: "2.0",
+        method: "session/prompt",
+        params: {
+          prompt: [
+            {
+              content: "hello",
+              role: "user",
+            },
+          ],
+          sessionId: "session-1",
+        },
+      } as AnyMessage,
+    });
+
+    const records = testLogExporter.getFinishedLogRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]?.eventName).toBe("acp.protocol.message");
+    expect(records[0]?.attributes).toMatchObject({
+      "acp.agent.command": "codex-acp",
+      "acp.agent.type": "codex-acp",
+      "acp.protocol.direction": "outbound",
+      "acp.protocol.has_error": false,
+      "acp.protocol.id": 7,
+      "acp.protocol.method": "session/prompt",
+      "acp.protocol.transport": "stdio",
+      "acp.session.cwd": "/tmp/project",
+      "acp.session.id": "session-1",
+    });
+    expect(JSON.parse(records[0]?.body as string)).toMatchObject({
+      method: "session/prompt",
+      params: {
+        sessionId: "session-1",
+      },
+    });
+  });
+
+  it("keeps protocol metadata when content capture is disabled", () => {
+    emitAcpProtocolMessageLog({
+      agent: {
+        command: "codex-acp",
+        type: "codex-acp",
+      },
+      cwd: "/tmp/project",
+      direction: "inbound",
+      message: {
+        error: {
+          code: -32602,
+          message: "Invalid params",
+        },
+        id: 8,
+        jsonrpc: "2.0",
+      } as AnyMessage,
+      observability: {
+        captureContent: "none",
+      },
+    });
+
+    const records = testLogExporter.getFinishedLogRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]?.body).toBeUndefined();
+    expect(records[0]?.severityText).toBe("WARN");
+    expect(records[0]?.attributes).toMatchObject({
+      "acp.protocol.direction": "inbound",
+      "acp.protocol.has_error": true,
+      "acp.protocol.id": 8,
+    });
+  });
+});
 
 describe("stdio ACP inbound normalization", () => {
   it("rewrites Claude Code usage_update messages with used=null", () => {

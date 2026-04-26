@@ -12,7 +12,7 @@
 - [Runtime SDK 分阶段接入](runtime-sdk-by-scenario.md)
 - [Runtime SDK API 覆盖矩阵](runtime-sdk-api-coverage.md)
 
-这一阶段默认使用 `runtime.sessions.registry.start({ agentId: "simulator-agent-acp-local" })`，同时也展示显式 `runtime.sessions.start({ agent })` 的 override 路径。
+这一阶段默认使用 `runtime.sessions.start({ agent: "simulator-agent-acp-local" })`，同时也展示显式 `runtime.sessions.start({ agent })` 的 override 路径。
 
 ## 覆盖内容
 

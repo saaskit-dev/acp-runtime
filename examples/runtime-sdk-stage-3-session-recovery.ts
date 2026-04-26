@@ -13,6 +13,7 @@ import {
   DEFAULT_EXAMPLE_AGENT_ID,
   createExampleHandlers,
   createExampleRuntime,
+  resolveExampleRegistryPath,
 } from "./runtime-sdk-example-helpers.js";
 
 export async function stage3RecoveryExample(input: {
@@ -22,7 +23,7 @@ export async function stage3RecoveryExample(input: {
   const agentId = input.agentId ?? DEFAULT_EXAMPLE_AGENT_ID;
   const cwd = input.cwd ?? process.cwd();
   const runtime = await createExampleRuntime({
-    registryPath: ".tmp/runtime-sdk-stage-3-recovery.json",
+    registryPath: resolveExampleRegistryPath("runtime-sdk-stage-3-recovery.json"),
   });
   const handlers = createExampleHandlers();
 
@@ -33,24 +34,26 @@ export async function stage3RecoveryExample(input: {
       cwd,
       handlers,
     });
-    const registrySession = await runtime.sessions.registry.start({
-      agentId,
+    const registrySession = await runtime.sessions.start({
+      agent: agentId,
       cwd,
       handlers,
     });
 
     try {
-      const snapshot = directSession.lifecycle.snapshot();
-      const directRemoteSessions = await runtime.sessions.remote.list({
+      const snapshot = directSession.snapshot();
+      const directRemoteSessions = await runtime.sessions.list({
         agent,
         cwd,
         handlers,
+        source: "remote",
       });
       const registryRemoteSessions =
-        await runtime.sessions.registry.remote.list({
-          agentId,
+        await runtime.sessions.list({
+          agent: agentId,
           cwd,
           handlers,
+          source: "remote",
         });
 
       const sessionId =
@@ -59,8 +62,10 @@ export async function stage3RecoveryExample(input: {
         directSession.metadata.id;
 
       const resumed = await runtime.sessions.resume({
+        agent,
+        cwd,
         handlers,
-        snapshot,
+        sessionId: snapshot.session.id,
       });
       const loaded = await runtime.sessions.load({
         agent,
@@ -68,8 +73,8 @@ export async function stage3RecoveryExample(input: {
         handlers,
         sessionId,
       });
-      const registryLoaded = await runtime.sessions.registry.load({
-        agentId,
+      const registryLoaded = await runtime.sessions.load({
+        agent: agentId,
         cwd,
         handlers,
         sessionId,
@@ -78,7 +83,7 @@ export async function stage3RecoveryExample(input: {
       try {
         return {
           directRemoteSessions,
-          historyReplay: registryLoaded.model.history.drain(),
+          historyReplay: registryLoaded.state.history.drain(),
           loadedStatus: loaded.status,
           resumedStatus: resumed.status,
           registryRemoteSessions,
@@ -87,15 +92,15 @@ export async function stage3RecoveryExample(input: {
         };
       } finally {
         await Promise.all([
-          resumed.lifecycle.close(),
-          loaded.lifecycle.close(),
-          registryLoaded.lifecycle.close(),
+          resumed.close(),
+          loaded.close(),
+          registryLoaded.close(),
         ]);
       }
     } finally {
       await Promise.all([
-        directSession.lifecycle.close(),
-        registrySession.lifecycle.close(),
+        directSession.close(),
+        registrySession.close(),
       ]);
     }
   } catch (error) {

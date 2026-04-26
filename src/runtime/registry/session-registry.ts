@@ -21,11 +21,15 @@ export type AcpRuntimeSessionRegistryEntry = {
 
 export type AcpRuntimeSessionRegistryStore = {
   load(): Promise<AcpRuntimeSessionRegistryState | undefined>;
-  save(state: AcpRuntimeSessionRegistryState): Promise<void>;
+  save(
+    state: AcpRuntimeSessionRegistryState,
+    options?: { deletedSessionIds?: readonly string[] },
+  ): Promise<void>;
 };
 
 export class AcpRuntimeSessionRegistry {
   private hydrated = false;
+  private hydratePromise: Promise<void> | undefined;
   private persistQueue: Promise<void> = Promise.resolve();
   private readonly sessions = new Map<string, AcpRuntimeSessionRegistryEntry>();
   private readonly watchers = new Set<AcpRuntimeStoredSessionWatcher>();
@@ -46,9 +50,17 @@ export class AcpRuntimeSessionRegistry {
     if (this.hydrated) {
       return;
     }
-    this.hydrated = true;
+    if (!this.hydratePromise) {
+      this.hydratePromise = this.hydrateFromStore().finally(() => {
+        this.hydratePromise = undefined;
+      });
+    }
+    await this.hydratePromise;
+  }
 
+  private async hydrateFromStore(): Promise<void> {
     const state = await this.options.store?.load();
+    this.hydrated = true;
     if (!state) {
       return;
     }
@@ -124,7 +136,7 @@ export class AcpRuntimeSessionRegistry {
     if (!deleted) {
       return false;
     }
-    await this.persist();
+    await this.persist({ deletedSessionIds: [sessionId] });
     this.emit({
       sessionId,
       type: "session_deleted",
@@ -142,7 +154,7 @@ export class AcpRuntimeSessionRegistry {
     for (const sessionId of matches) {
       this.sessions.delete(sessionId);
     }
-    await this.persist();
+    await this.persist({ deletedSessionIds: matches });
     for (const sessionId of matches) {
       this.emit({
         sessionId,
@@ -208,7 +220,9 @@ export class AcpRuntimeSessionRegistry {
     };
   }
 
-  private persist(): Promise<void> {
+  private persist(options?: {
+    deletedSessionIds?: readonly string[];
+  }): Promise<void> {
     if (!this.options.store) {
       return Promise.resolve();
     }
@@ -222,7 +236,7 @@ export class AcpRuntimeSessionRegistry {
               this.cloneEntry(entry),
             ),
             version: 1,
-          }) ?? Promise.resolve(),
+          }, options) ?? Promise.resolve(),
       );
     return this.persistQueue;
   }

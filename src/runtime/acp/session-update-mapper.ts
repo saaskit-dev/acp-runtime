@@ -32,13 +32,28 @@ import type {
   AcpRuntimeTurnFailedEvent,
   AcpRuntimeUsage,
 } from "../core/types.js";
+import {
+  AcpRuntimeOperationFailureReason as RuntimeOperationFailureReason,
+  AcpRuntimeOperationKind as RuntimeOperationKind,
+  AcpRuntimeOperationPermissionFamily as RuntimeOperationPermissionFamily,
+  AcpRuntimeOperationPhase as RuntimeOperationPhase,
+  AcpRuntimePermissionDecisionValue as RuntimePermissionDecisionValue,
+  AcpRuntimePermissionKind as RuntimePermissionKind,
+  AcpRuntimePermissionRequestPhase as RuntimePermissionRequestPhase,
+  AcpRuntimePermissionResolution as RuntimePermissionResolution,
+  AcpRuntimePermissionScope as RuntimePermissionScope,
+  AcpRuntimeTurnEventType as RuntimeTurnEventType,
+} from "../core/types.js";
 import type { AcpAgentProfile } from "./profiles/index.js";
 import {
   nextOperationId,
   nextPermissionRequestId,
   type AcpRuntimeTurnState,
 } from "./turn-state.js";
-import { extractRuntimeConfig } from "./capability-mapper.js";
+import {
+  extractRuntimeConfig,
+  mapSessionConfigOptions,
+} from "./capability-mapper.js";
 
 export type AcpMappedPermissionRequest = {
   operation: AcpRuntimeOperation;
@@ -59,7 +74,7 @@ export function mapSessionUpdateToRuntimeEvents(input: {
         {
           text: extractText(update),
           turnId: input.turn.turnId,
-          type: "thinking",
+          type: RuntimeTurnEventType.Thinking,
         },
       ];
     case "agent_message_chunk": {
@@ -70,7 +85,7 @@ export function mapSessionUpdateToRuntimeEvents(input: {
         {
           text,
           turnId: input.turn.turnId,
-          type: "text",
+          type: RuntimeTurnEventType.Text,
         },
       ];
     }
@@ -86,7 +101,7 @@ export function mapSessionUpdateToRuntimeEvents(input: {
             }),
           ),
           turnId: input.turn.turnId,
-          type: "plan_updated",
+          type: RuntimeTurnEventType.PlanUpdated,
         },
       ];
     case "available_commands_update":
@@ -100,7 +115,7 @@ export function mapSessionUpdateToRuntimeEvents(input: {
         {
           metadata: cloneMetadata(input.metadata),
           turnId: input.turn.turnId,
-          type: "metadata_updated",
+          type: RuntimeTurnEventType.MetadataUpdated,
         },
       ];
     case "current_mode_update":
@@ -109,16 +124,19 @@ export function mapSessionUpdateToRuntimeEvents(input: {
         {
           metadata: cloneMetadata(input.metadata),
           turnId: input.turn.turnId,
-          type: "metadata_updated",
+          type: RuntimeTurnEventType.MetadataUpdated,
         },
       ];
     case "config_option_update":
       input.metadata.config = extractRuntimeConfig(update.configOptions);
+      input.metadata.agentConfigOptions = mapSessionConfigOptions(
+        update.configOptions,
+      );
       return [
         {
           metadata: cloneMetadata(input.metadata),
           turnId: input.turn.turnId,
-          type: "metadata_updated",
+          type: RuntimeTurnEventType.MetadataUpdated,
         },
       ];
     case "session_info_update":
@@ -129,7 +147,7 @@ export function mapSessionUpdateToRuntimeEvents(input: {
         {
           metadata: cloneMetadata(input.metadata),
           turnId: input.turn.turnId,
-          type: "metadata_updated",
+          type: RuntimeTurnEventType.MetadataUpdated,
         },
       ];
     case "usage_update": {
@@ -138,7 +156,7 @@ export function mapSessionUpdateToRuntimeEvents(input: {
       return [
         {
           turnId: input.turn.turnId,
-          type: "usage_updated",
+          type: RuntimeTurnEventType.UsageUpdated,
           usage,
         },
       ];
@@ -157,7 +175,7 @@ export function mapSessionUpdateToRuntimeEvents(input: {
             turn: input.turn,
           }),
           turnId: input.turn.turnId,
-          type: "operation_started",
+          type: RuntimeTurnEventType.OperationStarted,
         },
       ];
     case "tool_call_update":
@@ -185,14 +203,14 @@ export function mapPermissionRequest(input: {
     turn: input.turn,
   });
 
-  operation.phase = "awaiting_permission";
+  operation.phase = RuntimeOperationPhase.AwaitingPermission;
   operation.updatedAt = new Date().toISOString();
 
   const request: AcpRuntimePermissionRequest = {
     id: nextPermissionRequestId(input.turn),
     kind: permissionKindFromOperation(operation.kind),
     operationId: operation.id,
-    phase: "pending",
+    phase: RuntimePermissionRequestPhase.Pending,
     scopeOptions: mapPermissionScopes(input.params.options),
     title: input.params.toolCall.title ?? "Permission request",
     turnId: input.turn.turnId,
@@ -200,7 +218,7 @@ export function mapPermissionRequest(input: {
   input.turn.permissionRequests.set(request.id, request);
 
   const storedOperation = getStoredOperation(input.turn, operation.id);
-  storedOperation.phase = "awaiting_permission";
+  storedOperation.phase = RuntimeOperationPhase.AwaitingPermission;
   storedOperation.permission = {
     ...storedOperation.permission,
     requestId: request.id,
@@ -222,11 +240,14 @@ export function applyPermissionDecision(input: {
   const operation = getStoredOperation(input.turn, input.operationId);
   operation.permission = {
     ...operation.permission,
-    decision: input.decision.decision === "allow" ? "allowed" : "denied",
+    decision:
+      input.decision.decision === RuntimePermissionDecisionValue.Allow
+        ? RuntimePermissionResolution.Allowed
+        : RuntimePermissionResolution.Denied,
     requested: true,
   };
-  if (input.decision.decision === "deny") {
-    operation.failureReason = "permission_denied";
+  if (input.decision.decision === RuntimePermissionDecisionValue.Deny) {
+    operation.failureReason = RuntimeOperationFailureReason.PermissionDenied;
   }
   operation.updatedAt = new Date().toISOString();
   return cloneOperation(operation);
@@ -238,7 +259,7 @@ export function mapPermissionDecisionToAcp(
 ): {
   outcome: { outcome: "cancelled" } | { optionId: string; outcome: "selected" };
 } {
-  if (decision.decision === "deny") {
+  if (decision.decision === RuntimePermissionDecisionValue.Deny) {
     const reject =
       options.find((option) => option.kind === "reject_once") ??
       options.find((option) => option.kind === "reject_always");
@@ -252,7 +273,7 @@ export function mapPermissionDecisionToAcp(
       : { outcome: { outcome: "cancelled" } };
   }
 
-  if (decision.scope === "session") {
+  if (decision.scope === RuntimePermissionScope.Session) {
     const allowAlways =
       options.find((option) => option.kind === "allow_always") ??
       options.find((option) => option.kind === "allow_once");
@@ -291,7 +312,7 @@ export function finalizePromptResponse(input: {
       {
         error: new AcpPermissionDeniedError("Permission denied."),
         turnId: input.turn.turnId,
-        type: "failed",
+        type: RuntimeTurnEventType.Failed,
       },
     ];
   }
@@ -302,7 +323,7 @@ export function finalizePromptResponse(input: {
       {
         error: new AcpTurnTimeoutError("Turn timed out."),
         turnId: input.turn.turnId,
-        type: "failed",
+        type: RuntimeTurnEventType.Failed,
       },
     ];
   }
@@ -313,7 +334,7 @@ export function finalizePromptResponse(input: {
       {
         error: new AcpTurnCancelledError("Turn cancelled."),
         turnId: input.turn.turnId,
-        type: "failed",
+        type: RuntimeTurnEventType.Cancelled,
       },
     ];
   }
@@ -324,7 +345,7 @@ export function finalizePromptResponse(input: {
       output: [...input.turn.output],
       outputText: input.turn.outputTextChunks.join(""),
       turnId: input.turn.turnId,
-      type: "completed",
+      type: RuntimeTurnEventType.Completed,
     },
   ];
 }
@@ -336,7 +357,7 @@ export function createProtocolFailure(
   return {
     error: new AcpProtocolError(message),
     turnId,
-    type: "failed",
+    type: RuntimeTurnEventType.Failed,
   };
 }
 
@@ -348,8 +369,11 @@ export function mapUsage(
   }
 
   return {
+    cachedReadTokens: value.cachedReadTokens ?? undefined,
+    cachedWriteTokens: value.cachedWriteTokens ?? undefined,
     inputTokens: value.inputTokens,
     outputTokens: value.outputTokens,
+    thoughtTokens: value.thoughtTokens ?? undefined,
     totalTokens: value.totalTokens,
   };
 }
@@ -382,23 +406,28 @@ function mapToolCallUpdateToRuntimeEvents(
       outputText: collectToolCallContentText(update.content),
     };
   }
-  if (existing.phase === "failed" && existing.permission?.decision === "denied") {
-    existing.failureReason = "permission_denied";
+  if (
+    existing.phase === RuntimeOperationPhase.Failed &&
+    existing.permission?.decision === RuntimePermissionResolution.Denied
+  ) {
+    existing.failureReason = RuntimeOperationFailureReason.PermissionDenied;
     existing.permission = {
       ...existing.permission,
-      family: existing.permission.family ?? "permission_request_end_turn",
+      family:
+        existing.permission.family ??
+        RuntimeOperationPermissionFamily.PermissionRequestEndTurn,
       requested: true,
     };
     turn.deniedOperationIds.add(existing.id);
-  } else if (existing.phase === "failed") {
+  } else if (existing.phase === RuntimeOperationPhase.Failed) {
     const family = profile.inferDeniedOperationFamily({
       metadata,
       operation: existing,
     });
-    if (family === "mode_denied") {
-      existing.failureReason = "permission_denied";
+    if (family === RuntimeOperationPermissionFamily.ModeDenied) {
+      existing.failureReason = RuntimeOperationFailureReason.PermissionDenied;
       existing.permission = {
-        decision: "denied",
+        decision: RuntimePermissionResolution.Denied,
         family,
         requested: false,
       };
@@ -407,26 +436,26 @@ function mapToolCallUpdateToRuntimeEvents(
   }
   existing.updatedAt = new Date().toISOString();
 
-  if (existing.phase === "completed") {
+  if (existing.phase === RuntimeOperationPhase.Completed) {
     return [
       {
         operation: cloneOperation(existing),
         turnId: turn.turnId,
-        type: "operation_completed",
+        type: RuntimeTurnEventType.OperationCompleted,
       },
     ];
   }
 
-  if (existing.phase === "failed") {
+  if (existing.phase === RuntimeOperationPhase.Failed) {
     return [
       {
         error:
-          existing.failureReason === "permission_denied"
+          existing.failureReason === RuntimeOperationFailureReason.PermissionDenied
             ? new AcpPermissionDeniedError(existing.title)
             : new AcpProtocolError(existing.title),
         operation: cloneOperation(existing),
         turnId: turn.turnId,
-        type: "operation_failed",
+        type: RuntimeTurnEventType.OperationFailed,
       },
     ];
   }
@@ -435,7 +464,7 @@ function mapToolCallUpdateToRuntimeEvents(
     {
       operation: cloneOperation(existing),
       turnId: turn.turnId,
-      type: "operation_updated",
+      type: RuntimeTurnEventType.OperationUpdated,
     },
   ];
 }
@@ -598,15 +627,15 @@ function collectToolCallContentText(
 function mapOperationPhase(status: string): AcpRuntimeOperationPhase {
   switch (status) {
     case "pending":
-      return "proposed";
+      return RuntimeOperationPhase.Proposed;
     case "in_progress":
-      return "running";
+      return RuntimeOperationPhase.Running;
     case "completed":
-      return "completed";
+      return RuntimeOperationPhase.Completed;
     case "failed":
-      return "failed";
+      return RuntimeOperationPhase.Failed;
     default:
-      return "proposed";
+      return RuntimeOperationPhase.Proposed;
   }
 }
 
@@ -614,18 +643,18 @@ function permissionKindFromOperation(
   operationKind: AcpRuntimeOperationKind,
 ): AcpRuntimePermissionRequest["kind"] {
   switch (operationKind) {
-    case "execute_command":
-      return "terminal";
-    case "network_request":
-      return "network";
-    case "read_file":
-    case "write_file":
-    case "document_edit":
-      return "filesystem";
-    case "mcp_call":
-      return "mcp";
+    case RuntimeOperationKind.ExecuteCommand:
+      return RuntimePermissionKind.Terminal;
+    case RuntimeOperationKind.NetworkRequest:
+      return RuntimePermissionKind.Network;
+    case RuntimeOperationKind.ReadFile:
+    case RuntimeOperationKind.WriteFile:
+    case RuntimeOperationKind.DocumentEdit:
+      return RuntimePermissionKind.Filesystem;
+    case RuntimeOperationKind.McpCall:
+      return RuntimePermissionKind.Mcp;
     default:
-      return "unknown";
+      return RuntimePermissionKind.Unknown;
   }
 }
 
@@ -635,9 +664,9 @@ function mapPermissionScopes(
   const scopes = new Set<"once" | "session">();
   for (const option of options) {
     if (option.kind.endsWith("always")) {
-      scopes.add("session");
+      scopes.add(RuntimePermissionScope.Session);
     } else {
-      scopes.add("once");
+      scopes.add(RuntimePermissionScope.Once);
     }
   }
 
@@ -648,8 +677,9 @@ function mapUsageUpdate(
   usage: Extract<SessionUpdate, { sessionUpdate: "usage_update" }>,
 ): AcpRuntimeUsage {
   return {
+    contextUsedTokens: usage.used,
+    contextWindowTokens: usage.size,
     costUsd: usage.cost?.currency === "USD" ? usage.cost.amount : undefined,
-    totalTokens: usage.used,
   };
 }
 
@@ -702,13 +732,13 @@ function finalizeDeniedOperations(input: {
 
     const family =
       input.response.stopReason === "cancelled"
-        ? "permission_request_cancelled"
-        : "permission_request_end_turn";
+        ? RuntimeOperationPermissionFamily.PermissionRequestCancelled
+        : RuntimeOperationPermissionFamily.PermissionRequestEndTurn;
     const nextPhase =
-      family === "permission_request_cancelled"
-        ? "cancelled"
-        : operation.phase === "awaiting_permission"
-          ? "failed"
+      family === RuntimeOperationPermissionFamily.PermissionRequestCancelled
+        ? RuntimeOperationPhase.Cancelled
+        : operation.phase === RuntimeOperationPhase.AwaitingPermission
+          ? RuntimeOperationPhase.Failed
           : operation.phase;
 
     let changed = false;
@@ -720,8 +750,8 @@ function finalizeDeniedOperations(input: {
       };
       changed = true;
     }
-    if (operation.failureReason !== "permission_denied") {
-      operation.failureReason = "permission_denied";
+    if (operation.failureReason !== RuntimeOperationFailureReason.PermissionDenied) {
+      operation.failureReason = RuntimeOperationFailureReason.PermissionDenied;
       changed = true;
     }
     if (operation.phase !== nextPhase) {
@@ -737,7 +767,7 @@ function finalizeDeniedOperations(input: {
     events.push({
       operation: cloneOperation(operation),
       turnId: input.turn.turnId,
-      type: "operation_updated",
+      type: RuntimeTurnEventType.OperationUpdated,
     });
   }
 

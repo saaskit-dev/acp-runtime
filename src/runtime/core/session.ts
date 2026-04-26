@@ -5,20 +5,24 @@ import type {
   AcpRuntimeOperationBundleWatcher,
   AcpRuntimeOperationWatcher,
   AcpRuntimePermissionRequestWatcher,
-  AcpRuntimeProjectionWatcher,
-  AcpRuntimeReadModelWatcher,
+  AcpRuntimeQueuePolicy,
+  AcpRuntimeQueuePolicyInput,
+  AcpRuntimeConfigValue,
   AcpRuntimeSessionMetadata,
   AcpRuntimePrompt,
   AcpRuntimeSessionStatus,
+  AcpRuntimeStateWatcher,
   AcpRuntimeSnapshot,
   AcpRuntimeStreamOptions,
   AcpRuntimeTerminalWatcher,
+  AcpRuntimeTurnHandle,
   AcpRuntimeToolCallWatcher,
   AcpRuntimeToolObjectWatcher,
   AcpRuntimeTurnCompletion,
   AcpRuntimeTurnEvent,
   AcpRuntimeTurnHandlers,
 } from "./types.js";
+import { AcpRuntimeTurnEventType } from "./types.js";
 import { AcpProtocolError } from "./errors.js";
 import type { AcpSessionDriver } from "./session-driver.js";
 
@@ -29,11 +33,16 @@ export class AcpRuntimeSession {
     listModes: () => this.driver.listAgentModes(),
     listConfigOptions: () => this.driver.listAgentConfigOptions(),
     setMode: (modeId: string) => this.applyAgentMode(modeId),
-    setConfigOption: (id: string, value: string) =>
+    setConfigOption: (id: string, value: AcpRuntimeConfigValue) =>
       this.applyAgentConfigValue(id, value),
   } as const;
 
   readonly turn = {
+    cancel: (turnId: string) => this.cancelTurn(turnId),
+    start: (
+      prompt: AcpRuntimePrompt,
+      options?: AcpRuntimeStreamOptions,
+    ) => this.startTurn(prompt, options),
     run: (
       prompt: AcpRuntimePrompt,
       options?: AcpRuntimeStreamOptions,
@@ -47,9 +56,22 @@ export class AcpRuntimeSession {
       prompt: AcpRuntimePrompt,
       options?: AcpRuntimeStreamOptions,
     ) => this.openPromptStream(prompt, options),
+    queue: {
+      clear: () => this.clearQueuedTurns(),
+      get: (turnId: string) => this.driver.queuedTurn(turnId),
+      list: () => this.driver.queuedTurns(),
+      remove: (turnId: string) => this.removeQueuedTurn(turnId),
+      sendNow: (turnId: string) => this.sendQueuedTurnNow(turnId),
+    },
   } as const;
 
-  readonly model = {
+  readonly queue = {
+    policy: () => this.driver.queuePolicy(),
+    setPolicy: (policy: AcpRuntimeQueuePolicyInput) =>
+      this.setQueuePolicy(policy),
+  } as const;
+
+  readonly state = {
     history: {
       drain: () => this.driver.drainHistoryEntries(),
     },
@@ -114,21 +136,16 @@ export class AcpRuntimeSession {
         watcher: AcpRuntimePermissionRequestWatcher,
       ) => this.driver.watchPermissionRequest(requestId, watcher),
     },
-    watch: (watcher: AcpRuntimeReadModelWatcher) =>
-      this.driver.watchReadModel(watcher),
-  } as const;
-
-  readonly live = {
     metadata: () => this.driver.projectionMetadata(),
     usage: () => this.driver.projectionUsage(),
-    watch: (watcher: AcpRuntimeProjectionWatcher) =>
-      this.driver.watchProjection(watcher),
-  } as const;
-
-  readonly lifecycle = {
-    snapshot: () => this.driver.snapshot(),
-    cancel: () => this.cancelSessionLifecycle(),
-    close: () => this.closeSessionLifecycle(),
+    watch: (watcher: AcpRuntimeStateWatcher) => {
+      const stopReadModel = this.driver.watchReadModel(watcher);
+      const stopProjection = this.driver.watchProjection(watcher);
+      return () => {
+        stopReadModel();
+        stopProjection();
+      };
+    },
   } as const;
 
   constructor(
@@ -157,12 +174,11 @@ export class AcpRuntimeSession {
     return this.closed ? "closed" : this.driver.status;
   }
 
-  private async cancelSessionLifecycle(): Promise<void> {
-    this.assertOpen();
-    await this.driver.cancel();
+  snapshot(): AcpRuntimeSnapshot {
+    return this.driver.snapshot();
   }
 
-  private async closeSessionLifecycle(): Promise<void> {
+  async close(): Promise<void> {
     if (this.closed) {
       return;
     }
@@ -172,7 +188,7 @@ export class AcpRuntimeSession {
 
   private async applyAgentConfigValue(
     id: string,
-    value: string,
+    value: AcpRuntimeConfigValue,
   ): Promise<void> {
     this.assertOpen();
     await this.driver.setAgentConfigOption(id, value);
@@ -193,14 +209,40 @@ export class AcpRuntimeSession {
     return completion.outputText;
   }
 
+  private async cancelTurn(turnId: string): Promise<boolean> {
+    this.assertOpen();
+    return this.driver.cancelTurn(turnId);
+  }
+
+  private async sendQueuedTurnNow(turnId: string): Promise<boolean> {
+    this.assertOpen();
+    return this.driver.sendQueuedTurnNow(turnId);
+  }
+
+  private clearQueuedTurns(): number {
+    this.assertOpen();
+    return this.driver.clearQueuedTurns();
+  }
+
+  private setQueuePolicy(policy: AcpRuntimeQueuePolicyInput): AcpRuntimeQueuePolicy {
+    this.assertOpen();
+    return this.driver.setQueuePolicy(policy);
+  }
+
+  private removeQueuedTurn(turnId: string): boolean {
+    this.assertOpen();
+    return this.driver.withdrawQueuedTurn(turnId);
+  }
+
   private async executePromptSend(
     prompt: AcpRuntimePrompt,
     handlers?: AcpRuntimeTurnHandlers,
     options?: AcpRuntimeStreamOptions,
   ): Promise<AcpRuntimeTurnCompletion> {
+    const turn = this.startTurn(prompt, options);
     let completion: AcpRuntimeTurnCompletion | undefined;
     let terminalSeen = false;
-    for await (const event of this.openPromptStream(prompt, options)) {
+    for await (const event of turn.events) {
       if (terminalSeen) {
         throw new AcpProtocolError(
           "Turn stream emitted events after a terminal event.",
@@ -208,14 +250,23 @@ export class AcpRuntimeSession {
       }
 
       await handlers?.onEvent?.(event);
-      if (event.type === "completed") {
+      if (event.type === AcpRuntimeTurnEventType.Completed) {
         terminalSeen = true;
         completion = {
           output: event.output,
           outputText: event.outputText,
           turnId: event.turnId,
         };
-      } else if (event.type === "failed") {
+      } else if (event.type === AcpRuntimeTurnEventType.Cancelled) {
+        terminalSeen = true;
+        throw event.error;
+      } else if (event.type === AcpRuntimeTurnEventType.Coalesced) {
+        terminalSeen = true;
+        throw event.error;
+      } else if (event.type === AcpRuntimeTurnEventType.Withdrawn) {
+        terminalSeen = true;
+        throw event.error;
+      } else if (event.type === AcpRuntimeTurnEventType.Failed) {
         throw event.error;
       }
     }
@@ -227,12 +278,19 @@ export class AcpRuntimeSession {
     return completion;
   }
 
+  private startTurn(
+    prompt: AcpRuntimePrompt,
+    options?: AcpRuntimeStreamOptions,
+  ): AcpRuntimeTurnHandle {
+    this.assertOpen();
+    return this.driver.startTurn(prompt, options);
+  }
+
   private openPromptStream(
     prompt: AcpRuntimePrompt,
     options?: AcpRuntimeStreamOptions,
   ): AsyncIterable<AcpRuntimeTurnEvent> {
-    this.assertOpen();
-    return this.driver.stream(prompt, options);
+    return this.startTurn(prompt, options).events;
   }
 
   private assertOpen(): void {

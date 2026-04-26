@@ -9,6 +9,7 @@ It describes only host-facing runtime concepts, not raw ACP protocol messages.
 
 Recommended reading order:
 - [Runtime SDK By Scenario](runtime-sdk-by-scenario.md)
+- [Runtime SDK Observability](runtime-sdk-observability.md)
 - [Runtime SDK Read Models](runtime-sdk-read-models.md)
 - [Runtime SDK API Coverage](runtime-sdk-api-coverage.md)
 - this page for grouped semantics and type notes
@@ -23,7 +24,7 @@ The package root intentionally keeps a narrow value-export surface:
 - runtime classes and runtime-facing error types
 - ACP agent launch helpers such as `createClaudeCodeAcpAgent()`
 - stdio transport construction via `createStdioAcpConnectionFactory()`
-- protocol alignment metadata and registry helpers
+- protocol alignment metadata, registry helpers, and default path helpers
 
 Internal implementation details such as `AcpSessionDriver`, session-service construction,
 and stdio process internals are not part of the package-root public API.
@@ -44,23 +45,26 @@ Internal runtime implementation is currently organized around:
 
 Public host surface:
 - `runtime.sessions.start(options)`
-- `runtime.sessions.registry.start(options)`
 - `runtime.sessions.load(options)`
-- `runtime.sessions.registry.load(options)`
 - `runtime.sessions.resume(options)`
-- `runtime.sessions.remote.list(options)`
-- `runtime.sessions.registry.remote.list(options)`
-- `runtime.sessions.stored.list(options?)`
-- `runtime.sessions.stored.delete(sessionId)`
-- `runtime.sessions.stored.deleteMany(options?)`
-- `runtime.sessions.stored.watch(watcher)`
-- `runtime.sessions.stored.refresh()`
+- `runtime.sessions.list(options?)`
 
 Registry-backed helper:
 - `resolveRuntimeAgentFromRegistry(agentId)`
+- `resolveRuntimeHomePath(...segments)`
+- `resolveRuntimeCachePath(...segments)`
 
-For most host integrations, `runtime.sessions.registry.start(...)` should be the default path.
-It keeps agent launch resolution inside the runtime instead of repeating `command` / `args` rules in every host.
+Default runtime-owned state now lives under `~/.acp-runtime/`.
+
+- `resolveRuntimeHomePath(...)` resolves paths under the runtime home root
+- `resolveRuntimeCachePath(...)` resolves cache paths under `~/.acp-runtime/cache/`
+- `ACP_RUNTIME_HOME_DIR` overrides the home root
+- `ACP_RUNTIME_CACHE_DIR` overrides the cache root only
+
+For most host integrations, `runtime.sessions.start({ agent: "claude-acp", ... })` should be the default path.
+Passing an agent id keeps launch resolution inside the runtime instead of repeating `command` / `args` rules in every host.
+Runtime-owned local state is enabled by default and stored at `~/.acp-runtime/state/runtime-session-registry.json`.
+Use `new AcpRuntime(factory, { state: { sessionRegistryPath } })` to override that path, or `{ state: false }` to disable local state.
 
 ## Session Surface
 
@@ -76,10 +80,16 @@ It keeps agent launch resolution inside the runtime instead of repeating `comman
   - `setMode()`
   - `setConfigOption()`
 - `session.turn.*`
+  - `cancel(turnId)`
+  - `start()`
   - `run()`
   - `send()`
   - `stream()`
-- `session.model.*`
+  - `queue.clear()/sendNow()/get()/list()/remove()`
+- `session.queue.*`
+  - `policy()`
+  - `setPolicy({ delivery })`
+- `session.state.*`
   - `history.drain()`
   - `thread.entries()`
   - `diffs.keys()/get()/list()/watch()`
@@ -87,44 +97,69 @@ It keeps agent launch resolution inside the runtime instead of repeating `comman
   - `toolCalls.ids()/get()/list()/bundle()/bundles()/diffs()/terminals()/watch()/watchObjects()`
   - `operations.ids()/get()/list()/bundle()/bundles()/permissions()/watch()/watchBundle()`
   - `permissions.ids()/get()/list()/watch()`
-  - `watch(...)`
-- `session.live.*`
   - `metadata()`
   - `usage()`
   - `watch()`
-- `session.lifecycle.*`
-  - `snapshot()`
-  - `cancel()`
-  - `close()`
+- `session.snapshot()`
+- `session.close()`
+
+Turn submission is queue-first. `start()`, `send()`, `run()`, and `stream()` create a queued turn and mark it ready automatically. Hosts that need explicit scheduling should keep the returned `turnId`, then call `session.turn.queue.sendNow(turnId)` to move that not-yet-started queued turn to the front and cancel the active turn, `remove(turnId)` to withdraw one queued turn before it starts, or `clear()` to withdraw all queued turns before they start.
+`AcpRuntimeQueuedTurn.status` is `queued` before dispatch and `ready` after dispatch while waiting for execution.
+
+Queue drain policy is session-level. Pass `queue: { delivery: "sequential" | "coalesce" }` to `runtime.sessions.start/load/resume`, or update future drains with `session.queue.setPolicy(...)`.
+`sequential` sends ready queued turns one by one. `coalesce` drains all ready queued prompts into one agent prompt; the first turn becomes the actual turn, and later merged turns receive a terminal `coalesced` event with `intoTurnId`.
 
 ## Session Handle Semantics
 
 `AcpRuntimeSession` is a host-facing handle over an underlying runtime-managed session driver.
 
-Current lifecycle rules:
+Current handle rules:
 
 - repeated `runtime.sessions.load()` calls for the same `sessionId` share one underlying driver while returning distinct handles
-- repeated `runtime.sessions.resume()` calls for the same `snapshot.session.id` share one underlying driver while returning distinct handles
+- repeated `runtime.sessions.resume()` calls for the same `sessionId` share one underlying driver while returning distinct handles
 - closing one handle does not close sibling handles that still reference the same underlying session
 - the underlying driver closes only after the final live handle closes
-- once a specific handle is closed, that handle rejects `session.turn.run`, `session.turn.send`, `session.turn.stream`, `session.lifecycle.cancel`, `session.agent.setMode`, and `session.agent.setConfigOption`
+- once a specific handle is closed, that handle rejects `session.turn.start`, `session.turn.run`, `session.turn.send`, `session.turn.stream`, `session.turn.cancel(turnId)`, `session.agent.setMode`, and `session.agent.setConfigOption`
 - snapshot and read-model getters remain readable from a closed handle, but they no longer represent an active control surface
 
 ## Read-Model Watcher Semantics
 
-The runtime exposes two watcher layers:
+The runtime exposes state watchers at two granularities:
 
-- read-model watchers such as `session.model.watch`, `session.model.diffs.watch`, `session.model.terminals.watch`, `session.model.toolCalls.watch`, and `session.model.toolCalls.watchObjects`
-- projection watchers such as `session.live.watch`, `session.model.operations.watch`, `session.model.operations.watchBundle`, and `session.model.permissions.watch`
+- broad state watchers such as `session.state.watch`, which receive read-model and projection updates
+- targeted watchers such as `session.state.diffs.watch`, `session.state.terminals.watch`, `session.state.toolCalls.watch`, `session.state.toolCalls.watchObjects`, `session.state.operations.watch`, `session.state.operations.watchBundle`, and `session.state.permissions.watch`
 
 Current `tool_call` read-model behavior is incremental rather than batch-coalesced:
 
 - when a tool call update contains derived objects like diffs or terminals, the runtime emits those derived object updates first
 - the corresponding `tool_call` thread entry is emitted after the derived object updates for that same write
-- `session.model.toolCalls.watch(toolCallId, watcher)` can therefore fire multiple times for one ACP `tool_call` or `tool_call_update`
+- `session.state.toolCalls.watch(toolCallId, watcher)` can therefore fire multiple times for one ACP `tool_call` or `tool_call_update`
 - each callback receives the latest bundle snapshot visible at that step, not a deferred final-only bundle
 
 Hosts should treat these watchers as live incremental state updates rather than assuming one callback per ACP update.
+
+## Public String Constants
+
+Public discriminant strings remain wire-stable, but callers should prefer the exported constants instead of hard-coded string literals:
+
+```ts
+import {
+  AcpRuntimeOperationKind,
+  AcpRuntimeReadModelUpdateType,
+  AcpRuntimeThreadEntryKind,
+  AcpRuntimeTurnEventType,
+} from "@saaskit-dev/acp-runtime";
+
+if (event.type === AcpRuntimeTurnEventType.UsageUpdated) {
+  console.log(event.usage.totalTokens);
+}
+
+if (entry.kind === AcpRuntimeThreadEntryKind.AssistantMessage) {
+  console.log(entry.text);
+}
+```
+
+The same pattern exists for operation kinds/phases, projection update types, read-model update types, content part types, prompt roles, permission kinds/scopes, queue delivery, session status, terminal status, and observability redaction kinds.
 
 ## Agent Identity
 
@@ -136,12 +171,12 @@ Hosts should treat these watchers as live incremental state updates rather than 
 
 `type` is the stable runtime-facing agent family identifier used for profile selection and host-side filtering.
 
-For registry-backed startup, hosts can skip manual `AcpRuntimeAgent` construction:
+For registry-id startup, hosts can skip manual `AcpRuntimeAgent` construction by passing a registry agent id:
 
 ```ts
 const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
-const session = await runtime.sessions.registry.start({
-  agentId: "claude-acp",
+const session = await runtime.sessions.start({
+  agent: "claude-acp",
   cwd: process.cwd(),
 });
 ```
@@ -159,23 +194,14 @@ That means:
 
 ## Session Listing Semantics
 
-`runtime.sessions.remote.list(options)` is **agent-scoped**, not global.
+`runtime.sessions.list({ source: "remote", agent, cwd })` is **agent-scoped**, not global.
 
 It asks one concrete ACP agent process to return the sessions it knows about.
 It does not aggregate across multiple agents.
 
-If a host needs a cross-agent session picker or a global recent-session view,
-that should be modeled through a host-owned registry layer.
-
-For that host-owned layer, `AcpRuntime` now also exposes registry-backed stored-session helpers:
-- `runtime.sessions.stored.list(options?)`
-- `runtime.sessions.stored.delete(sessionId)`
-- `runtime.sessions.stored.deleteMany(options?)`
-- `runtime.sessions.stored.watch(watcher)`
-- `runtime.sessions.stored.refresh()`
-
-These are runtime-owned history-management helpers built on top of the host registry.
-They are not ACP protocol methods.
+For a local recent-session view, use `runtime.sessions.list({ source: "local" })`.
+For a merged view, use `runtime.sessions.list({ source: "all", agent, cwd })`.
+Returned references include `source: "local" | "remote" | "both"` when the source is known.
 
 Current TypeScript SDK coverage for session management stops at:
 - `session/list`
@@ -248,7 +274,7 @@ For the full compatibility boundary, see
 
 ### Session Listing
 
-`runtime.sessions.remote.list(options)` returns:
+`runtime.sessions.list(options)` returns:
 - `sessions`
 - `nextCursor`
 
@@ -259,45 +285,33 @@ Each session reference currently includes:
 - `title`
 - `updatedAt`
 
-### Host Registry
+### Runtime State
 
-`AcpRuntimeSessionRegistry` is a host-owned global index.
-
-It can:
-- persist runtime snapshots by `session.id`
-- list stored sessions by `agentType` and `cwd`
-- return the stored snapshot for a given `session.id`
-- delete stored sessions
-- watch stored-session updates
-- emit refresh notifications
-
-The registry no longer keeps a separate agent-descriptor table.
-The minimal persistence unit is `session.id -> snapshot`.
-
-`AcpRuntimeJsonSessionRegistryStore` is the built-in persisted store.
-It reads and writes the registry state as JSON on local disk.
+The local session index is runtime-owned implementation detail.
+Hosts interact with it through `runtime.sessions.list({ source: "local" })`,
+`runtime.sessions.load({ sessionId, ... })`, and `runtime.sessions.resume({ sessionId, ... })`.
 
 ### Thread Entries
 
-`session.model.thread.entries()` exposes the runtime's thread-first read model.
+`session.state.thread.entries()` exposes the runtime's thread-first read model.
 
 This is additive. It does not replace:
 - `AcpRuntimeTurnEvent`
 - `AcpRuntimeOperation`
 
-`session.model.diffs.get(path)` and `session.model.terminals.get(terminalId)` expose direct lookup helpers
+`session.state.diffs.get(path)` and `session.state.terminals.get(terminalId)` expose direct lookup helpers
 for runtime-owned tool objects.
 
-`session.model.diffs.list()` and `session.model.terminals.list()` expose runtime-owned object views derived
+`session.state.diffs.list()` and `session.state.terminals.list()` expose runtime-owned object views derived
 from that same thread-first model.
 
-`session.model.diffs.keys()` and `session.model.terminals.ids()` expose the current object-store indexes.
+`session.state.diffs.keys()` and `session.state.terminals.ids()` expose the current object-store indexes.
 
-`session.model.toolCalls.diffs(toolCallId)` and `session.model.toolCalls.terminals(toolCallId)`
+`session.state.toolCalls.diffs(toolCallId)` and `session.state.toolCalls.terminals(toolCallId)`
 expose the object-store view grouped by source tool call.
 
-`session.model.toolCalls.ids()`, `session.model.toolCalls.list()`, `session.model.toolCalls.bundles()`,
-`session.model.toolCalls.get(toolCallId)`, and `session.model.toolCalls.bundle(toolCallId)`
+`session.state.toolCalls.ids()`, `session.state.toolCalls.list()`, `session.state.toolCalls.bundles()`,
+`session.state.toolCalls.get(toolCallId)`, and `session.state.toolCalls.bundle(toolCallId)`
 expose the tool-call-level inspection view.
 
 Those objects now carry basic lifecycle metadata such as:
@@ -312,13 +326,13 @@ They also expose derived inspection metrics:
 - terminal: `outputLength`, `outputLineCount`
 - diff: `newLineCount`, `oldLineCount`
 
-`session.model.watch(watcher)` lets hosts subscribe to read-model changes:
+`session.state.watch(watcher)` lets hosts subscribe to read-model changes:
 - `thread_entry_added`
 - `thread_entry_updated`
 - `diff_updated`
 - `terminal_updated`
 
-`session.live.watch(watcher)` exposes the runtime-owned projection layer for:
+It also exposes the runtime-owned projection layer for:
 - `operation_projection_updated`
 - `permission_projection_updated`
 - `metadata_projection_updated`
@@ -328,30 +342,30 @@ That projection layer exists so hosts can consume stable live operation/permissi
 without treating raw `AcpRuntimeTurnEvent` delivery as the source of truth.
 
 Operation and permission state now also expose narrower runtime-owned inspection views:
-- `session.model.operations.get(operationId)`
-- `session.model.operations.list()`
-- `session.model.operations.permissions(operationId)`
-- `session.model.operations.bundle(operationId)`
-- `session.model.operations.bundles()`
-- `session.model.permissions.get(requestId)`
-- `session.model.permissions.list()`
+- `session.state.operations.get(operationId)`
+- `session.state.operations.list()`
+- `session.state.operations.permissions(operationId)`
+- `session.state.operations.bundle(operationId)`
+- `session.state.operations.bundles()`
+- `session.state.permissions.get(requestId)`
+- `session.state.permissions.list()`
 
 And targeted watchers:
-- `session.model.operations.watch(operationId, watcher)`
-- `session.model.operations.watchBundle(operationId, watcher)`
-- `session.model.permissions.watch(requestId, watcher)`
+- `session.state.operations.watch(operationId, watcher)`
+- `session.state.operations.watchBundle(operationId, watcher)`
+- `session.state.permissions.watch(requestId, watcher)`
 
-`session.model.diffs.watch(path, watcher)` and `session.model.terminals.watch(terminalId, watcher)`
+`session.state.diffs.watch(path, watcher)` and `session.state.terminals.watch(terminalId, watcher)`
 provide targeted subscriptions for one diff or one terminal object.
 
-`session.model.toolCalls.watchObjects(toolCallId, watcher)` provides a targeted subscription
+`session.state.toolCalls.watchObjects(toolCallId, watcher)` provides a targeted subscription
 for all diff/terminal objects associated with one tool call.
 
-`session.model.toolCalls.watch(toolCallId, watcher)` provides a targeted subscription for the
+`session.state.toolCalls.watch(toolCallId, watcher)` provides a targeted subscription for the
 full tool-call bundle, including the tool call entry plus grouped diff/terminal objects.
 
 The event layer remains the stable host-facing streaming abstraction.
-`session.model.thread.entries()` is the richer structured view used for history, tool-call inspection, and future thread-oriented UIs.
+`session.state.thread.entries()` is the richer structured view used for history, tool-call inspection, and future thread-oriented UIs.
 
 Current thread entry families:
 - `user_message`
@@ -386,11 +400,11 @@ Current `tool_call.content` families:
 These fields are best-effort snapshots derived from ACP tool-call content and local terminal handlers when available.
 
 Two narrower runtime-side object views are also available:
-- `session.model.diffs.list()`
-- `session.model.terminals.list()`
+- `session.state.diffs.list()`
+- `session.state.terminals.list()`
 
 These are derived stores built from the same underlying thread-first model.
-They exist so hosts can consume richer diff/terminal state without re-scanning `session.model.thread.entries()`.
+They exist so hosts can consume richer diff/terminal state without re-scanning `session.state.thread.entries()`.
 
 ### Diagnostics
 
@@ -463,6 +477,9 @@ Current public turn event families:
 - `operation_completed`
 - `operation_failed`
 - `completed`
+- `cancelled`
+- `coalesced`
+- `withdrawn`
 - `failed`
 
 ## Errors

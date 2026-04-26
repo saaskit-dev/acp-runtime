@@ -11,7 +11,7 @@ import {
   type AcpRuntimeTurnEvent,
   createStdioAcpConnectionFactory,
 } from "../index.js";
-import { resolveBuiltSimulatorWorkspaceCliPath } from "../internal/simulator-workspace.js";
+import { resolveBuiltSimulatorWorkspaceCliPath } from "./registry/simulator-workspace.js";
 
 const tempDirs: string[] = [];
 
@@ -79,7 +79,11 @@ describe("AcpRuntime x simulator-agent ACP", () => {
   it("creates, configures, snapshots, and resumes simulator sessions through the runtime", async () => {
     const cliPath = resolveBuiltSimulatorWorkspaceCliPath();
     const { projectDir, storageDir } = await createTestDirs();
-    const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
+    const runtime = new AcpRuntime(createStdioAcpConnectionFactory(), {
+      state: {
+        sessionRegistryPath: join(storageDir, "runtime-session-registry.json"),
+      },
+    });
     const handlers = createAuthorityHandlers();
     const firstPath = join(projectDir, "notes-one.txt");
     const secondPath = join(projectDir, "notes-two.txt");
@@ -97,7 +101,7 @@ describe("AcpRuntime x simulator-agent ACP", () => {
       handlers,
     });
 
-    expect(session.lifecycle.snapshot().agent.type).toBe(SIMULATOR_AGENT_ACP_REGISTRY_ID);
+    expect(session.snapshot().agent.type).toBe(SIMULATOR_AGENT_ACP_REGISTRY_ID);
     expect(session.agent.listModes().map((mode) => mode.id)).toEqual([
       "deny",
       "accept-edits",
@@ -146,7 +150,7 @@ describe("AcpRuntime x simulator-agent ACP", () => {
       ),
     ).toBe(false);
 
-    const snapshot = session.lifecycle.snapshot();
+    const snapshot = session.snapshot();
     expect(snapshot.config).toMatchObject({
       "approval-policy": "accept-edits",
       model: "claude",
@@ -156,7 +160,7 @@ describe("AcpRuntime x simulator-agent ACP", () => {
 
     const resumed = await runtime.sessions.resume({
       handlers,
-      snapshot,
+      sessionId: snapshot.session.id,
     });
     expect(resumed.metadata.id).toBe(snapshot.session.id);
     expect(resumed.metadata.config).toMatchObject({
@@ -167,7 +171,7 @@ describe("AcpRuntime x simulator-agent ACP", () => {
 
     await resumed.agent.setMode("deny");
     expect(resumed.metadata.currentModeId).toBe("deny");
-    const deniedSnapshot = resumed.lifecycle.snapshot();
+    const deniedSnapshot = resumed.snapshot();
     expect(deniedSnapshot.currentModeId).toBe("deny");
 
     const describeResult = await resumed.turn.send("/describe");
@@ -176,13 +180,13 @@ describe("AcpRuntime x simulator-agent ACP", () => {
 
     const resumedDenied = await runtime.sessions.resume({
       handlers,
-      snapshot: deniedSnapshot,
+      sessionId: deniedSnapshot.session.id,
     });
     expect(resumedDenied.metadata.currentModeId).toBe("deny");
 
-    await resumedDenied.lifecycle.close();
+    await resumedDenied.close();
 
-    await resumed.lifecycle.close();
-    await session.lifecycle.close();
+    await resumed.close();
+    await session.close();
   });
 });

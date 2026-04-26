@@ -4,40 +4,35 @@ Language:
 - English (default)
 - [简体中文](../zh-CN/guides/runtime-sdk-read-models.md)
 
-This guide explains how to use the `session.model.*` and `session.live.*` surfaces.
+This guide explains how to use the `session.state.*` surface.
 
 If you only need to start a session and run prompts, you can ignore this page.
 Come here when you are building richer host state, inspection tools, or UI views.
 
 ## Mental Model
 
-There are three different layers:
+There are two different layers:
 
 1. `session.turn.*`
    Use this when you want to execute turns.
    It is the write/control path.
 
-2. `session.model.*`
+2. `session.state.*`
    Use this when you want stable runtime-owned state.
-   This is the read-model / object-store path.
-
-3. `session.live.*`
-   Use this when you want lightweight live projection updates such as metadata, usage,
-   operation projection, or permission projection.
+   This includes the read-model/object-store path plus lightweight metadata and usage projections.
 
 The simplest rule is:
 
 - run turns with `session.turn.*`
-- build durable UI/state from `session.model.*`
-- use `session.live.*` for small realtime overlays and host status summaries
+- query and watch current session state with `session.state.*`
 
 ## Thread vs Object Store
 
-`session.model.*` has two shapes.
+`session.state.*` has two shapes.
 
 ### 1. Thread entries
 
-Use `session.model.thread.entries()` when you want a transcript-like view:
+Use `session.state.thread.entries()` when you want a transcript-like view:
 
 - user messages
 - assistant messages
@@ -53,10 +48,12 @@ This is the right surface for:
 - "what happened in this turn?" style inspection
 
 ```ts
-const entries = session.model.thread.entries();
+import { AcpRuntimeThreadEntryKind } from "@saaskit-dev/acp-runtime";
+
+const entries = session.state.thread.entries();
 
 for (const entry of entries) {
-  if (entry.kind === "assistant_message") {
+  if (entry.kind === AcpRuntimeThreadEntryKind.AssistantMessage) {
     console.log(entry.text);
   }
 }
@@ -81,14 +78,14 @@ This is the right surface for:
 - permission request review UIs
 
 ```ts
-const diffs = session.model.diffs.list();
-const terminal = session.model.terminals.get("term-1");
-const bundle = session.model.toolCalls.bundle("tool-call-1");
+const diffs = session.state.diffs.list();
+const terminal = session.state.terminals.get("term-1");
+const bundle = session.state.toolCalls.bundle("tool-call-1");
 ```
 
-## Which `session.model.*` Group To Use
+## Which `session.state.*` Group To Use
 
-### `session.model.thread.*`
+### `session.state.thread.*`
 
 Use for transcript-style views.
 
@@ -97,7 +94,7 @@ Use for transcript-style views.
 - `thread.entries()`
   Use for the canonical thread timeline.
 
-### `session.model.diffs.*`
+### `session.state.diffs.*`
 
 Use for file-change views.
 
@@ -110,7 +107,7 @@ Use for file-change views.
 - `watch(path, watcher)`
   Subscribe to one diff.
 
-### `session.model.terminals.*`
+### `session.state.terminals.*`
 
 Use for terminal state.
 
@@ -131,7 +128,7 @@ Use for terminal state.
 - `release(terminalId)`
   Mark the terminal as released on the host side.
 
-### `session.model.toolCalls.*`
+### `session.state.toolCalls.*`
 
 Use for grouped tool-call inspection.
 
@@ -154,7 +151,7 @@ Use for grouped tool-call inspection.
 - `watchObjects(toolCallId, watcher)`
   Subscribe to diff/terminal object updates scoped to one tool call.
 
-### `session.model.operations.*`
+### `session.state.operations.*`
 
 Use when your host cares about runtime operation state rather than only transcript state.
 
@@ -173,7 +170,7 @@ This is useful for:
 - operation lifecycle UIs
 - permission-aware command execution surfaces
 
-### `session.model.permissions.*`
+### `session.state.permissions.*`
 
 Use for explicit permission request state.
 
@@ -185,7 +182,7 @@ Use for explicit permission request state.
 This is useful when your product wants a dedicated permission center rather than
 embedding permission info only inside operation rendering.
 
-### `session.model.watch(...)`
+### `session.state.watch(...)`
 
 Use this when you want one unified read-model watcher.
 
@@ -198,48 +195,39 @@ It emits:
 Use it when you are building a read-model cache in your host and want one subscription entry point.
 
 ```ts
-const stopWatching = session.model.watch((update) => {
+import { AcpRuntimeReadModelUpdateType } from "@saaskit-dev/acp-runtime";
+
+const stopWatching = session.state.watch((update) => {
   switch (update.type) {
-    case "thread_entry_added":
+    case AcpRuntimeReadModelUpdateType.ThreadEntryAdded:
       break;
-    case "diff_updated":
+    case AcpRuntimeReadModelUpdateType.DiffUpdated:
       break;
-    case "terminal_updated":
+    case AcpRuntimeReadModelUpdateType.TerminalUpdated:
       break;
   }
 });
 ```
 
-## How `session.live.*` Fits In
+## Metadata, Usage, And Projection Updates
 
-`session.live.*` is not a replacement for `session.model.*`.
-
-Use it for:
+`session.state.*` also includes the lightweight state that used to be described as live projection:
 
 - current metadata snapshot
 - current usage snapshot
-- lightweight live projection updates
+- operation projection updates
+- permission projection updates
 
 ```ts
-const metadata = session.live.metadata();
-const usage = session.live.usage();
+const metadata = session.state.metadata();
+const usage = session.state.usage();
 
-const stopWatching = session.live.watch((update) => {
+const stopWatching = session.state.watch((update) => {
   console.log(update.type);
 });
 ```
 
-Prefer `session.live.*` when:
-
-- you need top-line status
-- you want lightweight turn overlays
-- you do not need durable keyed objects
-
-Prefer `session.model.*` when:
-
-- you need stable runtime-owned entities
-- you need direct lookup by id/path
-- you are building transcript, terminal, diff, tool-call, operation, or permission UI
+Use `session.state.watch(...)` when you want one subscription for both object-store updates and lightweight projection updates.
 
 ## Typical Host Patterns
 
@@ -248,21 +236,21 @@ Prefer `session.model.*` when:
 Use:
 
 - `session.turn.stream(...)`
-- `session.model.thread.entries()`
-- `session.model.watch(...)`
+- `session.state.thread.entries()`
+- `session.state.watch(...)`
 
 Suggested approach:
 
 - execute the turn through `session.turn.*`
 - render the transcript from `thread.entries()`
-- use `model.watch(...)` to incrementally update local UI state
+- use `state.watch(...)` to incrementally update local UI state
 
 ### Pattern B: File Changes Panel
 
 Use:
 
-- `session.model.diffs.list()`
-- `session.model.diffs.watch(path, watcher)`
+- `session.state.diffs.list()`
+- `session.state.diffs.watch(path, watcher)`
 
 Suggested approach:
 
@@ -273,11 +261,11 @@ Suggested approach:
 
 Use:
 
-- `session.model.terminals.list()`
-- `session.model.terminals.get(id)`
-- `session.model.terminals.watch(id, watcher)`
-- `session.model.terminals.refresh(id)`
-- `session.model.terminals.wait(id)`
+- `session.state.terminals.list()`
+- `session.state.terminals.get(id)`
+- `session.state.terminals.watch(id, watcher)`
+- `session.state.terminals.refresh(id)`
+- `session.state.terminals.wait(id)`
 
 Suggested approach:
 
@@ -289,8 +277,8 @@ Suggested approach:
 
 Use:
 
-- `session.model.toolCalls.bundle(id)`
-- `session.model.toolCalls.watch(id, watcher)`
+- `session.state.toolCalls.bundle(id)`
+- `session.state.toolCalls.watch(id, watcher)`
 
 Suggested approach:
 
@@ -301,9 +289,9 @@ Suggested approach:
 
 Use:
 
-- `session.model.operations.bundles()`
-- `session.model.permissions.list()`
-- `session.live.watch(...)`
+- `session.state.operations.bundles()`
+- `session.state.permissions.list()`
+- `session.state.watch(...)`
 
 Suggested approach:
 
@@ -315,14 +303,13 @@ Suggested approach:
 If you are unsure, use this progression:
 
 1. Start with `session.turn.run(...)` or `session.turn.stream(...)`
-2. Add `session.model.thread.entries()` for transcript UI
-3. Add `session.model.toolCalls.bundle(...)` if you need richer tool inspection
-4. Add `session.model.diffs.*` / `session.model.terminals.*` only when your product has explicit panels for them
-5. Add `session.live.watch(...)` when you need lightweight realtime overlays
+2. Add `session.state.thread.entries()` for transcript UI
+3. Add `session.state.toolCalls.bundle(...)` if you need richer tool inspection
+4. Add `session.state.diffs.*` / `session.state.terminals.*` only when your product has explicit panels for them
+5. Add `session.state.watch(...)` when you need lightweight realtime overlays
 
 ## Related Guides
 
 - [Runtime SDK By Scenario](runtime-sdk-by-scenario.md)
 - [Runtime SDK API Coverage](runtime-sdk-api-coverage.md)
 - [Runtime SDK API](runtime-sdk-api.md)
-

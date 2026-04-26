@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   ACP_RUNTIME_SNAPSHOT_VERSION,
+  ACP_RUNTIME_CACHE_DIR_ENV_VAR,
+  ACP_RUNTIME_HOME_DIR_ENV_VAR,
   ACP_PROTOCOL_ALIGNMENT_VERIFIED_AT,
   ACP_PROTOCOL_DOCS_SCHEMA_URL,
   ACP_PROTOCOL_DOCS_URL,
@@ -14,26 +16,17 @@ import {
   SIMULATOR_AGENT_ACP_COMMAND,
   AcpPermissionDeniedError,
   AcpRuntime,
+  AcpRuntimeTurnEventType,
   createClaudeCodeAcpAgent,
   createCodexAcpAgent,
   createGeminiCliAcpAgent,
   createSimulatorAgentAcpAgent,
+  resolveRuntimeCachePath,
+  resolveRuntimeHomePath,
 } from "./index.js";
-import type { AcpRuntimeRegistryListOptions } from "./index.js";
 import * as publicSdk from "./index.js";
 
-const registryListOptionsTypecheck: AcpRuntimeRegistryListOptions = {
-  agentType: "mock-agent",
-  cursor: "cursor-1",
-  cwd: "/tmp/project",
-  limit: 10,
-};
-
 describe("public protocol alignment exports", () => {
-  it("re-exports root registry list option types needed by host code", () => {
-    expect(registryListOptionsTypecheck.limit).toBe(10);
-  });
-
   it("exports ACP protocol alignment metadata", () => {
     expect(ACP_PROTOCOL_VERSION).toBe(1);
     expect(ACP_PROTOCOL_SOURCE_REPO).toBe("https://github.com/agentclientprotocol/agent-client-protocol");
@@ -45,8 +38,11 @@ describe("public protocol alignment exports", () => {
 
   it("exports the new runtime SDK surface", () => {
     expect(AcpRuntime).toBeTypeOf("function");
+    expect(AcpRuntimeTurnEventType.UsageUpdated).toBe("usage_updated");
     expect(AcpPermissionDeniedError).toBeTypeOf("function");
     expect(ACP_RUNTIME_SNAPSHOT_VERSION).toBe(1);
+    expect(ACP_RUNTIME_HOME_DIR_ENV_VAR).toBe("ACP_RUNTIME_HOME_DIR");
+    expect(ACP_RUNTIME_CACHE_DIR_ENV_VAR).toBe("ACP_RUNTIME_CACHE_DIR");
     expect(CLAUDE_CODE_ACP_COMMAND).toBe("claude-agent-acp");
     expect(CLAUDE_CODE_ACP_PACKAGE).toBe("@agentclientprotocol/claude-agent-acp");
     expect(SIMULATOR_AGENT_ACP_COMMAND).toBe("simulator-agent-acp");
@@ -55,6 +51,8 @@ describe("public protocol alignment exports", () => {
     expect(createCodexAcpAgent).toBeTypeOf("function");
     expect(createGeminiCliAcpAgent).toBeTypeOf("function");
     expect(createSimulatorAgentAcpAgent).toBeTypeOf("function");
+    expect(resolveRuntimeHomePath).toBeTypeOf("function");
+    expect(resolveRuntimeCachePath).toBeTypeOf("function");
   });
 
   it("keeps a narrow root runtime value export contract", () => {
@@ -65,6 +63,8 @@ describe("public protocol alignment exports", () => {
       "ACP_PROTOCOL_SOURCE_REF",
       "ACP_PROTOCOL_SOURCE_REPO",
       "ACP_PROTOCOL_VERSION",
+      "ACP_RUNTIME_CACHE_DIR_ENV_VAR",
+      "ACP_RUNTIME_HOME_DIR_ENV_VAR",
       "ACP_RUNTIME_SNAPSHOT_VERSION",
       "AcpAuthenticationError",
       "AcpCreateError",
@@ -77,11 +77,46 @@ describe("public protocol alignment exports", () => {
       "AcpProtocolError",
       "AcpResumeError",
       "AcpRuntime",
-      "AcpRuntimeJsonSessionRegistryStore",
+      "AcpRuntimeAgentConfigOptionType",
+      "AcpRuntimeAuthenticationMethodType",
+      "AcpRuntimeChangeType",
+      "AcpRuntimeContentPartType",
+      "AcpRuntimeMcpTransportType",
+      "AcpRuntimeObservabilityCaptureContent",
+      "AcpRuntimeObservabilityRedactionKind",
+      "AcpRuntimeOperationFailureReason",
+      "AcpRuntimeOperationKind",
+      "AcpRuntimeOperationPermissionFamily",
+      "AcpRuntimeOperationPhase",
+      "AcpRuntimeOperationProjectionLifecycle",
+      "AcpRuntimeOperationTargetType",
+      "AcpRuntimePermissionDecisionValue",
+      "AcpRuntimePermissionKind",
+      "AcpRuntimePermissionProjectionLifecycle",
+      "AcpRuntimePermissionRequestPhase",
+      "AcpRuntimePermissionResolution",
+      "AcpRuntimePermissionScope",
+      "AcpRuntimePlanPriority",
+      "AcpRuntimePlanStatus",
+      "AcpRuntimeProjectionUpdateType",
+      "AcpRuntimePromptMessageRole",
+      "AcpRuntimeQueueDelivery",
+      "AcpRuntimeQueuedTurnStatus",
+      "AcpRuntimeReadModelUpdateType",
       "AcpRuntimeSession",
-      "AcpRuntimeSessionRegistry",
+      "AcpRuntimeSessionListSource",
+      "AcpRuntimeSessionReferenceSource",
+      "AcpRuntimeSessionStatus",
+      "AcpRuntimeStoredSessionUpdateType",
+      "AcpRuntimeTerminalStatus",
+      "AcpRuntimeThreadEntryKind",
+      "AcpRuntimeThreadEntryStatus",
+      "AcpRuntimeThreadToolContentKind",
+      "AcpRuntimeTurnEventType",
       "AcpTurnCancelledError",
+      "AcpTurnCoalescedError",
       "AcpTurnTimeoutError",
+      "AcpTurnWithdrawnError",
       "CLAUDE_CODE_ACP_COMMAND",
       "CLAUDE_CODE_ACP_PACKAGE",
       "CLAUDE_CODE_ACP_REGISTRY_ID",
@@ -101,6 +136,8 @@ describe("public protocol alignment exports", () => {
       "createSimulatorAgentAcpAgent",
       "createStdioAcpConnectionFactory",
       "resolveRuntimeAgentFromRegistry",
+      "resolveRuntimeCachePath",
+      "resolveRuntimeHomePath",
       "resolveRuntimeTerminalAuthenticationRequest",
     ]);
   });

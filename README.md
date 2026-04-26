@@ -48,19 +48,13 @@ If you are integrating `acp-runtime` into a product host, start here:
 ```ts
 import {
   AcpRuntime,
-  AcpRuntimeJsonSessionRegistryStore,
-  AcpRuntimeSessionRegistry,
   createStdioAcpConnectionFactory,
 } from "@saaskit-dev/acp-runtime";
 
-const registry = new AcpRuntimeSessionRegistry({
-  store: new AcpRuntimeJsonSessionRegistryStore(".tmp/runtime-registry.json"),
-});
+const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
 
-const runtime = new AcpRuntime(createStdioAcpConnectionFactory(), { registry });
-
-const session = await runtime.sessions.registry.start({
-  agentId: "claude-acp",
+const session = await runtime.sessions.start({
+  agent: "claude-acp",
   cwd: process.cwd(),
   handlers: {
     permission: () => ({ decision: "allow", scope: "session" }),
@@ -68,10 +62,15 @@ const session = await runtime.sessions.registry.start({
 });
 
 const text = await session.turn.run("Summarize the current workspace.");
-const snapshot = session.lifecycle.snapshot();
+const snapshot = session.snapshot();
 
-await session.lifecycle.close();
+await session.close();
 ```
+
+Runtime-owned state is enabled by default and stored under
+`~/.acp-runtime/state/runtime-session-registry.json`. Override it with
+`new AcpRuntime(factory, { state: { sessionRegistryPath } })`, or disable local
+state with `{ state: false }`.
 
 Then read in this order:
 - [Runtime SDK By Scenario](docs/guides/runtime-sdk-by-scenario.md)
@@ -138,14 +137,15 @@ pnpm harness:check-admission -- --type codex-acp
 pnpm harness:run-agent -- --type codex-acp
 ```
 
-Generated runtime state now defaults to `./.tmp/` so the repository root stays clean.
+Generated runtime state now defaults to `~/.acp-runtime/`.
+You can override the home root with `ACP_RUNTIME_HOME_DIR`, and override cache-only paths with `ACP_RUNTIME_CACHE_DIR`.
 
 ## Runtime SDK Status
 
 The current runtime surface is organized around three public concepts:
 
 - `AcpRuntime`: host-facing entry point for `runtime.sessions.*`
-- `AcpRuntimeSession`: unified object model for `session.agent.*`, `session.turn.*`, `session.model.*`, `session.live.*`, and `session.lifecycle.*`
+- `AcpRuntimeSession`: unified object model for `session.agent.*`, `session.turn.*`, `session.state.*`, `session.queue.*`, and `session.snapshot()`/`session.close()`
 - `AcpSessionDriver`: internal driver boundary used to normalize ACP agent differences behind the runtime session API
 
 Internally, ACP-specific behavior is split into:
@@ -168,13 +168,13 @@ For a method-by-method lookup, use
 
 This is intentionally not a generic multi-protocol abstraction. The runtime is ACP-focused, but still normalizes behavioral differences across ACP agents.
 
-For registry-backed startup, the runtime now exposes first-class helpers.
-Hosts can ask the runtime to resolve launch config from the ACP registry instead of hard-coding `command` / `args`:
+For registry-id startup, pass a registry agent id as `agent`.
+The runtime resolves launch config from the ACP registry instead of forcing each host to hard-code `command` / `args`:
 
 ```ts
 const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
-const session = await runtime.sessions.registry.start({
-  agentId: "claude-acp",
+const session = await runtime.sessions.start({
+  agent: "claude-acp",
   cwd: process.cwd(),
 });
 ```
@@ -234,7 +234,7 @@ If the registry launch cannot be resolved, the default test suite skips that con
 Runtime session handles are ref-counted wrappers over an underlying runtime-managed session driver.
 
 - repeated `runtime.sessions.load()` calls for the same `sessionId` share one underlying driver
-- repeated `runtime.sessions.resume()` calls for the same `snapshot.session.id` share one underlying driver
+- repeated `runtime.sessions.resume()` calls for the same `sessionId` share one underlying driver
 - closing one handle does not invalidate sibling handles for the same runtime session
 - the underlying driver closes only after the final live handle closes
 - once a specific handle is closed, that handle rejects new turn and mutation calls

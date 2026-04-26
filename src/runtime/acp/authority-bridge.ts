@@ -20,10 +20,12 @@ import type {
 } from "@agentclientprotocol/sdk";
 
 import type { AcpRuntimeAuthorityHandlers } from "../core/types.js";
+import { SerialActor } from "../core/concurrency.js";
 
 export class AcpClientBridge implements Client {
   private bufferedUpdates: SessionNotification[] = [];
   private bufferedUpdatesFlush: Promise<void> = Promise.resolve();
+  private readonly sessionUpdates = new SerialActor();
   private permissionHandler:
     | ((params: RequestPermissionRequest) => Promise<RequestPermissionResponse>)
     | undefined;
@@ -47,11 +49,12 @@ export class AcpClientBridge implements Client {
     this.sessionUpdateHandler = handler;
     const pending = this.bufferedUpdates;
     this.bufferedUpdates = [];
-    this.bufferedUpdatesFlush = (async () => {
+    const flush = this.sessionUpdates.dispatch(async () => {
       for (const update of pending) {
         await handler(update);
       }
-    })();
+    });
+    this.bufferedUpdatesFlush = flush;
   }
 
   async waitForBufferedSessionUpdates(): Promise<void> {
@@ -78,7 +81,7 @@ export class AcpClientBridge implements Client {
       return;
     }
 
-    await this.sessionUpdateHandler(params);
+    await this.sessionUpdates.dispatch(() => this.sessionUpdateHandler?.(params));
   }
 
   async writeTextFile(

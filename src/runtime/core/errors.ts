@@ -50,6 +50,22 @@ export class AcpTurnCancelledError extends AcpError {
   readonly code: string = "TURN_CANCELLED";
 }
 
+export class AcpTurnCoalescedError extends AcpError {
+  readonly code: string = "TURN_COALESCED";
+
+  constructor(
+    message: string,
+    readonly intoTurnId: string,
+    cause?: unknown,
+  ) {
+    super(message, cause);
+  }
+}
+
+export class AcpTurnWithdrawnError extends AcpError {
+  readonly code: string = "TURN_WITHDRAWN";
+}
+
 export class AcpTurnTimeoutError extends AcpError {
   readonly code: string = "TURN_TIMEOUT";
 }

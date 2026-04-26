@@ -2,32 +2,57 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { cwd, stdin as input, stdout as output } from "node:process";
 import { dirname, join } from "node:path";
-import { createInterface, type Interface } from "node:readline/promises";
-import { createWriteStream } from "node:fs";
+import { createInterface } from "node:readline/promises";
+import { SeverityNumber } from "@opentelemetry/api-logs";
 
 import {
-  ACP_RUNTIME_SNAPSHOT_VERSION,
   AcpProtocolError,
   AcpRuntime,
-  AcpRuntimeJsonSessionRegistryStore,
+  AcpRuntimeOperationKind,
+  AcpRuntimeOperationProjectionLifecycle,
+  AcpRuntimePermissionProjectionLifecycle,
+  AcpRuntimePermissionResolution,
+  AcpRuntimeProjectionUpdateType,
+  AcpRuntimeReadModelUpdateType,
   AcpRuntimeSession,
-  AcpRuntimeSessionRegistry,
+  AcpRuntimeThreadEntryKind,
+  AcpRuntimeTurnEventType,
   createStdioAcpConnectionFactory,
-  resolveRuntimeAgentFromRegistry,
+  resolveRuntimeHomePath,
   type AcpRuntimeHistoryEntry,
   type AcpRuntimeProjectionUpdate,
   type AcpRuntimeSnapshot,
+  type AcpRuntimeStateUpdate,
   type AcpRuntimeAuthorityHandlers,
+  type AcpRuntimeAgentConfigOption,
+  type AcpRuntimeConfigValue,
   type AcpRuntimeOperation,
   type AcpRuntimePermissionRequest,
+  type AcpRuntimePrompt,
   type AcpRuntimeThreadEntry,
   type AcpRuntimeTurnEvent,
 } from "@saaskit-dev/acp-runtime";
 import { promptForDemoAuthentication } from "./runtime-demo-auth-adapter.js";
+import {
+  configureDemoLogSink,
+  type DemoLogSink as LogSink,
+} from "./runtime-demo-log-sink.js";
+import {
+  createInputCoordinator,
+  createOutputGate,
+  type DemoInputCoordinator as InputCoordinator,
+  type DemoOutputGate as OutputGate,
+} from "./runtime-demo-input.js";
 
 type TimelineRenderer = {
+  createTurn(prompt: string): TurnRenderer;
   flush(): void;
-  nextTurn(prompt: string): void;
+  writeLine(label: string, detail: string): void;
+  writeEvent(event: AcpRuntimeTurnEvent): void;
+};
+
+type TurnRenderer = {
+  flush(): void;
   writeEvent(event: AcpRuntimeTurnEvent): void;
   writeLine(label: string, detail: string): void;
 };
@@ -51,21 +76,8 @@ type DemoCliOptions = {
   resumeSnapshotPath?: string;
 };
 
-type LogSink = {
-  rawLogFile?: string;
-  writeJson(record: unknown): void;
-  close(): Promise<void>;
-};
-
 type ExitSignal = {
   requested: boolean;
-};
-
-type OutputGate = {
-  flush(): void;
-  pause(): void;
-  print(line: string): void;
-  resume(): void;
 };
 
 type StreamChunkType = "text" | "thinking";
@@ -92,7 +104,6 @@ type TurnEventProjectionInstruction =
 
 type TurnProjection = {
   bindTurn(turnId: string): void;
-  hasProjectedAssistantOutput(): boolean;
   stop(): void;
 };
 
@@ -110,13 +121,27 @@ const AGENT_ALIASES: Record<string, string> = {
 
 const LOCAL_COMMANDS = [
   "/help",
-  "/snapshot",
-  "/snapshot-save",
   "/mode",
   "/config",
+  "/thread",
+  "/diffs",
+  "/terminals",
+  "/toolcalls",
+  "/operations",
+  "/permissions",
+  "/usage",
+  "/metadata",
+  "/queue",
+  "/queue-policy",
+  "/queue-clear",
+  "/drop",
+  "/cancel",
+  "/insert",
   "/slash",
   "/exit",
 ] as const;
+
+const DEFAULT_LOG_FILE = resolveRuntimeHomePath("logs", "runtime.log");
 
 function resolveAgentId(inputAgent: string | undefined): string {
   if (!inputAgent) {
@@ -135,7 +160,8 @@ function parseCliOptions(argv: string[]): DemoCliOptions {
   const promptTokens: string[] = [];
   let listSessions = false;
   let loadSessionId: string | undefined;
-  let logFile = process.env.ACP_RUNTIME_LOG_FILE?.trim() || undefined;
+  let logFile: string | undefined =
+    process.env.ACP_RUNTIME_LOG_FILE?.trim() || DEFAULT_LOG_FILE;
   let resumeLast = false;
   let resumeSessionId: string | undefined;
   let resumeSnapshotPath: string | undefined;
@@ -163,11 +189,15 @@ function parseCliOptions(argv: string[]): DemoCliOptions {
       continue;
     }
     if (token.startsWith("--log-file=")) {
-      logFile = token.slice("--log-file=".length) || undefined;
+      logFile = token.slice("--log-file=".length).trim() || undefined;
       continue;
     }
     if (token.startsWith("--log=")) {
-      logFile = token.slice("--log=".length) || undefined;
+      logFile = token.slice("--log=".length).trim() || undefined;
+      continue;
+    }
+    if (token === "--no-log-file") {
+      logFile = undefined;
       continue;
     }
     promptTokens.push(token);
@@ -224,97 +254,182 @@ function renderHistoryEntries(
   }
 }
 
-async function configureLogFile(logFile: string | undefined): Promise<LogSink> {
-  if (!logFile) {
-    return {
-      writeJson() {},
-      async close() {},
-    };
+function summarizeQueuedPrompt(prompt: AcpRuntimePrompt): string {
+  if (typeof prompt === "string") {
+    return shortenForTerminal(prompt, 72);
   }
 
-  await mkdir(dirname(logFile), { recursive: true });
-  const rawLogFile = `${logFile}.jsonl`;
-  const stream = createWriteStream(logFile, { flags: "a" });
-  const rawStream = createWriteStream(rawLogFile, { flags: "a" });
-  const originalLog = console.log.bind(console);
-  const originalError = console.error.bind(console);
+  if (!Array.isArray(prompt) || prompt.length === 0) {
+    return "<empty>";
+  }
 
-  const writeToLog = (line: string): void => {
-    stream.write(`${line}\n`);
-  };
-  const writeJson = (record: unknown): void => {
-    rawStream.write(`${JSON.stringify(record)}\n`);
-  };
+  const first = prompt[0];
+  if (
+    typeof first === "object" &&
+    first !== null &&
+    "role" in first &&
+    "content" in first
+  ) {
+    const userMessage = prompt.find(
+      (entry) =>
+        typeof entry === "object" &&
+        entry !== null &&
+        "role" in entry &&
+        entry.role === "user",
+    ) as { content: string | readonly { text?: string; type: string }[] } | undefined;
+    if (!userMessage) {
+      return "<message prompt>";
+    }
+    if (typeof userMessage.content === "string") {
+      return shortenForTerminal(userMessage.content, 72);
+    }
+    const text = userMessage.content
+      .filter((part) => part.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join(" ");
+    return text ? shortenForTerminal(text, 72) : "<multipart prompt>";
+  }
 
-  console.log = (...args: unknown[]) => {
-    originalLog(...args);
-    writeToLog(args.map((arg) => String(arg)).join(" "));
-  };
-
-  console.error = (...args: unknown[]) => {
-    originalError(...args);
-    writeToLog(args.map((arg) => String(arg)).join(" "));
-  };
-
-  originalLog(`[runtime] log file: ${logFile}`);
-  originalLog(`[runtime] raw log file: ${rawLogFile}`);
-  writeToLog(`[runtime] log file: ${logFile}`);
-  writeToLog(`[runtime] raw log file: ${rawLogFile}`);
-
-  return {
-    rawLogFile,
-    writeJson,
-    async close() {
-      console.log = originalLog;
-      console.error = originalError;
-      await new Promise<void>((resolve, reject) => {
-        stream.end((error?: Error | null) => {
-          if (error) {
-            reject(error);
-            return;
-          }
-          resolve();
-        });
-      });
-      await new Promise<void>((resolve, reject) => {
-        rawStream.end((error?: Error | null) => {
-          if (error) {
-            reject(error);
-            return;
-          }
-          resolve();
-        });
-      });
-    },
-  };
+  const text = prompt
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join(" ");
+  return text ? shortenForTerminal(text, 72) : "<multipart prompt>";
 }
 
-function createOutputGate(): OutputGate {
-  let paused = false;
-  const buffered: string[] = [];
+function formatQueuedTurns(session: AcpRuntimeSession): string {
+  const queuedTurns = session.turn.queue.list();
+  if (queuedTurns.length === 0) {
+    return "[runtime] queue is empty";
+  }
 
-  return {
-    flush() {
-      while (buffered.length > 0) {
-        console.log(buffered.shift()!);
-      }
-    },
-    pause() {
-      paused = true;
-    },
-    print(line: string) {
-      if (paused) {
-        buffered.push(line);
-        return;
-      }
-      console.log(line);
-    },
-    resume() {
-      paused = false;
-      this.flush();
-    },
-  };
+  return queuedTurns
+    .map(
+      (turn) =>
+        `${turn.position}. ${turn.turnId} [${turn.status}]\n   prompt=${summarizeQueuedPrompt(turn.prompt)}\n   queuedAt=${turn.queuedAt}`,
+    )
+    .join("\n");
 }
+
+function resolveQueuedTurnId(
+  session: AcpRuntimeSession,
+  rawTurnId: string,
+): string | undefined {
+  const queuedTurns = session.turn.queue.list();
+  const exact = queuedTurns.find((turn) => turn.turnId === rawTurnId);
+  if (exact) {
+    return exact.turnId;
+  }
+  const matches = queuedTurns.filter((turn) => turn.turnId.startsWith(rawTurnId));
+  return matches.length === 1 ? matches[0].turnId : undefined;
+}
+
+function formatThreadEntries(session: AcpRuntimeSession): string {
+  const entries = session.state.thread.entries();
+  if (entries.length === 0) {
+    return "[runtime] thread is empty";
+  }
+
+  return entries
+    .map((entry, index) => {
+      switch (entry.kind) {
+        case AcpRuntimeThreadEntryKind.UserMessage:
+          return `${index + 1}. user ${entry.turnId ? `[${entry.turnId}]` : ""}\n   ${shortenForTerminal(entry.text, 180)}`;
+        case AcpRuntimeThreadEntryKind.AssistantMessage:
+          return `${index + 1}. assistant ${entry.status} [${entry.turnId}]\n   ${shortenForTerminal(entry.text, 180)}`;
+        case AcpRuntimeThreadEntryKind.AssistantThought:
+          return `${index + 1}. thinking ${entry.status} [${entry.turnId}]\n   ${shortenForTerminal(entry.text, 180)}`;
+        case AcpRuntimeThreadEntryKind.Plan:
+          return `${index + 1}. plan [${entry.turnId}]\n   ${entry.plan.map((item) => `${item.status}:${item.content}`).join(" / ")}`;
+        case AcpRuntimeThreadEntryKind.ToolCall:
+          return `${index + 1}. tool ${entry.status} ${entry.toolCallId} [${entry.turnId}]\n   ${shortenForTerminal(entry.title, 180)}`;
+      }
+    })
+    .join("\n");
+}
+
+function formatDiffs(session: AcpRuntimeSession): string {
+  const diffs = session.state.diffs.list();
+  if (diffs.length === 0) {
+    return "[runtime] no diffs";
+  }
+
+  return diffs
+    .map(
+      (diff, index) =>
+        `${index + 1}. ${diff.path} rev=${diff.revision} ${diff.changeType} +${diff.newLineCount}${typeof diff.oldLineCount === "number" ? ` -${diff.oldLineCount}` : ""}${diff.toolCallId ? ` tool=${diff.toolCallId}` : ""}`,
+    )
+    .join("\n");
+}
+
+function formatTerminals(session: AcpRuntimeSession): string {
+  const terminals = session.state.terminals.list();
+  if (terminals.length === 0) {
+    return "[runtime] no terminals";
+  }
+
+  return terminals
+    .map((terminal, index) => {
+      const output = terminal.output
+        ? `\n   ${previewLines(terminal.output, 3)}`
+        : "";
+      return `${index + 1}. ${terminal.terminalId} ${terminal.status}${typeof terminal.exitCode === "number" ? ` exit=${terminal.exitCode}` : ""}${terminal.command ? ` | ${terminal.command}` : ""}${terminal.toolCallId ? ` | tool=${terminal.toolCallId}` : ""}${output}`;
+    })
+    .join("\n");
+}
+
+function formatToolCalls(session: AcpRuntimeSession): string {
+  const bundles = session.state.toolCalls.bundles();
+  if (bundles.length === 0) {
+    return "[runtime] no tool calls";
+  }
+
+  return bundles
+    .map((bundle, index) => {
+      const tool = bundle.toolCall;
+      return `${index + 1}. ${tool.toolCallId} ${tool.status} [${tool.turnId}]\n   ${shortenForTerminal(tool.title, 160)}\n   diffs=${bundle.diffs.length} terminals=${bundle.terminals.length} content=${tool.content.length}`;
+    })
+    .join("\n");
+}
+
+function formatOperations(session: AcpRuntimeSession): string {
+  const operations = session.state.operations.list();
+  if (operations.length === 0) {
+    return "[runtime] no operations";
+  }
+
+  return operations
+    .map(
+      (operation, index) =>
+        `${index + 1}. ${operation.id} ${operation.kind} ${operation.phase} [${operation.turnId}]\n   ${formatOperationHeader(operation)}${operation.permission?.requested ? `\n   permission=${operation.permission.decision ?? "pending"}` : ""}`,
+    )
+    .join("\n");
+}
+
+function formatPermissions(session: AcpRuntimeSession): string {
+  const permissions = session.state.permissions.list();
+  if (permissions.length === 0) {
+    return "[runtime] no permissions";
+  }
+
+  return permissions
+    .map(
+      (request, index) =>
+        `${index + 1}. ${request.id} ${request.kind} ${request.phase} [${request.turnId}]\n   ${shortenForTerminal(request.title, 180)}`,
+    )
+    .join("\n");
+}
+
+function formatUsageSnapshot(session: AcpRuntimeSession): string {
+  return formatUsage(session.state.usage() ?? {}) ?? "[runtime] no usage yet";
+}
+
+function formatMetadataSnapshot(session: AcpRuntimeSession): string {
+  return summarizeMetadata(
+    (session.state.metadata() ?? session.metadata) as Record<string, unknown>,
+  );
+}
+
 
 function completeLocalCommand(
   line: string,
@@ -344,7 +459,7 @@ function completeLocalCommand(
 
   if (parts[0] === "/config") {
     const options = session?.agent.listConfigOptions() ?? [];
-    const optionIds = options.map((option) => option.id);
+    const optionIds = listConfigOptionKeys(options);
 
     if (parts.length === 2 && !trailingSpace) {
       const current = parts[1] ?? "";
@@ -357,9 +472,21 @@ function completeLocalCommand(
     }
 
     const optionId = parts[1];
-    const option = options.find((entry) => entry.id === optionId);
+    const option = resolveCliConfigOption(options, optionId).option;
     const values = option?.options?.map((entry) => String(entry.value)) ?? [];
     const current = trailingSpace ? "" : (parts[2] ?? "");
+    const matches = values.filter((value) => value.startsWith(current));
+    return [matches.length > 0 ? matches : values, current];
+  }
+  if (parts[0] === "/drop") {
+    const queuedTurnIds = session?.turn.queue.list().map((turn) => turn.turnId) ?? [];
+    const current = trailingSpace ? "" : (parts[1] ?? "");
+    const matches = queuedTurnIds.filter((turnId) => turnId.startsWith(current));
+    return [matches.length > 0 ? matches : queuedTurnIds, current];
+  }
+  if (parts[0] === "/queue-policy") {
+    const values = ["sequential", "coalesce"];
+    const current = trailingSpace ? "" : (parts[1] ?? "");
     const matches = values.filter((value) => value.startsWith(current));
     return [matches.length > 0 ? matches : values, current];
   }
@@ -397,6 +524,142 @@ function formatAvailableCommands(
         : `/${command.name}`,
     )
     .join("\n");
+}
+
+function listConfigOptionKeys(
+  options: readonly AcpRuntimeAgentConfigOption[],
+): string[] {
+  const categoryCounts = new Map<string, number>();
+  for (const option of options) {
+    if (option.category && option.category !== option.id) {
+      categoryCounts.set(option.category, (categoryCounts.get(option.category) ?? 0) + 1);
+    }
+  }
+
+  const keys = new Set<string>();
+  for (const option of options) {
+    keys.add(option.id);
+    if (
+      option.category &&
+      option.category !== option.id &&
+      categoryCounts.get(option.category) === 1
+    ) {
+      keys.add(option.category);
+    }
+  }
+  return [...keys];
+}
+
+function parseConfigCommandArgs(args: string): {
+  optionId: string;
+  value: string;
+} {
+  const assignment = args.match(/^([^=\s]+)=(.*)$/);
+  if (assignment) {
+    return {
+      optionId: assignment[1] ?? "",
+      value: (assignment[2] ?? "").trim(),
+    };
+  }
+
+  const [optionId, ...valueParts] = args.split(/\s+/);
+  return {
+    optionId: optionId ?? "",
+    value: valueParts.join(" ").trim(),
+  };
+}
+
+function resolveCliConfigOption(
+  options: readonly AcpRuntimeAgentConfigOption[],
+  optionIdOrCategory: string | undefined,
+): {
+  error?: string;
+  option?: AcpRuntimeAgentConfigOption;
+} {
+  if (!optionIdOrCategory) {
+    return { error: "usage: /config <id|category> [value]" };
+  }
+
+  const byId = options.find((option) => option.id === optionIdOrCategory);
+  if (byId) {
+    return { option: byId };
+  }
+
+  const byCategory = options.filter(
+    (option) => option.category === optionIdOrCategory,
+  );
+  if (byCategory.length === 1 && byCategory[0]) {
+    return { option: byCategory[0] };
+  }
+
+  if (byCategory.length > 1) {
+    return {
+      error: `[runtime] ambiguous config category: ${optionIdOrCategory}. Use one of: ${byCategory
+        .map((option) => option.id)
+        .join(", ")}`,
+    };
+  }
+
+  return {
+    error: `[runtime] unknown config option: ${optionIdOrCategory}`,
+  };
+}
+
+function normalizeCliConfigValue(
+  option: AcpRuntimeAgentConfigOption,
+  value: string,
+): {
+  error?: string;
+  value?: AcpRuntimeConfigValue;
+} {
+  if (option.type === "boolean") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") {
+      return { value: true };
+    }
+    if (normalized === "false") {
+      return { value: false };
+    }
+    return {
+      error: `[runtime] invalid config value for ${option.id}: ${value}. Valid values: true, false`,
+    };
+  }
+
+  if (option.type === "number") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return { value: parsed };
+    }
+    return {
+      error: `[runtime] invalid config value for ${option.id}: ${value}. Expected a number.`,
+    };
+  }
+
+  if (option.type !== "select" || !option.options?.length) {
+    return { value };
+  }
+
+  const raw = value.trim();
+  const lower = raw.toLowerCase();
+  const match =
+    option.options.find((entry) => String(entry.value) === raw) ??
+    option.options.find((entry) => entry.name === raw) ??
+    option.options.find((entry) => String(entry.value).toLowerCase() === lower) ??
+    option.options.find((entry) => entry.name.toLowerCase() === lower);
+
+  if (match) {
+    return { value: match.value };
+  }
+
+  return {
+    error: `[runtime] invalid config value for ${option.id}: ${value}. Valid values: ${option.options
+      .map((entry) =>
+        entry.name === String(entry.value)
+          ? String(entry.value)
+          : `${String(entry.value)} (${entry.name})`,
+      )
+      .join(", ")}`,
+  };
 }
 
 function summarizeOutputPart(part: unknown): string {
@@ -455,7 +718,7 @@ function summarizeOperationResult(operation: AcpRuntimeOperation): string[] {
   const jsonValue = getJsonOutputValue(operation);
   const outputText = operation.result?.outputText?.trim();
 
-  if (operation.kind === "write_file" && jsonValue) {
+  if (operation.kind === AcpRuntimeOperationKind.WriteFile && jsonValue) {
     const newText =
       typeof jsonValue.newText === "string" ? jsonValue.newText : undefined;
     const oldText =
@@ -468,7 +731,7 @@ function summarizeOperationResult(operation: AcpRuntimeOperation): string[] {
     return lines;
   }
 
-  if (operation.kind === "read_file") {
+  if (operation.kind === AcpRuntimeOperationKind.ReadFile) {
     if (outputText) {
       const outputLines = outputText.split("\n").filter(Boolean);
       lines.push(`matches=${outputLines.length}`);
@@ -490,7 +753,7 @@ function summarizeOperationResult(operation: AcpRuntimeOperation): string[] {
     return lines;
   }
 
-  if (operation.kind === "execute_command") {
+  if (operation.kind === AcpRuntimeOperationKind.ExecuteCommand) {
     if (outputText) {
       const normalized = outputText
         .replace(/^```[a-z]*\n?/i, "")
@@ -534,17 +797,17 @@ function formatOperationHeader(operation: AcpRuntimeOperation): string {
 
 function describeOperationKind(kind: AcpRuntimeOperation["kind"]): string {
   switch (kind) {
-    case "execute_command":
+    case AcpRuntimeOperationKind.ExecuteCommand:
       return "命令";
-    case "read_file":
+    case AcpRuntimeOperationKind.ReadFile:
       return "读取文件";
-    case "write_file":
+    case AcpRuntimeOperationKind.WriteFile:
       return "写入文件";
-    case "document_edit":
+    case AcpRuntimeOperationKind.DocumentEdit:
       return "编辑文档";
-    case "mcp_call":
+    case AcpRuntimeOperationKind.McpCall:
       return "工具调用";
-    case "network_request":
+    case AcpRuntimeOperationKind.NetworkRequest:
       return "网络请求";
     default:
       return "操作";
@@ -779,44 +1042,111 @@ function summarizeMetadata(
     : shortenForTerminal(JSON.stringify(metadata), 160);
 }
 
+function formatUsage(usage: {
+  cachedReadTokens?: number;
+  cachedWriteTokens?: number;
+  contextUsedTokens?: number;
+  contextWindowTokens?: number;
+  costUsd?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  thoughtTokens?: number;
+  totalTokens?: number;
+}): string | undefined {
+  const formatCount = (value: number) =>
+    new Intl.NumberFormat("en-US").format(value);
+  const formatUsd = (value: number) =>
+    value.toLocaleString("en-US", {
+      maximumFractionDigits: 6,
+      minimumFractionDigits: value > 0 && value < 0.01 ? 4 : 0,
+    });
+  const parts: string[] = [];
+
+  if (typeof usage.inputTokens === "number" && usage.inputTokens > 0) {
+    parts.push(`in=${formatCount(usage.inputTokens)}`);
+  }
+  if (typeof usage.outputTokens === "number" && usage.outputTokens > 0) {
+    parts.push(`out=${formatCount(usage.outputTokens)}`);
+  }
+  if (typeof usage.thoughtTokens === "number" && usage.thoughtTokens > 0) {
+    parts.push(`thought=${formatCount(usage.thoughtTokens)}`);
+  }
+  if (
+    typeof usage.cachedReadTokens === "number" &&
+    usage.cachedReadTokens > 0
+  ) {
+    parts.push(`cacheRead=${formatCount(usage.cachedReadTokens)}`);
+  }
+  if (
+    typeof usage.cachedWriteTokens === "number" &&
+    usage.cachedWriteTokens > 0
+  ) {
+    parts.push(`cacheWrite=${formatCount(usage.cachedWriteTokens)}`);
+  }
+  if (
+    (typeof usage.contextUsedTokens === "number" && usage.contextUsedTokens > 0) ||
+    typeof usage.contextWindowTokens === "number"
+  ) {
+    parts.push(
+      `ctx=${typeof usage.contextUsedTokens === "number" ? formatCount(usage.contextUsedTokens) : "?"}/${typeof usage.contextWindowTokens === "number" ? formatCount(usage.contextWindowTokens) : "?"}`,
+    );
+  }
+  if (typeof usage.totalTokens === "number" && usage.totalTokens > 0) {
+    parts.push(`total=${formatCount(usage.totalTokens)}`);
+  }
+  if (typeof usage.costUsd === "number" && usage.costUsd > 0) {
+    parts.push(`cost=$${formatUsd(usage.costUsd)}`);
+  }
+
+  return parts.length > 0
+    ? parts.join(" | ")
+    : undefined;
+}
+
 function formatEventDetail(event: AcpRuntimeTurnEvent): string {
   switch (event.type) {
-    case "queued":
-      return `position=${event.position}`;
-    case "started":
-      return "turn started";
-    case "thinking":
+    case AcpRuntimeTurnEventType.Queued:
+      return `position=${event.position} | id=${event.turnId}`;
+    case AcpRuntimeTurnEventType.Started:
+      return `id=${event.turnId}`;
+    case AcpRuntimeTurnEventType.Thinking:
       return event.text;
-    case "text":
+    case AcpRuntimeTurnEventType.Text:
       return event.text;
-    case "metadata_updated":
+    case AcpRuntimeTurnEventType.MetadataUpdated:
       return summarizeMetadata(event.metadata as Record<string, unknown>);
-    case "usage_updated":
-      return JSON.stringify(event.usage);
-    case "permission_requested":
+    case AcpRuntimeTurnEventType.UsageUpdated:
+      return formatUsage(event.usage) ?? "";
+    case AcpRuntimeTurnEventType.PermissionRequested:
       return `需要权限(${event.request.kind}): ${shortenForTerminal(event.request.title, 96)}`;
-    case "permission_resolved":
+    case AcpRuntimeTurnEventType.PermissionResolved:
       return `权限${event.decision === "allowed" ? "已允许" : "已拒绝"}(${event.request.kind}): ${shortenForTerminal(event.request.title, 96)}`;
-    case "plan_updated":
+    case AcpRuntimeTurnEventType.PlanUpdated:
       return JSON.stringify(event.plan);
-    case "operation_started":
+    case AcpRuntimeTurnEventType.OperationStarted:
       return formatOperationInline(event.operation, "started");
-    case "operation_updated":
+    case AcpRuntimeTurnEventType.OperationUpdated:
       return formatOperationInline(event.operation, "updated");
-    case "operation_completed":
+    case AcpRuntimeTurnEventType.OperationCompleted:
       return formatOperationInline(event.operation, "completed");
-    case "operation_failed":
+    case AcpRuntimeTurnEventType.OperationFailed:
       return formatOperationInline(
         event.operation,
         "failed",
         event.error.message,
       );
-    case "failed":
+    case AcpRuntimeTurnEventType.Cancelled:
       return event.error.message;
-    case "completed":
-      return event.outputText
-        ? renderMarkdownForTerminal(event.outputText)
-        : "turn completed";
+    case AcpRuntimeTurnEventType.Coalesced:
+      return `${event.error.message} | into=${event.intoTurnId}`;
+    case AcpRuntimeTurnEventType.Withdrawn:
+      return event.error.message;
+    case AcpRuntimeTurnEventType.Failed:
+      return event.error.message;
+    case AcpRuntimeTurnEventType.Completed:
+      return event.outputText.length > 0
+        ? `completed | outputChars=${event.outputText.length}`
+        : "completed";
     default:
       return "<unknown>";
   }
@@ -837,115 +1167,124 @@ function createFilesystemHandlers(): AcpRuntimeAuthorityHandlers["filesystem"] {
 }
 
 function createTimelineRenderer(
-  logSink: LogSink,
   outputGate: OutputGate,
 ): TimelineRenderer {
   let turnNumber = 0;
-  let turnStartedAt = Date.now();
-  const stream: StreamAccumulator = { buffer: "" };
-  const eventProjection = createTurnEventProjection();
+  function createScopedTurnRenderer(
+    currentTurnNumber?: number,
+    prompt?: string,
+  ): TurnRenderer {
+    let turnStartedAt = Date.now();
+    const stream: StreamAccumulator = { buffer: "" };
+    const eventProjection = createTurnEventProjection();
 
-  function writeLine(label: string, detail: string): void {
-    const clock = formatClock(new Date());
-    const elapsed = formatElapsed(turnStartedAt);
-    const body = detail
-      .split("\n")
-      .map((line, index) =>
-        index === 0 ? line : `${" ".repeat(label.length + 2)}${line}`,
-      )
-      .join("\n");
-    outputGate.print(`${clock}  ${elapsed}  ${label}  ${body}`);
-  }
-
-  function flushStream(): void {
-    if (!stream.type || stream.buffer.length === 0) {
-      return;
+    function writeLine(label: string, detail: string): void {
+      const clock = formatClock(new Date());
+      const elapsed = formatElapsed(turnStartedAt);
+      const body = detail
+        .split("\n")
+        .map((line, index) =>
+          index === 0 ? line : `${" ".repeat(label.length + 2)}${line}`,
+        )
+        .join("\n");
+      outputGate.print(`${clock}  ${elapsed}  ${label}  ${body}`);
     }
 
-    const label = stream.type;
-    const content =
-      stream.type === "text"
-        ? renderMarkdownForTerminal(stream.buffer)
-        : shortenForTerminal(stream.buffer, 240);
-    writeLine(label, content);
-    stream.type = undefined;
-    stream.buffer = "";
-  }
+    function flushStream(): void {
+      if (!stream.type || stream.buffer.length === 0) {
+        return;
+      }
 
-  function shouldFlushStream(type: StreamChunkType, chunk: string): boolean {
-    if (type === "thinking") {
-      return /[\n。！？!?]/.test(chunk) || stream.buffer.length >= 160;
+      const label = stream.type;
+      const content =
+        stream.type === "text"
+          ? renderMarkdownForTerminal(stream.buffer)
+          : shortenForTerminal(stream.buffer, 240);
+      writeLine(label, content);
+      stream.type = undefined;
+      stream.buffer = "";
     }
 
-    return /(?:\n\n|\n|[。！？!?]$)/.test(chunk) || stream.buffer.length >= 220;
-  }
+    function shouldFlushStream(type: StreamChunkType, chunk: string): boolean {
+      if (type === "thinking") {
+        return /[\n。！？!?]/.test(chunk) || stream.buffer.length >= 160;
+      }
 
-  return {
-    flush(): void {
-      flushStream();
-    },
-    nextTurn(prompt: string): void {
-      flushStream();
-      turnNumber += 1;
+      return /(?:\n\n|\n|[。！？!?]$)/.test(chunk) || stream.buffer.length >= 220;
+    }
+
+    if (typeof prompt === "string" && typeof currentTurnNumber === "number") {
       turnStartedAt = Date.now();
       eventProjection.nextTurn();
-      logSink.writeJson({
-        prompt,
-        recordType: "turn_prompt",
-        timestamp: new Date().toISOString(),
-        turnNumber,
-      });
-      console.log("");
-      console.log(`=== turn ${turnNumber} ===`);
-      writeLine("user", prompt);
+      outputGate.print("");
+      outputGate.print(`=== turn ${currentTurnNumber} ===`);
+    }
+
+    return {
+      flush(): void {
+        flushStream();
+      },
+      writeEvent(event): void {
+        const instruction = eventProjection.project(event);
+        if (instruction.kind === "stream") {
+          const type = instruction.streamType;
+          if (stream.type && stream.type !== type) {
+            flushStream();
+          }
+          stream.type = type;
+          stream.buffer += instruction.text;
+          if (shouldFlushStream(type, instruction.text)) {
+            flushStream();
+          }
+          return;
+        }
+
+        flushStream();
+        if (instruction.kind === "skip") {
+          return;
+        }
+        writeLine(instruction.label, instruction.detail);
+      },
+      writeLine,
+    };
+  }
+
+  const standaloneRenderer = createScopedTurnRenderer();
+
+  return {
+    createTurn(prompt: string): TurnRenderer {
+      turnNumber += 1;
+      return createScopedTurnRenderer(turnNumber, prompt);
+    },
+    flush(): void {
+      standaloneRenderer.flush();
     },
     writeEvent(event): void {
-      logSink.writeJson({
-        event,
-        recordType: "turn_event",
-        timestamp: new Date().toISOString(),
-      });
-
-      const instruction = eventProjection.project(event);
-      if (instruction.kind === "stream") {
-        const type = instruction.streamType;
-        if (stream.type && stream.type !== type) {
-          flushStream();
-        }
-        stream.type = type;
-        stream.buffer += instruction.text;
-        if (shouldFlushStream(type, instruction.text)) {
-          flushStream();
-        }
-        return;
-      }
-
-      flushStream();
-      if (instruction.kind === "skip") {
-        return;
-      }
-      writeLine(instruction.label, instruction.detail);
+      standaloneRenderer.writeEvent(event);
     },
-    writeLine,
+    writeLine(label: string, detail: string): void {
+      standaloneRenderer.writeLine(label, detail);
+    },
   };
 }
 
 function createTurnEventProjection(): TurnEventProjection {
   const operationDetails = new Map<string, string>();
-  let sawAssistantText = false;
 
   return {
     nextTurn(): void {
       operationDetails.clear();
-      sawAssistantText = false;
     },
     project(event): TurnEventProjectionInstruction {
-      if (event.type === "thinking") {
-        return { kind: "skip" };
+      if (event.type === AcpRuntimeTurnEventType.Thinking) {
+        return {
+          kind: "stream",
+          streamType: "thinking",
+          text: event.text,
+        };
       }
 
-      if (event.type === "text") {
-        sawAssistantText = true;
+      if (event.type === AcpRuntimeTurnEventType.Text) {
         return {
           kind: "stream",
           streamType: "text",
@@ -953,44 +1292,69 @@ function createTurnEventProjection(): TurnEventProjection {
         };
       }
 
-      if (
-        event.type === "queued" ||
-        event.type === "started" ||
-        event.type === "metadata_updated" ||
-        event.type === "usage_updated"
-      ) {
+      if (event.type === AcpRuntimeTurnEventType.Queued) {
+        return {
+          detail: formatEventDetail(event),
+          kind: "line",
+          label: "queued",
+        };
+      }
+
+      if (event.type === AcpRuntimeTurnEventType.Coalesced) {
+        return {
+          detail: formatEventDetail(event),
+          kind: "line",
+          label: "coalesced",
+        };
+      }
+
+      if (event.type === AcpRuntimeTurnEventType.MetadataUpdated) {
         return { kind: "skip" };
       }
 
-      if (
-        event.type === "completed" &&
-        sawAssistantText &&
-        typeof event.outputText === "string" &&
-        event.outputText.length > 0
-      ) {
-        return { kind: "skip" };
+      if (event.type === AcpRuntimeTurnEventType.Started) {
+        return {
+          detail: formatEventDetail(event),
+          kind: "line",
+          label: "running",
+        };
+      }
+
+      if (event.type === AcpRuntimeTurnEventType.UsageUpdated) {
+        const detail = formatEventDetail(event);
+        if (detail === "") {
+          return { kind: "skip" };
+        }
+        return {
+          detail,
+          kind: "line",
+          label: "usage",
+        };
       }
 
       if (
-        event.type === "operation_started" ||
-        event.type === "operation_updated" ||
-        event.type === "operation_completed" ||
-        event.type === "operation_failed"
+        event.type === AcpRuntimeTurnEventType.OperationStarted ||
+        event.type === AcpRuntimeTurnEventType.OperationUpdated ||
+        event.type === AcpRuntimeTurnEventType.OperationCompleted ||
+        event.type === AcpRuntimeTurnEventType.OperationFailed
       ) {
         const detail =
-          event.type === "operation_failed"
+          event.type === AcpRuntimeTurnEventType.OperationFailed
             ? `${formatOperationDetail(event.operation)}\nerror=${event.error.message}`
             : formatOperationDetail(event.operation);
         const previous = operationDetails.get(event.operation.id);
 
-        if (event.type === "operation_updated" && previous === detail) {
+        if (
+          event.type === AcpRuntimeTurnEventType.OperationUpdated &&
+          previous === detail
+        ) {
           return { kind: "skip" };
         }
 
         operationDetails.set(event.operation.id, detail);
         if (
-          event.type === "operation_completed" ||
-          event.type === "operation_failed"
+          event.type === AcpRuntimeTurnEventType.OperationCompleted ||
+          event.type === AcpRuntimeTurnEventType.OperationFailed
         ) {
           operationDetails.delete(event.operation.id);
         }
@@ -1002,13 +1366,21 @@ function createTurnEventProjection(): TurnEventProjection {
       }
 
       if (
-        event.type === "permission_requested" ||
-        event.type === "permission_resolved"
+        event.type === AcpRuntimeTurnEventType.PermissionRequested ||
+        event.type === AcpRuntimeTurnEventType.PermissionResolved
       ) {
         return {
           detail: formatEventDetail(event),
           kind: "line",
           label: "permission",
+        };
+      }
+
+      if (event.type === AcpRuntimeTurnEventType.Completed) {
+        return {
+          detail: formatEventDetail(event),
+          kind: "line",
+          label: "done",
         };
       }
 
@@ -1025,71 +1397,72 @@ function projectionUpdateToTurnEvent(
   update: AcpRuntimeProjectionUpdate,
 ): AcpRuntimeTurnEvent {
   switch (update.type) {
-    case "metadata_projection_updated":
+    case AcpRuntimeProjectionUpdateType.MetadataUpdated:
       return {
         metadata: update.metadata,
         turnId: update.turnId,
-        type: "metadata_updated",
+        type: AcpRuntimeTurnEventType.MetadataUpdated,
       };
-    case "usage_projection_updated":
+    case AcpRuntimeProjectionUpdateType.UsageUpdated:
       return {
         turnId: update.turnId,
-        type: "usage_updated",
+        type: AcpRuntimeTurnEventType.UsageUpdated,
         usage: update.usage,
       };
-    case "operation_projection_updated":
-      if (update.lifecycle === "started") {
+    case AcpRuntimeProjectionUpdateType.OperationUpdated:
+      if (update.lifecycle === AcpRuntimeOperationProjectionLifecycle.Started) {
         return {
           operation: update.operation,
           turnId: update.turnId,
-          type: "operation_started",
+          type: AcpRuntimeTurnEventType.OperationStarted,
         };
       }
-      if (update.lifecycle === "updated") {
+      if (update.lifecycle === AcpRuntimeOperationProjectionLifecycle.Updated) {
         return {
           operation: update.operation,
           turnId: update.turnId,
-          type: "operation_updated",
+          type: AcpRuntimeTurnEventType.OperationUpdated,
         };
       }
-      if (update.lifecycle === "completed") {
+      if (update.lifecycle === AcpRuntimeOperationProjectionLifecycle.Completed) {
         return {
           operation: update.operation,
           turnId: update.turnId,
-          type: "operation_completed",
+          type: AcpRuntimeTurnEventType.OperationCompleted,
         };
       }
       return {
         error: new AcpProtocolError(update.errorMessage ?? "Operation failed."),
         operation: update.operation,
         turnId: update.turnId,
-        type: "operation_failed",
+        type: AcpRuntimeTurnEventType.OperationFailed,
       };
-    case "permission_projection_updated":
-      if (update.lifecycle === "requested") {
+    case AcpRuntimeProjectionUpdateType.PermissionUpdated:
+      if (
+        update.lifecycle === AcpRuntimePermissionProjectionLifecycle.Requested
+      ) {
         return {
           operation: update.operation,
           request: update.request,
           turnId: update.turnId,
-          type: "permission_requested",
+          type: AcpRuntimeTurnEventType.PermissionRequested,
         };
       }
       return {
-        decision: update.decision ?? "denied",
+        decision: update.decision ?? AcpRuntimePermissionResolution.Denied,
         operation: update.operation,
         request: update.request,
         turnId: update.turnId,
-        type: "permission_resolved",
+        type: AcpRuntimeTurnEventType.PermissionResolved,
       };
   }
 }
 
 function createTurnProjection(
   session: AcpRuntimeSession,
-  renderer: TimelineRenderer,
+  renderer: TurnRenderer,
 ): TurnProjection {
   let activeTurnId: string | undefined;
-  let projectedAssistantOutput = false;
   const seen = new Map<
     string,
     {
@@ -1098,10 +1471,10 @@ function createTurnProjection(
     }
   >();
 
-  const stopWatching = session.model.watch((update) => {
+  const stopWatching = session.state.watch((update) => {
     if (
-      update.type !== "thread_entry_added" &&
-      update.type !== "thread_entry_updated"
+      update.type !== AcpRuntimeReadModelUpdateType.ThreadEntryAdded &&
+      update.type !== AcpRuntimeReadModelUpdateType.ThreadEntryUpdated
     ) {
       return;
     }
@@ -1113,15 +1486,14 @@ function createTurnProjection(
 
     const previous = seen.get(entry.id);
 
-    if (entry.kind === "assistant_message") {
+    if (entry.kind === AcpRuntimeThreadEntryKind.AssistantMessage) {
       const previousLength = previous?.textLength ?? 0;
       const delta = entry.text.slice(previousLength);
       if (delta.length > 0) {
-        projectedAssistantOutput = true;
         renderer.writeEvent({
           text: delta,
           turnId: entry.turnId,
-          type: "text",
+          type: AcpRuntimeTurnEventType.Text,
         });
       }
       seen.set(entry.id, {
@@ -1130,14 +1502,14 @@ function createTurnProjection(
       return;
     }
 
-    if (entry.kind === "assistant_thought") {
+    if (entry.kind === AcpRuntimeThreadEntryKind.AssistantThought) {
       const previousLength = previous?.textLength ?? 0;
       const delta = entry.text.slice(previousLength);
       if (delta.length > 0) {
         renderer.writeEvent({
           text: delta,
           turnId: entry.turnId,
-          type: "thinking",
+          type: AcpRuntimeTurnEventType.Thinking,
         });
       }
       seen.set(entry.id, {
@@ -1146,13 +1518,13 @@ function createTurnProjection(
       return;
     }
 
-    if (entry.kind === "plan") {
+    if (entry.kind === AcpRuntimeThreadEntryKind.Plan) {
       const signature = JSON.stringify(entry.plan);
       if (previous?.planSignature !== signature) {
         renderer.writeEvent({
           plan: entry.plan,
           turnId: entry.turnId,
-          type: "plan_updated",
+          type: AcpRuntimeTurnEventType.PlanUpdated,
         });
       }
       seen.set(entry.id, {
@@ -1161,7 +1533,10 @@ function createTurnProjection(
     }
   });
 
-  const stopWatchingProjection = session.live.watch((update) => {
+  const stopWatchingProjection = session.state.watch((update) => {
+    if (!isProjectionUpdate(update)) {
+      return;
+    }
     if (update.turnId !== activeTurnId) {
       return;
     }
@@ -1172,9 +1547,6 @@ function createTurnProjection(
     bindTurn(turnId: string): void {
       activeTurnId = turnId;
     },
-    hasProjectedAssistantOutput(): boolean {
-      return projectedAssistantOutput;
-    },
     stop(): void {
       stopWatching();
       stopWatchingProjection();
@@ -1182,18 +1554,27 @@ function createTurnProjection(
   };
 }
 
+function isProjectionUpdate(
+  update: AcpRuntimeStateUpdate,
+): update is AcpRuntimeProjectionUpdate {
+  return Object.values(AcpRuntimeProjectionUpdateType).includes(
+    update.type as AcpRuntimeProjectionUpdate["type"],
+  );
+}
+
 function entryHasTurnId(
   entry: AcpRuntimeThreadEntry,
-): entry is Exclude<Readonly<AcpRuntimeThreadEntry>, { kind: "user_message" }> {
-  return entry.kind !== "user_message";
+): entry is Exclude<
+  Readonly<AcpRuntimeThreadEntry>,
+  { kind: typeof AcpRuntimeThreadEntryKind.UserMessage }
+> {
+  return entry.kind !== AcpRuntimeThreadEntryKind.UserMessage;
 }
 
 async function promptForPermission(
-  rl: Interface,
-  renderer: TimelineRenderer,
+  inputCoordinator: InputCoordinator,
   logSink: LogSink,
   exitSignal: ExitSignal,
-  outputGate: OutputGate,
   request: AcpRuntimePermissionRequest,
 ): Promise<{
   decision: "allow" | "deny";
@@ -1206,37 +1587,41 @@ async function promptForPermission(
   const reasonSuffix = request.reason ? ` | ${request.reason}` : "";
 
   while (true) {
-    outputGate.pause();
     const answer = (
-      await rl.question(
-        `permission ${request.kind}${scopeHint}\n${request.title}${reasonSuffix}\nallow? [y]es [n]o [s]ession\n> `,
-      )
+      await inputCoordinator.promptExclusive({
+        promptText: `permission ${request.kind}${scopeHint}\n${request.title}${reasonSuffix}\nallow? [y]es [n]o [s]ession`,
+      })
     )
       .trim()
       .toLowerCase();
-    outputGate.resume();
 
     if (answer === "/exit" || answer === "/quit") {
       exitSignal.requested = true;
-      logSink.writeJson({
-        decision: { decision: "deny" },
-        recordType: "permission_decision",
-        request,
-        timestamp: new Date().toISOString(),
-        triggeredBy: answer,
+      logSink.emit({
+        attributes: {
+          "acp.permission.id": request.id,
+          "acp.permission.kind": request.kind,
+          "acp.permission.decision": "deny",
+          "acp.permission.triggered_by": answer,
+        },
+        body: request.title,
+        eventName: "acp.demo.permission.resolved",
+        severityNumber: SeverityNumber.WARN,
       });
-      renderer.writeLine("permission", "decision=deny requested exit");
       return { decision: "deny" };
     }
 
     if (answer === "" || answer === "y" || answer === "yes") {
-      logSink.writeJson({
-        decision: { decision: "allow", scope: "once" },
-        recordType: "permission_decision",
-        request,
-        timestamp: new Date().toISOString(),
+      logSink.emit({
+        attributes: {
+          "acp.permission.id": request.id,
+          "acp.permission.kind": request.kind,
+          "acp.permission.decision": "allow",
+          "acp.permission.scope": "once",
+        },
+        body: request.title,
+        eventName: "acp.demo.permission.resolved",
       });
-      renderer.writeLine("permission", "decision=allow scope=once");
       return { decision: "allow", scope: "once" };
     }
 
@@ -1244,24 +1629,30 @@ async function promptForPermission(
       (answer === "s" || answer === "session") &&
       request.scopeOptions.includes("session")
     ) {
-      logSink.writeJson({
-        decision: { decision: "allow", scope: "session" },
-        recordType: "permission_decision",
-        request,
-        timestamp: new Date().toISOString(),
+      logSink.emit({
+        attributes: {
+          "acp.permission.id": request.id,
+          "acp.permission.kind": request.kind,
+          "acp.permission.decision": "allow",
+          "acp.permission.scope": "session",
+        },
+        body: request.title,
+        eventName: "acp.demo.permission.resolved",
       });
-      renderer.writeLine("permission", "decision=allow scope=session");
       return { decision: "allow", scope: "session" };
     }
 
     if (answer === "n" || answer === "no") {
-      logSink.writeJson({
-        decision: { decision: "deny" },
-        recordType: "permission_decision",
-        request,
-        timestamp: new Date().toISOString(),
+      logSink.emit({
+        attributes: {
+          "acp.permission.id": request.id,
+          "acp.permission.kind": request.kind,
+          "acp.permission.decision": "deny",
+        },
+        body: request.title,
+        eventName: "acp.demo.permission.resolved",
+        severityNumber: SeverityNumber.WARN,
       });
-      renderer.writeLine("permission", "decision=deny");
       return { decision: "deny" };
     }
 
@@ -1273,58 +1664,72 @@ async function runTurn(
   prompt: string,
   session: AcpRuntimeSession,
   renderer: TimelineRenderer,
+  options?: {
+    onStarted?: (turnId: string) => void;
+    onTerminal?: (turnId: string) => void;
+    sendNow?: boolean;
+  },
 ): Promise<void> {
-  renderer.nextTurn(prompt);
-  const projection = createTurnProjection(session, renderer);
+  const turnRenderer = renderer.createTurn(prompt);
+  const projection = createTurnProjection(session, turnRenderer);
+  const turn = session.turn.start(prompt);
+  if (options?.sendNow) {
+    await session.turn.queue.sendNow(turn.turnId);
+  }
+  let startedTurnId: string | undefined;
 
   try {
-    for await (const event of session.turn.stream(prompt)) {
-      if (event.type === "started") {
+    for await (const event of turn.events) {
+      if (event.type === AcpRuntimeTurnEventType.Started) {
+        startedTurnId = event.turnId;
+        options?.onStarted?.(event.turnId);
         projection.bindTurn(event.turnId);
-        renderer.writeEvent(event);
+        turnRenderer.writeEvent(event);
         continue;
       }
 
       if (
-        event.type === "thinking" ||
-        event.type === "text" ||
-        event.type === "plan_updated" ||
-        event.type === "operation_started" ||
-        event.type === "operation_updated" ||
-        event.type === "operation_completed" ||
-        event.type === "operation_failed" ||
-        event.type === "permission_requested" ||
-        event.type === "permission_resolved" ||
-        event.type === "metadata_updated" ||
-        event.type === "usage_updated"
+        event.type === AcpRuntimeTurnEventType.Thinking ||
+        event.type === AcpRuntimeTurnEventType.Text ||
+        event.type === AcpRuntimeTurnEventType.PlanUpdated ||
+        event.type === AcpRuntimeTurnEventType.OperationStarted ||
+        event.type === AcpRuntimeTurnEventType.OperationUpdated ||
+        event.type === AcpRuntimeTurnEventType.OperationCompleted ||
+        event.type === AcpRuntimeTurnEventType.OperationFailed ||
+        event.type === AcpRuntimeTurnEventType.PermissionRequested ||
+        event.type === AcpRuntimeTurnEventType.PermissionResolved ||
+        event.type === AcpRuntimeTurnEventType.MetadataUpdated ||
+        event.type === AcpRuntimeTurnEventType.UsageUpdated
       ) {
         continue;
       }
 
+      turnRenderer.writeEvent(event);
       if (
-        event.type === "completed" &&
-        projection.hasProjectedAssistantOutput() &&
-        typeof event.outputText === "string" &&
-        event.outputText.length > 0
+        event.type === AcpRuntimeTurnEventType.Failed ||
+        event.type === AcpRuntimeTurnEventType.Cancelled ||
+        event.type === AcpRuntimeTurnEventType.Coalesced ||
+        event.type === AcpRuntimeTurnEventType.Withdrawn ||
+        event.type === AcpRuntimeTurnEventType.Completed
       ) {
-        renderer.flush();
-        continue;
-      }
-
-      renderer.writeEvent(event);
-      if (event.type === "failed") {
-        renderer.flush();
+        if (startedTurnId) {
+          options?.onTerminal?.(startedTurnId);
+        }
+        turnRenderer.flush();
         return;
       }
     }
-    renderer.flush();
+    if (startedTurnId) {
+      options?.onTerminal?.(startedTurnId);
+    }
+    turnRenderer.flush();
   } finally {
     projection.stop();
   }
 }
 
 async function runRepl(
-  rl: Interface,
+  inputCoordinator: InputCoordinator,
   session: AcpRuntimeSession,
   renderer: TimelineRenderer,
   logSink: LogSink,
@@ -1334,8 +1739,30 @@ async function runRepl(
   console.log("");
   console.log(`Interactive runtime smoke ready for ${label}.`);
   console.log(
-    "Commands: /help, /snapshot, /snapshot-save, /mode, /config, /slash, /exit",
+    "Commands: /help, /mode, /config, /thread, /diffs, /terminals, /toolcalls, /operations, /permissions, /usage, /metadata, /queue, /queue-policy, /queue-clear, /drop, /cancel, /insert, /slash, /exit",
   );
+  const inFlightTurns = new Set<Promise<void>>();
+  let activeTurnId: string | undefined;
+
+  const launchTurn = (prompt: string, options?: { sendNow?: boolean }): void => {
+    const task = runTurn(prompt, session, renderer, {
+      sendNow: options?.sendNow,
+      onStarted(turnId) {
+        activeTurnId = turnId;
+      },
+      onTerminal(turnId) {
+        if (activeTurnId === turnId) {
+          activeTurnId = undefined;
+        }
+      },
+    }).catch((error: unknown) => {
+      console.error(formatUnknownError(error));
+    });
+    inFlightTurns.add(task);
+    void task.finally(() => {
+      inFlightTurns.delete(task);
+    });
+  };
 
   while (true) {
     if (exitSignal.requested) {
@@ -1344,12 +1771,17 @@ async function runRepl(
 
     let prompt: string;
     try {
-      prompt = (await rl.question("you> ")).trim();
+      prompt = (await inputCoordinator.nextUserInput()).trim();
     } catch (error: unknown) {
       if (
         error instanceof Error &&
-        "code" in error &&
-        error.code === "ERR_USE_AFTER_CLOSE"
+        ("code" in error && error.code === "ERR_USE_AFTER_CLOSE")
+      ) {
+        return;
+      }
+      if (
+        error instanceof Error &&
+        error.message === "Input coordinator closed."
       ) {
         return;
       }
@@ -1366,46 +1798,33 @@ async function runRepl(
 
     if (prompt === "/help") {
       console.log(
-        "Use plain text for agent prompts. Local commands: /help, /snapshot, /snapshot-save, /mode, /config, /slash, /exit",
+        "Use plain text for agent prompts. Local commands: /help, /mode, /config, /thread, /diffs, /terminals, /toolcalls, /operations, /permissions, /usage, /metadata, /queue, /queue-policy, /queue-clear, /drop, /cancel, /insert, /slash, /exit",
       );
       console.log("  /mode                  Show available modes");
       console.log("  /mode <id>             Switch current mode");
-      console.log("  /snapshot-save <path>  Save the current runtime snapshot");
       console.log("  /config                Show config options");
-      console.log("  /config <id>           Show one config option");
+      console.log("  /config <id|category>  Show one config option");
       console.log("  /config <id> <value>   Set one config option");
+      console.log("  /config <id>=<value>   Set one config option");
+      console.log("  /thread                Show structured thread entries");
+      console.log("  /diffs                 Show session diff objects");
+      console.log("  /terminals             Show terminal objects and output previews");
+      console.log("  /toolcalls             Show tool calls with related object counts");
+      console.log("  /operations            Show runtime operation objects");
+      console.log("  /permissions           Show permission request history");
+      console.log("  /usage                 Show latest token/cost usage");
+      console.log("  /metadata              Show latest session metadata");
+      console.log("  /queue                 Show queued turns that have not started yet");
+      console.log("  /queue-policy          Show current queue delivery policy");
+      console.log("  /queue-policy <value>  Set future queue delivery: sequential | coalesce");
+      console.log("  /queue-clear           Remove all queued turns before they start");
+      console.log("  /drop <turnId>         Remove one queued turn before it starts");
+      console.log("  /cancel                Cancel the currently running turn");
+      console.log("  /insert <prompt>       Interrupt the active turn and run this prompt next");
       console.log(
         "  /slash                 Show available agent slash commands",
       );
       console.log("  /slash <name> [args]   Run an agent slash command");
-      continue;
-    }
-
-    if (prompt === "/snapshot") {
-      console.log(JSON.stringify(session.lifecycle.snapshot(), null, 2));
-      continue;
-    }
-
-    if (prompt.startsWith("/snapshot-save ")) {
-      const filePath = prompt.slice("/snapshot-save ".length).trim();
-      if (!filePath) {
-        console.log("usage: /snapshot-save <path>");
-        continue;
-      }
-      const snapshot = session.lifecycle.snapshot();
-      await mkdir(dirname(filePath), { recursive: true });
-      await writeFile(
-        filePath,
-        `${JSON.stringify(snapshot, null, 2)}\n`,
-        "utf8",
-      );
-      logSink.writeJson({
-        filePath,
-        recordType: "local_command",
-        subcommand: "snapshot_save",
-        timestamp: new Date().toISOString(),
-      });
-      console.log(`[runtime] snapshot saved: ${filePath}`);
       continue;
     }
 
@@ -1426,6 +1845,97 @@ async function runRepl(
       continue;
     }
 
+    if (prompt === "/thread") {
+      console.log(formatThreadEntries(session));
+      continue;
+    }
+
+    if (prompt === "/diffs") {
+      console.log(formatDiffs(session));
+      continue;
+    }
+
+    if (prompt === "/terminals") {
+      console.log(formatTerminals(session));
+      continue;
+    }
+
+    if (prompt === "/toolcalls") {
+      console.log(formatToolCalls(session));
+      continue;
+    }
+
+    if (prompt === "/operations") {
+      console.log(formatOperations(session));
+      continue;
+    }
+
+    if (prompt === "/permissions") {
+      console.log(formatPermissions(session));
+      continue;
+    }
+
+    if (prompt === "/usage") {
+      console.log(formatUsageSnapshot(session));
+      continue;
+    }
+
+    if (prompt === "/metadata") {
+      console.log(formatMetadataSnapshot(session));
+      continue;
+    }
+
+    if (prompt === "/queue") {
+      console.log(formatQueuedTurns(session));
+      continue;
+    }
+
+    if (prompt === "/queue-policy") {
+      console.log(`[runtime] queue delivery: ${session.queue.policy().delivery}`);
+      continue;
+    }
+
+    if (prompt.startsWith("/queue-policy ")) {
+      const delivery = prompt.slice("/queue-policy ".length).trim();
+      if (delivery !== "sequential" && delivery !== "coalesce") {
+        console.log("usage: /queue-policy sequential|coalesce");
+        continue;
+      }
+      const policy = session.queue.setPolicy({ delivery });
+      console.log(`[runtime] queue delivery: ${policy.delivery}`);
+      continue;
+    }
+
+    if (prompt === "/queue-clear") {
+      const cleared = session.turn.queue.clear();
+      console.log(`[runtime] cleared queued turns: ${cleared}`);
+      continue;
+    }
+
+    if (prompt === "/cancel") {
+      if (!activeTurnId) {
+        console.log("[runtime] no active turn to cancel");
+        continue;
+      }
+      const cancelled = await session.turn.cancel(activeTurnId);
+      if (!cancelled) {
+        console.log(`[runtime] turn ${activeTurnId} is no longer cancellable`);
+        continue;
+      }
+      console.log(`[runtime] cancellation requested for ${activeTurnId}`);
+      continue;
+    }
+
+    if (prompt.startsWith("/insert ")) {
+      const insertPrompt = prompt.slice("/insert ".length).trim();
+      if (insertPrompt === "") {
+        console.log("usage: /insert <prompt>");
+        continue;
+      }
+      launchTurn(insertPrompt, { sendNow: true });
+      continue;
+    }
+
     if (prompt.startsWith("/mode ")) {
       const modeId = prompt.slice("/mode ".length).trim();
       if (modeId === "") {
@@ -1434,23 +1944,28 @@ async function runRepl(
       }
       try {
         await session.agent.setMode(modeId);
-        logSink.writeJson({
-          modeId,
-          recordType: "local_command",
-          subcommand: "mode",
-          timestamp: new Date().toISOString(),
+        logSink.emit({
+          attributes: {
+            "acp.agent.mode": modeId,
+            "acp.demo.command.name": "mode",
+          },
+          body: "Updated current mode.",
+          eventName: "acp.demo.local_command",
         });
         console.log(
           `[runtime] current mode: ${session.metadata.currentModeId ?? "<none>"}`,
         );
       } catch (error: unknown) {
         const formatted = formatUnknownError(error);
-        logSink.writeJson({
-          error,
-          modeId,
-          recordType: "local_command_error",
-          subcommand: "mode",
-          timestamp: new Date().toISOString(),
+        logSink.emit({
+          attributes: {
+            "acp.agent.mode": modeId,
+            "acp.demo.command.name": "mode",
+          },
+          body: formatted,
+          eventName: "acp.demo.local_command.failed",
+          exception: error,
+          severityNumber: SeverityNumber.ERROR,
         });
         console.error(`[runtime] failed to set mode ${modeId}`);
         console.error(formatted);
@@ -1460,51 +1975,70 @@ async function runRepl(
 
     if (prompt.startsWith("/config ")) {
       const args = prompt.slice("/config ".length).trim();
-      const [optionId, ...valueParts] = args.split(/\s+/);
-      const value = valueParts.join(" ").trim();
+      const { optionId, value } = parseConfigCommandArgs(args);
 
       if (!optionId) {
-        console.log("usage: /config <id> [value]");
+        console.log("usage: /config <id|category> [value]");
         continue;
       }
 
-      const option = session.agent
-        .listConfigOptions()
-        .find((entry) => entry.id === optionId);
+      const resolvedOption = resolveCliConfigOption(
+        session.agent.listConfigOptions(),
+        optionId,
+      );
 
-      if (!option) {
-        console.log(`[runtime] unknown config option: ${optionId}`);
+      if (!resolvedOption.option) {
+        console.log(resolvedOption.error);
         continue;
       }
+      const option = resolvedOption.option;
 
       if (value === "") {
         console.log(JSON.stringify(option, null, 2));
         continue;
       }
 
+      const normalizedValue = normalizeCliConfigValue(option, value);
+      if (normalizedValue.error) {
+        console.log(normalizedValue.error);
+        continue;
+      }
+
       try {
-        await session.agent.setConfigOption(optionId, value);
-        logSink.writeJson({
-          optionId,
-          recordType: "local_command",
-          subcommand: "config_set",
-          timestamp: new Date().toISOString(),
-          value,
+        await session.agent.setConfigOption(
+          option.id,
+          normalizedValue.value ?? value,
+        );
+        logSink.emit({
+          attributes: {
+            "acp.agent.config_id": option.id,
+            "acp.demo.command.name": "config_set",
+            "acp.agent.config_value": String(normalizedValue.value ?? value),
+          },
+          body: "Updated config option.",
+          eventName: "acp.demo.local_command",
         });
         console.log(
-          `[runtime] config ${optionId}=${String(session.metadata.config?.[optionId] ?? value)}`,
+          `[runtime] config ${option.id}=${String(session.metadata.config?.[option.id] ?? normalizedValue.value ?? value)}`,
         );
       } catch (error: unknown) {
         const formatted = formatUnknownError(error);
-        logSink.writeJson({
-          error,
-          optionId,
-          recordType: "local_command_error",
-          subcommand: "config_set",
-          timestamp: new Date().toISOString(),
-          value,
+        logSink.emit({
+          attributes: {
+            "acp.agent.config_id": option.id,
+            "acp.demo.command.name": "config_set",
+            "acp.agent.config_value": String(normalizedValue.value ?? value),
+          },
+          body: formatted,
+          eventName: "acp.demo.local_command.failed",
+          exception: error,
+          severityNumber: SeverityNumber.ERROR,
         });
-        console.error(`[runtime] failed to set config ${optionId}=${value}`);
+        console.error(
+          `[runtime] failed to set config ${option.id}=${String(
+            normalizedValue.value ?? value,
+          )}`,
+        );
         console.error(formatted);
       }
       continue;
@@ -1527,15 +2061,36 @@ async function runRepl(
         continue;
       }
 
-      await runTurn(
+      launchTurn(
         `/${slashName}${slashArgs.length > 0 ? ` ${slashArgs.join(" ")}` : ""}`,
-        session,
-        renderer,
       );
       continue;
     }
 
-    await runTurn(prompt, session, renderer);
+    if (prompt.startsWith("/drop ")) {
+      const rawTurnId = prompt.slice("/drop ".length).trim();
+      if (rawTurnId === "") {
+        console.log("usage: /drop <turnId>");
+        continue;
+      }
+      const turnId = resolveQueuedTurnId(session, rawTurnId);
+      if (!turnId) {
+        console.log(`[runtime] queued turn not found: ${rawTurnId}`);
+        continue;
+      }
+      if (!session.turn.queue.remove(turnId)) {
+        console.log(`[runtime] failed to drop queued turn: ${turnId}`);
+        continue;
+      }
+      console.log(`[runtime] dropped queued turn: ${turnId}`);
+      continue;
+    }
+
+    launchTurn(prompt);
+  }
+
+  if (inFlightTurns.size > 0) {
+    await Promise.allSettled([...inFlightTurns]);
   }
 }
 
@@ -1573,17 +2128,19 @@ async function createRuntimeSmokeConfig(
 
 async function main(): Promise<void> {
   const options = parseCliOptions(process.argv);
-  const logSink = await configureLogFile(options.logFile);
-  const outputGate = createOutputGate();
-  const renderer = createTimelineRenderer(logSink, outputGate);
-  const config = await createRuntimeSmokeConfig(options.agentId);
-  const registry = new AcpRuntimeSessionRegistry({
-    store: new AcpRuntimeJsonSessionRegistryStore(
-      join(config.cwd, ".tmp", "runtime-session-registry.json"),
-    ),
+  const logSink = await configureDemoLogSink(options.logFile);
+  const outputGate = createOutputGate({
+    onLine: (line) => logSink.writeLine(line),
   });
+  const renderer = createTimelineRenderer(outputGate);
+  const config = await createRuntimeSmokeConfig(options.agentId);
   const runtime = new AcpRuntime(createStdioAcpConnectionFactory(), {
-    registry,
+    state: {
+      sessionRegistryPath: resolveRuntimeHomePath(
+        "state",
+        "runtime-session-registry.json",
+      ),
+    },
   });
   const exitSignal: ExitSignal = { requested: false };
   let session: AcpRuntimeSession | undefined;
@@ -1594,12 +2151,14 @@ async function main(): Promise<void> {
       return completeLocalCommand(line, session);
     },
   });
+  const inputCoordinator = createInputCoordinator(rl, outputGate);
 
   if (options.listSessions) {
-    const result = await runtime.sessions.registry.remote.list({
-      agentId: config.agentId,
+    const result = await runtime.sessions.list({
+      agent: config.agentId,
       cwd: config.cwd,
       handlers: config.handlers,
+      source: "remote",
     });
     console.log(formatSessionList(result.sessions));
     await config.cleanup();
@@ -1610,17 +2169,18 @@ async function main(): Promise<void> {
 
   const createPermissionHandler =
     () => (request: AcpRuntimePermissionRequest) => {
-      logSink.writeJson({
-        recordType: "permission_request",
-        request,
-        timestamp: new Date().toISOString(),
+      logSink.emit({
+        attributes: {
+          "acp.permission.id": request.id,
+          "acp.permission.kind": request.kind,
+        },
+        body: request.title,
+        eventName: "acp.demo.permission.prompted",
       });
       return promptForPermission(
-        rl,
-        renderer,
+        inputCoordinator,
         logSink,
         exitSignal,
-        outputGate,
         request,
       );
     };
@@ -1633,8 +2193,8 @@ async function main(): Promise<void> {
       >[0],
     ) =>
       promptForDemoAuthentication({
+        inputCoordinator,
         logSink,
-        outputGate,
         renderer,
         request,
         rl,
@@ -1645,18 +2205,22 @@ async function main(): Promise<void> {
       await readFile(options.resumeSnapshotPath, "utf8"),
     ) as AcpRuntimeSnapshot;
     session = await runtime.sessions.resume({
+      agent: snapshot.agent,
+      cwd: snapshot.cwd,
       handlers: {
         authentication: createAuthenticationHandler(),
         ...config.handlers,
         permission: createPermissionHandler(),
       },
-      snapshot,
+      mcpServers: snapshot.mcpServers,
+      sessionId: snapshot.session.id,
     });
   } else if (options.resumeLast) {
-    const latest = await registry.listSessions({
-      agentType: config.agentId,
+    const latest = await runtime.sessions.list({
+      agent: config.agentId,
       cwd: config.cwd,
       limit: 1,
+      source: "local",
     });
     const latestSessionId = latest.sessions[0]?.id;
     if (!latestSessionId) {
@@ -1664,42 +2228,28 @@ async function main(): Promise<void> {
         `[runtime] no locally persisted sessions found for ${config.agentId} in ${config.cwd}`,
       );
     }
-    const snapshot = registry.getSnapshot(latestSessionId);
-    if (!snapshot) {
-      throw new Error(
-        `[runtime] local snapshot missing for session ${latestSessionId}`,
-      );
-    }
     session = await runtime.sessions.resume({
       handlers: {
         authentication: createAuthenticationHandler(),
         ...config.handlers,
         permission: createPermissionHandler(),
       },
-      snapshot,
+      sessionId: latestSessionId,
     });
   } else if (options.resumeSessionId) {
-    const snapshot =
-      registry.getSnapshot(options.resumeSessionId) ??
-      ({
-        agent: await resolveRuntimeAgentFromRegistry(config.agentId),
-        cwd: config.cwd,
-        session: {
-          id: options.resumeSessionId,
-        },
-        version: ACP_RUNTIME_SNAPSHOT_VERSION,
-      } satisfies AcpRuntimeSnapshot);
     session = await runtime.sessions.resume({
+      agent: config.agentId,
+      cwd: config.cwd,
       handlers: {
         authentication: createAuthenticationHandler(),
         ...config.handlers,
         permission: createPermissionHandler(),
       },
-      snapshot,
+      sessionId: options.resumeSessionId,
     });
   } else if (options.loadSessionId) {
-    session = await runtime.sessions.registry.load({
-      agentId: config.agentId,
+    session = await runtime.sessions.load({
+      agent: config.agentId,
       cwd: config.cwd,
       handlers: {
         authentication: createAuthenticationHandler(),
@@ -1709,8 +2259,8 @@ async function main(): Promise<void> {
       sessionId: options.loadSessionId,
     });
   } else {
-    session = await runtime.sessions.registry.start({
-      agentId: config.agentId,
+    session = await runtime.sessions.start({
+      agent: config.agentId,
       cwd: config.cwd,
       handlers: {
         authentication: createAuthenticationHandler(),
@@ -1720,15 +2270,17 @@ async function main(): Promise<void> {
     });
   }
 
-  logSink.writeJson({
-    agentId: config.agentId,
-    label: config.label,
-    logFile: options.logFile,
-    rawLogFile: logSink.rawLogFile,
-    recordType: "session_created",
-    sessionMetadata: session.metadata,
-    snapshot: session.lifecycle.snapshot(),
-    timestamp: new Date().toISOString(),
+  await logSink.attachSession(session.metadata.id);
+  logSink.emit({
+    attributes: {
+      "acp.agent.id": config.agentId,
+      "acp.agent.type": session.snapshot().agent.type,
+      "acp.demo.label": config.label,
+      "acp.session.id": session.metadata.id,
+      "acp.session.cwd": config.cwd,
+    },
+    body: "Demo session ready.",
+    eventName: "acp.demo.session.ready",
   });
 
   console.log("[runtime] session created");
@@ -1736,7 +2288,7 @@ async function main(): Promise<void> {
   console.log(`[runtime] agentId: ${config.agentId}`);
   console.log(`[runtime] label: ${config.label}`);
   console.log(
-    `[runtime] agentType: ${session.lifecycle.snapshot().agent.type ?? "<none>"}`,
+    `[runtime] agentType: ${session.snapshot().agent.type ?? "<none>"}`,
   );
   console.log(`[runtime] cwd: ${config.cwd}`);
   if (process.platform === "win32" && config.agentId === "codex-acp") {
@@ -1744,7 +2296,7 @@ async function main(): Promise<void> {
   }
 
   if (options.loadSessionId) {
-    const historyEntries = session.model.history.drain();
+    const historyEntries = session.state.history.drain();
     if (historyEntries.length > 0) {
       console.log("");
       console.log("[runtime] loaded history replay");
@@ -1758,15 +2310,23 @@ async function main(): Promise<void> {
     }
 
     if (input.isTTY) {
-      await runRepl(rl, session, renderer, logSink, exitSignal, config.label);
+      await runRepl(
+        inputCoordinator,
+        session,
+        renderer,
+        logSink,
+        exitSignal,
+        config.label,
+      );
     } else if (!options.initialPrompt) {
       console.log(
         "[runtime] stdin is not a TTY; pass an initial prompt as argv to run a single turn.",
       );
     }
   } finally {
+    inputCoordinator.close();
     rl.close();
-    await session.lifecycle.close().catch(() => undefined);
+    await session.close().catch(() => undefined);
     await config.cleanup();
     await logSink.close();
   }

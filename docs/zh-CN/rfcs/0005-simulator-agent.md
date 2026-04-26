@@ -252,7 +252,7 @@ Simulator Agent 用于：
 
 - agent id: `simulator-agent-acp-local`
 - launch target: `dist/simulator-agent/cli.js`
-- launch flags: `--auth-mode none --storage-dir .tmp/simulator-agent-acp-harness`
+- launch flags: `--auth-mode none --storage-dir ~/.acp-runtime/simulator-agent-acp-harness`
 
 这个基线的目的不是证明 harness 已经完成，而是反过来校准 harness：
 

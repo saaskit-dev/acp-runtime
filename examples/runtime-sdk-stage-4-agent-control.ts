@@ -7,6 +7,7 @@ import type {
 
 import {
   DEFAULT_EXAMPLE_AGENT_ID,
+  resolveExampleRegistryPath,
   startRegistryExampleSession,
 } from "./runtime-sdk-example-helpers.js";
 
@@ -27,7 +28,7 @@ export async function stage4AgentControlExample(input: {
   const { session } = await startRegistryExampleSession({
     agentId: input.agentId ?? DEFAULT_EXAMPLE_AGENT_ID,
     cwd: input.cwd,
-    registryPath: ".tmp/runtime-sdk-stage-4-agent-control.json",
+    registryPath: resolveExampleRegistryPath("runtime-sdk-stage-4-agent-control.json"),
   });
 
   try {
@@ -51,6 +52,6 @@ export async function stage4AgentControlExample(input: {
       modes,
     };
   } finally {
-    await session.lifecycle.close();
+    await session.close();
   }
 }

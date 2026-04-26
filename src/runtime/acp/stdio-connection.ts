@@ -5,11 +5,22 @@ import {
   ClientSideConnection,
   type AnyMessage,
 } from "@agentclientprotocol/sdk";
+import { SeverityNumber } from "@opentelemetry/api-logs";
 
 import type {
   AcpConnection,
   AcpConnectionFactory,
 } from "./connection-types.js";
+import { AcpRuntimeObservabilityRedactionKind } from "../core/types.js";
+import type {
+  AcpRuntimeAgent,
+  AcpRuntimeObservabilityOptions,
+} from "../core/types.js";
+import {
+  emitRuntimeLog,
+  isRuntimeLogEnabled,
+  observedLogBody,
+} from "../observability/logging.js";
 
 const QODER_BENIGN_STDOUT_LINES = new Set([
   "Received interrupt signal. Cleaning up resources...",
@@ -18,6 +29,7 @@ const QODER_BENIGN_STDOUT_LINES = new Set([
 
 export type StdioFactoryOptions = {
   stderr?: "ignore" | "inherit" | "pipe";
+  observability?: AcpRuntimeObservabilityOptions;
   onAcpMessage?:
     | ((direction: "inbound" | "outbound", message: AnyMessage) => void)
     | undefined;
@@ -77,7 +89,13 @@ export function createStdioAcpConnectionFactory(
         nodeWritableToWeb(child.stdin),
         nodeReadableToWeb(child.stdout),
       ),
-      options.onAcpMessage,
+      {
+        agent: input.agent,
+        cwd: input.cwd,
+        onAcpMessage: options.onAcpMessage,
+        observability: input.observability ?? options.observability,
+        traceContext: input.traceContext,
+      },
     );
     const sdkConnection = new ClientSideConnection(() => input.client, stream);
 
@@ -435,14 +453,20 @@ function createTappedStream(
     readable: ReadableStream<AnyMessage>;
     writable: WritableStream<AnyMessage>;
   },
-  onAcpMessage:
-    | ((direction: "inbound" | "outbound", message: AnyMessage) => void)
-    | undefined,
+  options: {
+    agent: AcpRuntimeAgent;
+    cwd: string;
+    observability?: AcpRuntimeObservabilityOptions;
+    onAcpMessage?:
+      | ((direction: "inbound" | "outbound", message: AnyMessage) => void)
+      | undefined;
+    traceContext?: import("@opentelemetry/api").Context;
+  },
 ): {
   readable: ReadableStream<AnyMessage>;
   writable: WritableStream<AnyMessage>;
 } {
-  if (!onAcpMessage) {
+  if (!options.onAcpMessage && !protocolMessageLoggingEnabled(options.traceContext)) {
     return base;
   }
 
@@ -459,7 +483,15 @@ function createTappedStream(
             if (!value) {
               continue;
             }
-            onAcpMessage("inbound", value);
+            emitAcpProtocolMessageLog({
+              agent: options.agent,
+              cwd: options.cwd,
+              direction: "inbound",
+              message: value,
+              observability: options.observability,
+              traceContext: options.traceContext,
+            });
+            options.onAcpMessage?.("inbound", value);
             controller.enqueue(value);
           }
         } finally {
@@ -470,7 +502,15 @@ function createTappedStream(
     }),
     writable: new WritableStream<AnyMessage>({
       async write(message) {
-        onAcpMessage("outbound", message);
+        emitAcpProtocolMessageLog({
+          agent: options.agent,
+          cwd: options.cwd,
+          direction: "outbound",
+          message,
+          observability: options.observability,
+          traceContext: options.traceContext,
+        });
+        options.onAcpMessage?.("outbound", message);
         const writer = base.writable.getWriter();
         try {
           await writer.write(message);
@@ -480,6 +520,90 @@ function createTappedStream(
       },
     }),
   };
+}
+
+export function emitAcpProtocolMessageLog(input: {
+  agent: AcpRuntimeAgent;
+  cwd: string;
+  direction: "inbound" | "outbound";
+  message: AnyMessage;
+  observability?: AcpRuntimeObservabilityOptions;
+  traceContext?: import("@opentelemetry/api").Context;
+}): void {
+  if (!protocolMessageLoggingEnabled(input.traceContext)) {
+    return;
+  }
+
+  emitRuntimeLog({
+    attributes: {
+      "acp.agent.command": input.agent.command,
+      "acp.agent.type": input.agent.type,
+      "acp.protocol.direction": input.direction,
+      "acp.protocol.has_error": hasJsonRpcError(input.message),
+      "acp.protocol.id": jsonRpcId(input.message),
+      "acp.protocol.method": jsonRpcMethod(input.message),
+      "acp.protocol.transport": "stdio",
+      "acp.session.cwd": input.cwd,
+      "acp.session.id": jsonRpcSessionId(input.message),
+    },
+    body: observedLogBody({
+      options: input.observability,
+      redactContext: {
+        kind: AcpRuntimeObservabilityRedactionKind.ProtocolMessage,
+        sessionId: jsonRpcSessionId(input.message),
+      },
+      value: input.message,
+    }),
+    context: input.traceContext,
+    eventName: "acp.protocol.message",
+    severityNumber: hasJsonRpcError(input.message)
+      ? SeverityNumber.WARN
+      : SeverityNumber.DEBUG,
+  });
+}
+
+function protocolMessageLoggingEnabled(
+  traceContext: import("@opentelemetry/api").Context | undefined,
+): boolean {
+  return isRuntimeLogEnabled({
+    context: traceContext,
+    eventName: "acp.protocol.message",
+    severityNumber: SeverityNumber.DEBUG,
+  }) || isRuntimeLogEnabled({
+    context: traceContext,
+    eventName: "acp.protocol.message",
+    severityNumber: SeverityNumber.WARN,
+  });
+}
+
+function jsonRpcId(message: AnyMessage): string | number | undefined {
+  const id = readMessageProperty(message, "id");
+  return typeof id === "string" || typeof id === "number" ? id : undefined;
+}
+
+function jsonRpcMethod(message: AnyMessage): string | undefined {
+  const method = readMessageProperty(message, "method");
+  return typeof method === "string" ? method : undefined;
+}
+
+function jsonRpcSessionId(message: AnyMessage): string | undefined {
+  const params = readMessageProperty(message, "params");
+  if (!params || typeof params !== "object") {
+    return undefined;
+  }
+
+  const sessionId = (params as Record<string, unknown>).sessionId;
+  return typeof sessionId === "string" ? sessionId : undefined;
+}
+
+function hasJsonRpcError(message: AnyMessage): boolean {
+  return readMessageProperty(message, "error") !== undefined;
+}
+
+function readMessageProperty(message: AnyMessage, key: string): unknown {
+  return message && typeof message === "object"
+    ? (message as Record<string, unknown>)[key]
+    : undefined;
 }
 
 function createExitWatcher(

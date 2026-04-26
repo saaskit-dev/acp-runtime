@@ -25,14 +25,11 @@ Source examples:
 
 Primary APIs:
 - `AcpRuntime`
-- `AcpRuntimeSessionRegistry`
-- `AcpRuntimeJsonSessionRegistryStore`
 - `createStdioAcpConnectionFactory()`
-- `runtime.sessions.registry.start(...)`
 - `runtime.sessions.start(...)`
 - `session.turn.run(...)`
-- `session.lifecycle.snapshot()`
-- `session.lifecycle.close()`
+- `session.snapshot()`
+- `session.close()`
 - `session.capabilities`
 - `session.diagnostics`
 - `session.metadata`
@@ -44,18 +41,21 @@ Use this stage when you need:
 - realtime turn output
 - structured prompts
 - event-by-event streaming
-- cancellation and timeout handling
+- explicit turn handles
+- timeout handling
+- host-driven turn cancellation
 
 Source example:
 - [runtime-sdk-stage-2-interactive.ts](../../examples/runtime-sdk-stage-2-interactive.ts)
 
 Primary APIs:
+- `session.turn.start(...)`
+- `session.turn.cancel(turnId)`
 - `session.turn.send(...)`
 - `session.turn.stream(...)`
-- `session.live.watch(...)`
-- `session.live.metadata()`
-- `session.live.usage()`
-- `session.lifecycle.cancel()`
+- `session.state.watch(...)`
+- `session.state.metadata()`
+- `session.state.usage()`
 
 Typed runtime errors shown in this stage:
 - `AcpPermissionDeniedError`
@@ -69,19 +69,17 @@ Use this stage when your product needs:
 - recent remote sessions from one agent
 - session recovery
 - explicit `load` vs `resume`
-- registry-backed and explicit-agent startup paths
+- registry-id and explicit-agent startup paths
 
 Source example:
 - [runtime-sdk-stage-3-session-recovery.ts](../../examples/runtime-sdk-stage-3-session-recovery.ts)
 
 Primary APIs:
 - `resolveRuntimeAgentFromRegistry(...)`
-- `runtime.sessions.remote.list(...)`
-- `runtime.sessions.registry.remote.list(...)`
+- `runtime.sessions.list(...)`
 - `runtime.sessions.load(...)`
-- `runtime.sessions.registry.load(...)`
 - `runtime.sessions.resume(...)`
-- `session.model.history.drain()`
+- `session.state.history.drain()`
 
 Typed runtime errors shown in this stage:
 - `AcpAuthenticationError`
@@ -127,34 +125,31 @@ Focused guide:
 - [Runtime SDK Read Models](runtime-sdk-read-models.md)
 
 Primary APIs:
-- `session.model.thread.entries()`
-- `session.model.diffs.*`
-- `session.model.terminals.*`
-- `session.model.toolCalls.*`
-- `session.model.operations.*`
-- `session.model.permissions.*`
-- `session.model.watch(...)`
-- `session.live.metadata()`
-- `session.live.usage()`
-- `session.live.watch(...)`
+- `session.state.thread.entries()`
+- `session.state.diffs.*`
+- `session.state.terminals.*`
+- `session.state.toolCalls.*`
+- `session.state.operations.*`
+- `session.state.permissions.*`
+- `session.state.watch(...)`
+- `session.state.metadata()`
+- `session.state.usage()`
+- `session.state.watch(...)`
 
-## Stage 6: Stored Session History
+## Stage 6: Unified Session Listing
 
 Use this stage when your host owns a local recent-session index:
-- stored session list
-- delete / bulk delete
-- refresh
-- watcher-driven history UI
+- local session list
+- remote session list
+- merged local/remote view
 
 Source example:
 - [runtime-sdk-stage-6-stored-sessions.ts](../../examples/runtime-sdk-stage-6-stored-sessions.ts)
 
 Primary APIs:
-- `runtime.sessions.stored.list(...)`
-- `runtime.sessions.stored.delete(...)`
-- `runtime.sessions.stored.deleteMany(...)`
-- `runtime.sessions.stored.watch(...)`
-- `runtime.sessions.stored.refresh()`
+- `runtime.sessions.list({ source: "local" })`
+- `runtime.sessions.list({ source: "remote", agent, cwd })`
+- `runtime.sessions.list({ source: "all", agent, cwd })`
 
 ## Stage 7: Host Authority and Authentication
 
@@ -180,7 +175,7 @@ Primary APIs:
 ## Full User-Facing CLI Demo
 
 Use the full demo when you want the whole host flow in one place:
-- registry-backed startup
+- registry-id startup
 - user-facing interactive CLI
 - logging
 - load / resume entry flags

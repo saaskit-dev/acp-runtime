@@ -25,7 +25,7 @@ Recommended companions:
 - [Runtime SDK By Scenario](runtime-sdk-by-scenario.md)
 - [Runtime SDK API Coverage](runtime-sdk-api-coverage.md)
 
-This unified example uses `runtime.sessions.registry.start({ agentId })` as the default host entry point and switches behavior by agent id.
+This unified example uses `runtime.sessions.start({ agent })` as the default host entry point and switches behavior by agent id.
 
 ## Covered Scenarios
 
@@ -50,15 +50,14 @@ Use this file after the staged examples when you want the entire user-facing hos
 - permissions
 - authentication
 - load / resume
-- snapshot save
 - local CLI commands
 
 ## Design Notes
 
 - The demo treats `runtime` as the host-facing SDK instance.
-- Agent startup is resolved through the runtime's registry-backed entry point instead of hard-coded launch arguments.
+- Agent startup is resolved by passing a registry agent id to `runtime.sessions.start(...)` instead of hard-coded launch arguments.
 - Raw agent control happens through `session.agent.setMode()` and `session.agent.setConfigOption()`.
 - Permission decisions are modeled through `permission` handlers, not raw ACP messages.
 - Tool execution is modeled through `Operation` events, not `tool_call` or `tool_call_update`.
-- Recovery is modeled through `session.lifecycle.snapshot()` and `runtime.sessions.resume()`.
+- Recovery is modeled through `session.snapshot()` and `runtime.sessions.resume()`.
 - Host control flow is modeled through typed runtime errors, not vendor `stopReason` values.

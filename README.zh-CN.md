@@ -64,19 +64,13 @@
 ```ts
 import {
   AcpRuntime,
-  AcpRuntimeJsonSessionRegistryStore,
-  AcpRuntimeSessionRegistry,
   createStdioAcpConnectionFactory,
 } from "@saaskit-dev/acp-runtime";
 
-const registry = new AcpRuntimeSessionRegistry({
-  store: new AcpRuntimeJsonSessionRegistryStore(".tmp/runtime-registry.json"),
-});
+const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
 
-const runtime = new AcpRuntime(createStdioAcpConnectionFactory(), { registry });
-
-const session = await runtime.sessions.registry.start({
-  agentId: "claude-acp",
+const session = await runtime.sessions.start({
+  agent: "claude-acp",
   cwd: process.cwd(),
   handlers: {
     permission: () => ({ decision: "allow", scope: "session" }),
@@ -84,10 +78,14 @@ const session = await runtime.sessions.registry.start({
 });
 
 const text = await session.turn.run("Summarize the current workspace.");
-const snapshot = session.lifecycle.snapshot();
+const snapshot = session.snapshot();
 
-await session.lifecycle.close();
+await session.close();
 ```
+
+runtime 默认会把本地会话索引维护在 `~/.acp-runtime/state/runtime-session-registry.json`。
+如需改路径，使用 `new AcpRuntime(factory, { state: { sessionRegistryPath } })`；
+如需关闭本地状态，传 `{ state: false }`。
 
 接下来建议按这个顺序看：
 - [Runtime SDK 分阶段接入](docs/zh-CN/guides/runtime-sdk-by-scenario.md)
@@ -139,7 +137,7 @@ npx @saaskit-dev/simulator-agent-acp@latest
 当前 runtime 对外已经收敛成三个核心概念：
 
 - `AcpRuntime`：宿主侧入口，负责 `runtime.sessions.*`
-- `AcpRuntimeSession`：统一的 session 对象模型，承载 `session.agent.*`、`session.turn.*`、`session.model.*`、`session.live.*`、`session.lifecycle.*`
+- `AcpRuntimeSession`：统一的 session 对象模型，承载 `session.agent.*`、`session.turn.*`、`session.state.*`、`session.queue.*`、`session.snapshot()`/`session.close()`
 - `AcpSessionDriver`：内部 driver 边界，用来抹平不同 ACP agent 的行为差异
 
 内部的 ACP 实现分成三块：
@@ -155,8 +153,8 @@ npx @saaskit-dev/simulator-agent-acp@latest
 
 ```ts
 const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
-const session = await runtime.sessions.registry.start({
-  agentId: "claude-acp",
+const session = await runtime.sessions.start({
+  agent: "claude-acp",
   cwd: process.cwd(),
 });
 ```

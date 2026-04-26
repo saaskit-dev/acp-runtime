@@ -2,6 +2,7 @@ import type {
   AcpRuntimeAgentConfigOption,
   AcpRuntimeAgentMode,
   AcpRuntimeCapabilities,
+  AcpRuntimeConfigValue,
   AcpRuntimeCreateOptions,
   AcpRuntimeDiffWatcher,
   AcpRuntimeHistoryEntry,
@@ -26,17 +27,28 @@ import type {
   AcpRuntimePermissionRequestWatcher,
   AcpRuntimePrompt,
   AcpRuntimeProjectionWatcher,
+  AcpRuntimeQueuedTurn,
+  AcpRuntimeQueuePolicy,
+  AcpRuntimeQueuePolicyInput,
   AcpRuntimeSessionStatus,
   AcpRuntimeSnapshot,
   AcpRuntimeStreamOptions,
   AcpRuntimeTerminalSnapshot,
   AcpRuntimeTerminalWatcher,
+  AcpRuntimeTurnCompletion,
   AcpRuntimeTurnEvent,
   AcpRuntimeUsage,
 } from "./types.js";
 
+export type AcpSessionDriverTurnHandle = {
+  readonly completion: Promise<AcpRuntimeTurnCompletion>;
+  readonly events: AsyncIterable<AcpRuntimeTurnEvent>;
+  readonly turnId: string;
+};
+
 export type AcpSessionDriver = {
-  cancel(): Promise<void>;
+  cancelTurn(turnId: string): Promise<boolean>;
+  clearQueuedTurns(): number;
   close(): Promise<void>;
   readonly capabilities: Readonly<AcpRuntimeCapabilities>;
   readonly diagnostics: Readonly<AcpRuntimeDiagnostics>;
@@ -63,6 +75,11 @@ export type AcpSessionDriver = {
   permissionRequests(): readonly AcpRuntimePermissionRequest[];
   projectionMetadata(): AcpRuntimeSessionMetadata | undefined;
   projectionUsage(): AcpRuntimeUsage | undefined;
+  queuePolicy(): AcpRuntimeQueuePolicy;
+  setQueuePolicy(policy: AcpRuntimeQueuePolicyInput): AcpRuntimeQueuePolicy;
+  sendQueuedTurnNow(turnId: string): Promise<boolean>;
+  queuedTurn(turnId: string): AcpRuntimeQueuedTurn | undefined;
+  queuedTurns(): readonly AcpRuntimeQueuedTurn[];
   terminalIds(): readonly string[];
   terminal(terminalId: string): AcpRuntimeTerminalSnapshot | undefined;
   terminals(): readonly AcpRuntimeTerminalSnapshot[];
@@ -107,17 +124,18 @@ export type AcpSessionDriver = {
   waitForTerminal(
     terminalId: string,
   ): Promise<AcpRuntimeTerminalSnapshot | undefined>;
+  withdrawQueuedTurn(turnId: string): boolean;
   setAgentConfigOption(
     id: string,
-    value: string,
+    value: AcpRuntimeConfigValue,
   ): Promise<void>;
   setAgentMode(modeId: string): Promise<void>;
   snapshot(): AcpRuntimeSnapshot;
-  readonly status: AcpRuntimeSessionStatus;
-  stream(
+  startTurn(
     prompt: AcpRuntimePrompt,
     options?: AcpRuntimeStreamOptions,
-  ): AsyncIterable<AcpRuntimeTurnEvent>;
+  ): AcpSessionDriverTurnHandle;
+  readonly status: AcpRuntimeSessionStatus;
 };
 
 export type AcpSessionService = {

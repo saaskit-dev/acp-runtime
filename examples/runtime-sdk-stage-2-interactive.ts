@@ -1,10 +1,14 @@
 import {
+  AcpRuntimeContentPartType,
   AcpPermissionDeniedError,
   AcpProtocolError,
+  AcpRuntimeProjectionUpdateType,
+  AcpRuntimePromptMessageRole,
   AcpTurnCancelledError,
   AcpTurnTimeoutError,
   type AcpRuntimeProjectionUpdate,
   type AcpRuntimeSessionMetadata,
+  type AcpRuntimeStateUpdate,
   type AcpRuntimeTurnCompletion,
   type AcpRuntimeTurnEvent,
   type AcpRuntimeUsage,
@@ -13,6 +17,7 @@ import {
 import {
   DEFAULT_EXAMPLE_AGENT_ID,
   collectTurnEvents,
+  resolveExampleRegistryPath,
   startRegistryExampleSession,
 } from "./runtime-sdk-example-helpers.js";
 
@@ -22,18 +27,21 @@ export async function stage2SendExample(input: {
 } = {}): Promise<{
   completion: AcpRuntimeTurnCompletion;
   events: readonly AcpRuntimeTurnEvent[];
-  liveMetadata?: Readonly<AcpRuntimeSessionMetadata>;
-  liveUsage?: AcpRuntimeUsage;
+  stateMetadata?: Readonly<AcpRuntimeSessionMetadata>;
+  stateUsage?: AcpRuntimeUsage;
   projectionUpdates: readonly AcpRuntimeProjectionUpdate[];
 }> {
   const { session } = await startRegistryExampleSession({
     agentId: input.agentId ?? DEFAULT_EXAMPLE_AGENT_ID,
     cwd: input.cwd,
-    registryPath: ".tmp/runtime-sdk-stage-2-send.json",
+    registryPath: resolveExampleRegistryPath("runtime-sdk-stage-2-send.json"),
   });
   const events: AcpRuntimeTurnEvent[] = [];
   const projectionUpdates: AcpRuntimeProjectionUpdate[] = [];
-  const stopWatchingProjection = session.live.watch((update) => {
+  const stopWatchingProjection = session.state.watch((update) => {
+    if (!isProjectionUpdate(update)) {
+      return;
+    }
     projectionUpdates.push(update);
   });
 
@@ -42,11 +50,16 @@ export async function stage2SendExample(input: {
       [
         {
           content: "Answer in one short paragraph.",
-          role: "system",
+          role: AcpRuntimePromptMessageRole.System,
         },
         {
-          content: [{ text: "What does this repository do?", type: "text" }],
-          role: "user",
+          content: [
+            {
+              text: "What does this repository do?",
+              type: AcpRuntimeContentPartType.Text,
+            },
+          ],
+          role: AcpRuntimePromptMessageRole.User,
         },
       ],
       {
@@ -60,8 +73,8 @@ export async function stage2SendExample(input: {
     return {
       completion,
       events,
-      liveMetadata: session.live.metadata(),
-      liveUsage: session.live.usage(),
+      stateMetadata: session.state.metadata(),
+      stateUsage: session.state.usage(),
       projectionUpdates,
     };
   } catch (error) {
@@ -76,8 +89,16 @@ export async function stage2SendExample(input: {
     throw error;
   } finally {
     stopWatchingProjection();
-    await session.lifecycle.close();
+    await session.close();
   }
+}
+
+function isProjectionUpdate(
+  update: AcpRuntimeStateUpdate,
+): update is AcpRuntimeProjectionUpdate {
+  return Object.values(AcpRuntimeProjectionUpdateType).includes(
+    update.type as AcpRuntimeProjectionUpdate["type"],
+  );
 }
 
 export async function stage2StreamExample(input: {
@@ -87,7 +108,7 @@ export async function stage2StreamExample(input: {
   const { session } = await startRegistryExampleSession({
     agentId: input.agentId ?? DEFAULT_EXAMPLE_AGENT_ID,
     cwd: input.cwd,
-    registryPath: ".tmp/runtime-sdk-stage-2-stream.json",
+    registryPath: resolveExampleRegistryPath("runtime-sdk-stage-2-stream.json"),
   });
 
   try {
@@ -96,17 +117,17 @@ export async function stage2StreamExample(input: {
       [
         {
           text: "Inspect the workspace and answer with one useful next step.",
-          type: "text",
+          type: AcpRuntimeContentPartType.Text,
         },
         {
-          type: "json",
+          type: AcpRuntimeContentPartType.Json,
           value: { source: "runtime-sdk-stage-2-interactive" },
         },
       ],
       { timeoutMs: 15_000 },
     );
   } finally {
-    await session.lifecycle.close();
+    await session.close();
   }
 }
 
@@ -117,27 +138,35 @@ export async function stage2CancelExample(input: {
   const { session } = await startRegistryExampleSession({
     agentId: input.agentId ?? DEFAULT_EXAMPLE_AGENT_ID,
     cwd: input.cwd,
-    registryPath: ".tmp/runtime-sdk-stage-2-cancel.json",
+    registryPath: resolveExampleRegistryPath("runtime-sdk-stage-2-cancel.json"),
   });
-  const controller = new AbortController();
-
   try {
+    const turn = session.turn.start(
+      "Keep working until the host cancels this turn.",
+    );
     setTimeout(() => {
-      controller.abort();
-      void session.lifecycle.cancel();
+      void session.turn.cancel(turn.turnId);
     }, 250);
 
-    return await collectTurnEvents(
-      session,
-      "Keep working until the host cancels this turn.",
-      { signal: controller.signal },
-    );
+    const events: AcpRuntimeTurnEvent[] = [];
+    try {
+      for await (const event of turn.events) {
+        events.push(event);
+      }
+    } catch (error) {
+      if (error instanceof AcpTurnCancelledError) {
+        return events;
+      }
+      throw error;
+    }
+
+    return events;
   } catch (error) {
     if (error instanceof AcpTurnCancelledError) {
       return [];
     }
     throw error;
   } finally {
-    await session.lifecycle.close();
+    await session.close();
   }
 }

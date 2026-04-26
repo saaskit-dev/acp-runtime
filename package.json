@@ -9,42 +9,12 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    },
-    "./internal/agent-launch-registry": {
-      "types": "./dist/internal/agent-launch-registry.d.ts",
-      "import": "./dist/internal/agent-launch-registry.js"
-    },
-    "./internal/simulator-workspace": {
-      "types": "./dist/internal/simulator-workspace.d.ts",
-      "import": "./dist/internal/simulator-workspace.js"
     }
   },
   "files": [
     "dist/index.js",
     "dist/index.d.ts",
     "dist/runtime",
-    "dist/examples/client-sdk-demo.js",
-    "dist/examples/client-sdk-demo.d.ts",
-    "dist/examples/runtime-demo-auth-adapter.js",
-    "dist/examples/runtime-demo-auth-adapter.d.ts",
-    "dist/examples/runtime-sdk-demo.js",
-    "dist/examples/runtime-sdk-demo.d.ts",
-    "dist/examples/runtime-sdk-example-helpers.js",
-    "dist/examples/runtime-sdk-example-helpers.d.ts",
-    "dist/examples/runtime-sdk-stage-1-minimal.js",
-    "dist/examples/runtime-sdk-stage-1-minimal.d.ts",
-    "dist/examples/runtime-sdk-stage-2-interactive.js",
-    "dist/examples/runtime-sdk-stage-2-interactive.d.ts",
-    "dist/examples/runtime-sdk-stage-3-session-recovery.js",
-    "dist/examples/runtime-sdk-stage-3-session-recovery.d.ts",
-    "dist/examples/runtime-sdk-stage-4-agent-control.js",
-    "dist/examples/runtime-sdk-stage-4-agent-control.d.ts",
-    "dist/examples/runtime-sdk-stage-5-read-model.js",
-    "dist/examples/runtime-sdk-stage-5-read-model.d.ts",
-    "dist/examples/runtime-sdk-stage-6-stored-sessions.js",
-    "dist/examples/runtime-sdk-stage-6-stored-sessions.d.ts",
-    "dist/examples/runtime-sdk-stage-7-host-authority.js",
-    "dist/examples/runtime-sdk-stage-7-host-authority.d.ts",
     "README.md",
     "LICENSE"
   ],
@@ -91,6 +61,8 @@
     "node": ">=18.0.0"
   },
   "devDependencies": {
+    "@opentelemetry/sdk-logs": "0.215.0",
+    "@opentelemetry/sdk-trace-base": "^1.9.1",
     "@types/node": "^22.15.3",
     "@types/tar": "^7.0.87",
     "@types/unzipper": "^0.10.11",
@@ -99,6 +71,8 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.20.0",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/api-logs": "0.215.0",
     "tar": "^7.5.13",
     "unzipper": "^0.12.3"
   },

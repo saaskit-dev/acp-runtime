@@ -11,7 +11,7 @@ shift
 case "$target" in
   runtime)
     if [[ $# -eq 0 ]]; then
-      echo 'usage: ./run runtime <agent-id> [--sessions] [--load SESSION_ID] [--resume SESSION_ID] [--resume-last] [--resume-snapshot SNAPSHOT.json] [--prompt TEXT] [--log-file PATH] [prompt...]' >&2
+      echo 'usage: ./run runtime <agent-id> [--sessions] [--load SESSION_ID] [--resume SESSION_ID] [--resume-last] [--resume-snapshot SNAPSHOT.json] [--prompt TEXT] [--log-file PATH] [--no-log-file] [prompt...]' >&2
       exit 2
     fi
 
@@ -19,6 +19,7 @@ case "$target" in
     shift
     prompt=""
     log_file="${ACP_RUNTIME_LOG_FILE:-}"
+    log_arg=""
     runtime_args=()
 
     while [[ $# -gt 0 ]]; do
@@ -59,10 +60,16 @@ case "$target" in
           ;;
         --log-file=*|--log=*)
           log_file="${1#*=}"
+          log_arg="--log-file=$log_file"
           ;;
         --log-file|--log)
           shift
           log_file="${1:-}"
+          log_arg="--log-file=$log_file"
+          ;;
+        --no-log-file)
+          log_file=""
+          log_arg="--no-log-file"
           ;;
         *)
           if [[ -n "$prompt" ]]; then
@@ -77,6 +84,10 @@ case "$target" in
 
     if [[ -n "$log_file" ]]; then
       export ACP_RUNTIME_LOG_FILE="$log_file"
+    fi
+    if [[ -n "$log_arg" ]]; then
+      runtime_args+=("$log_arg")
+    elif [[ -n "$log_file" ]]; then
       runtime_args+=("--log-file=$log_file")
     fi
 

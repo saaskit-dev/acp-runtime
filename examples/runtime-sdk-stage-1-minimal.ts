@@ -11,6 +11,7 @@ import {
   DEFAULT_EXAMPLE_AGENT_ID,
   createExampleHandlers,
   createExampleRuntime,
+  resolveExampleRegistryPath,
   startRegistryExampleSession,
 } from "./runtime-sdk-example-helpers.js";
 
@@ -28,7 +29,7 @@ export async function stage1RegistryMinimalExample(input: {
   const { session } = await startRegistryExampleSession({
     agentId: input.agentId ?? DEFAULT_EXAMPLE_AGENT_ID,
     cwd: input.cwd,
-    registryPath: ".tmp/runtime-sdk-stage-1-registry.json",
+    registryPath: resolveExampleRegistryPath("runtime-sdk-stage-1-registry.json"),
   });
 
   try {
@@ -41,11 +42,11 @@ export async function stage1RegistryMinimalExample(input: {
       diagnostics: session.diagnostics,
       metadata: session.metadata,
       outputText,
-      snapshot: session.lifecycle.snapshot(),
+      snapshot: session.snapshot(),
       status: session.status,
     };
   } finally {
-    await session.lifecycle.close();
+    await session.close();
   }
 }
 
@@ -56,7 +57,7 @@ export async function stage1ExplicitAgentExample(input: {
   snapshot: AcpRuntimeSnapshot;
 }> {
   const runtime = await createExampleRuntime({
-    registryPath: ".tmp/runtime-sdk-stage-1-explicit.json",
+    registryPath: resolveExampleRegistryPath("runtime-sdk-stage-1-explicit.json"),
   });
   const session = await runtime.sessions.start({
     agent: createSimulatorAgentAcpAgent({ via: "npx" }),
@@ -67,9 +68,9 @@ export async function stage1ExplicitAgentExample(input: {
   try {
     return {
       outputText: await session.turn.run("Say hello from the explicit agent path."),
-      snapshot: session.lifecycle.snapshot(),
+      snapshot: session.snapshot(),
     };
   } finally {
-    await session.lifecycle.close();
+    await session.close();
   }
 }

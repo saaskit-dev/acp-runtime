@@ -11,6 +11,7 @@ Language:
 - [Runtime SDK By Scenario](runtime-sdk-by-scenario.md)
 - [Runtime SDK API](runtime-sdk-api.md)
 - [Runtime SDK API Coverage](runtime-sdk-api-coverage.md)
+- [Runtime SDK Observability](runtime-sdk-observability.md)
 - [Runtime SDK Read Models](runtime-sdk-read-models.md)
 - [Runtime SDK Minimal Demo](runtime-sdk-minimal-demo.md)
 - [Runtime SDK Demo](runtime-sdk-demo.md)
