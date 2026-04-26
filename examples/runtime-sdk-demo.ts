@@ -20,8 +20,9 @@ import {
   createStdioAcpConnectionFactory,
   resolveRuntimeHomePath,
   type AcpRuntimeHistoryEntry,
+  type AcpRuntimeInitialConfig,
+  type AcpRuntimeInitialConfigReport,
   type AcpRuntimeProjectionUpdate,
-  type AcpRuntimeSnapshot,
   type AcpRuntimeStateUpdate,
   type AcpRuntimeAuthorityHandlers,
   type AcpRuntimeAgentConfigOption,
@@ -67,13 +68,15 @@ type RuntimeSmokeConfig = {
 
 type DemoCliOptions = {
   agentId: string;
+  initialConfig?: AcpRuntimeInitialConfig;
   initialPrompt: string;
   listSessions: boolean;
   loadSessionId?: string;
   logFile?: string;
   resumeLast: boolean;
   resumeSessionId?: string;
-  resumeSnapshotPath?: string;
+  systemPrompt?: string;
+  systemPromptFile?: string;
 };
 
 type ExitSignal = {
@@ -123,6 +126,7 @@ const LOCAL_COMMANDS = [
   "/help",
   "/mode",
   "/config",
+  "/config-json",
   "/thread",
   "/diffs",
   "/terminals",
@@ -131,6 +135,7 @@ const LOCAL_COMMANDS = [
   "/permissions",
   "/usage",
   "/metadata",
+  "/metadata-json",
   "/queue",
   "/queue-policy",
   "/queue-clear",
@@ -158,13 +163,20 @@ function parseCliOptions(argv: string[]): DemoCliOptions {
   const rawAgent = argv[2];
   const agentId = resolveAgentId(rawAgent);
   const promptTokens: string[] = [];
+  const rawInitialConfig: {
+    mode?: string;
+    model?: string;
+    effort?: string;
+    strict?: boolean;
+  } = {};
   let listSessions = false;
   let loadSessionId: string | undefined;
   let logFile: string | undefined =
     process.env.ACP_RUNTIME_LOG_FILE?.trim() || DEFAULT_LOG_FILE;
   let resumeLast = false;
   let resumeSessionId: string | undefined;
-  let resumeSnapshotPath: string | undefined;
+  let systemPrompt: string | undefined;
+  let systemPromptFile: string | undefined;
 
   for (const token of argv.slice(rawAgent ? 3 : 2)) {
     if (token === "--sessions") {
@@ -183,10 +195,10 @@ function parseCliOptions(argv: string[]): DemoCliOptions {
       resumeLast = true;
       continue;
     }
-    if (token.startsWith("--resume-snapshot=")) {
-      resumeSnapshotPath =
-        token.slice("--resume-snapshot=".length) || undefined;
-      continue;
+    if (token === "--resume-snapshot" || token.startsWith("--resume-snapshot=")) {
+      throw new Error(
+        "usage: --resume-snapshot was removed; use --resume=<sessionId> or --resume-last",
+      );
     }
     if (token.startsWith("--log-file=")) {
       logFile = token.slice("--log-file=".length).trim() || undefined;
@@ -196,22 +208,99 @@ function parseCliOptions(argv: string[]): DemoCliOptions {
       logFile = token.slice("--log=".length).trim() || undefined;
       continue;
     }
+    if (token.startsWith("--mode=")) {
+      rawInitialConfig.mode = token.slice("--mode=".length).trim() || undefined;
+      continue;
+    }
+    if (token.startsWith("--model=")) {
+      rawInitialConfig.model = token.slice("--model=".length).trim() || undefined;
+      continue;
+    }
+    if (token.startsWith("--effort=")) {
+      rawInitialConfig.effort =
+        token.slice("--effort=".length).trim() || undefined;
+      continue;
+    }
+    if (token === "--config" || token.startsWith("--config=")) {
+      throw new Error(
+        "usage: startup --config was removed; use --mode=<id>, --model=<id>, or --effort=<level>",
+      );
+    }
+    if (
+      token === "--initial-config-strict" ||
+      token === "--strict-initial-config"
+    ) {
+      rawInitialConfig.strict = true;
+      continue;
+    }
+    if (token.startsWith("--system-prompt=")) {
+      systemPrompt = token.slice("--system-prompt=".length);
+      continue;
+    }
+    if (token === "--system-prompt") {
+      throw new Error("usage: --system-prompt=<text>");
+    }
+    if (token.startsWith("--system-prompt-file=")) {
+      systemPromptFile =
+        token.slice("--system-prompt-file=".length).trim() || undefined;
+      continue;
+    }
+    if (token === "--system-prompt-file") {
+      throw new Error("usage: --system-prompt-file=<path>");
+    }
     if (token === "--no-log-file") {
       logFile = undefined;
+      continue;
+    }
+    if (token.startsWith("--")) {
+      console.error(`[runtime] warning: ignoring unknown option: ${token}`);
       continue;
     }
     promptTokens.push(token);
   }
 
+  if (
+    (systemPrompt !== undefined || systemPromptFile !== undefined) &&
+    (loadSessionId || resumeLast || resumeSessionId)
+  ) {
+    throw new Error(
+      "usage: --system-prompt and --system-prompt-file are only supported when creating a new session; remove them when using --load, --resume, or --resume-last",
+    );
+  }
+
   return {
     agentId,
+    initialConfig: createInitialConfig(rawInitialConfig),
     initialPrompt: promptTokens.join(" "),
     listSessions,
     loadSessionId,
     logFile,
     resumeLast,
     resumeSessionId,
-    resumeSnapshotPath,
+    systemPrompt,
+    systemPromptFile,
+  };
+}
+
+function createInitialConfig(input: {
+  mode?: string;
+  model?: string;
+  effort?: string;
+  strict?: boolean;
+}): AcpRuntimeInitialConfig | undefined {
+  if (
+    !input.mode &&
+    !input.model &&
+    !input.effort &&
+    !input.strict
+  ) {
+    return undefined;
+  }
+  return {
+    mode: input.mode,
+    model: input.model,
+    effort: input.effort,
+    strict: input.strict,
   };
 }
 
@@ -239,6 +328,46 @@ function formatSessionList(
       ].join("\n"),
     )
     .join("\n");
+}
+
+function formatInitialConfigReport(
+  report: AcpRuntimeInitialConfigReport | undefined,
+  options: readonly AcpRuntimeAgentConfigOption[] = [],
+): string | undefined {
+  if (!report || report.items.length === 0) {
+    return undefined;
+  }
+
+  const lines = [
+    `[runtime] initial config ${report.ok ? "applied" : "partially applied"}`,
+  ];
+  for (const item of report.items) {
+    const target = item.optionId ? `${item.key} -> ${item.optionId}` : item.key;
+    const value =
+      item.appliedValue === undefined
+        ? String(item.requestedValue)
+        : String(item.appliedValue);
+    const label = formatConfigValueLabel(options, item.optionId, value);
+    const reason = item.reason ? ` | ${item.reason}` : "";
+    lines.push(`  ${item.status} ${target}=${value}${label}${reason}`);
+  }
+  return lines.join("\n");
+}
+
+function formatConfigValueLabel(
+  options: readonly AcpRuntimeAgentConfigOption[],
+  optionId: string | undefined,
+  value: string,
+): string {
+  if (!optionId || optionId === "currentModeId") {
+    return "";
+  }
+  const option = options.find((entry) => entry.id === optionId);
+  const choice = option?.options?.find((entry) => String(entry.value) === value);
+  if (!choice || choice.name === value) {
+    return "";
+  }
+  return ` (${choice.name})`;
 }
 
 function renderHistoryEntries(
@@ -524,6 +653,71 @@ function formatAvailableCommands(
         : `/${command.name}`,
     )
     .join("\n");
+}
+
+function formatAgentModes(
+  modes: readonly { id: string; name: string; description?: string }[],
+): string {
+  if (modes.length === 0) {
+    return "[runtime] no available modes";
+  }
+
+  return [
+    "[runtime] modes",
+    ...modes.map((mode) =>
+      mode.description
+        ? `  ${mode.id.padEnd(20)} ${mode.name} - ${mode.description}`
+        : `  ${mode.id.padEnd(20)} ${mode.name}`,
+    ),
+  ].join("\n");
+}
+
+function formatConfigOptions(
+  options: readonly AcpRuntimeAgentConfigOption[],
+): string {
+  if (options.length === 0) {
+    return "[runtime] no config options";
+  }
+
+  return [
+    "[runtime] config options",
+    ...options.map((option) =>
+      [
+        `  ${option.id.padEnd(22)}`,
+        option.category ? `[${option.category}] `.padEnd(18) : "".padEnd(18),
+        `${option.name}: ${String(option.value)}`,
+      ].join(""),
+    ),
+    "usage: /config <id|category> <value>",
+    "raw: /config-json",
+  ].join("\n");
+}
+
+function formatConfigOption(option: AcpRuntimeAgentConfigOption): string {
+  const lines = [
+    `[runtime] config ${option.id}`,
+    `  name: ${option.name}`,
+    `  type: ${option.type}`,
+    `  value: ${String(option.value)}`,
+  ];
+
+  if (option.category) {
+    lines.push(`  category: ${option.category}`);
+  }
+  if (option.description) {
+    lines.push(`  description: ${option.description}`);
+  }
+  if (option.options?.length) {
+    lines.push("  options:");
+    for (const entry of option.options) {
+      lines.push(
+        entry.description
+          ? `    ${String(entry.value).padEnd(18)} ${entry.name} - ${entry.description}`
+          : `    ${String(entry.value).padEnd(18)} ${entry.name}`,
+      );
+    }
+  }
+  return lines.join("\n");
 }
 
 function listConfigOptionKeys(
@@ -1806,6 +2000,10 @@ async function runRepl(
       console.log("  /config <id|category>  Show one config option");
       console.log("  /config <id> <value>   Set one config option");
       console.log("  /config <id>=<value>   Set one config option");
+      console.log("  /config-json           Show raw config option JSON");
+      console.log("  startup flags           --mode=<id> --model=<id> --effort=<level>");
+      console.log("  startup strict          --initial-config-strict fails startup if any initial config is skipped");
+      console.log("  startup prompt          --system-prompt=<text> or --system-prompt-file=<path>");
       console.log("  /thread                Show structured thread entries");
       console.log("  /diffs                 Show session diff objects");
       console.log("  /terminals             Show terminal objects and output previews");
@@ -1814,6 +2012,7 @@ async function runRepl(
       console.log("  /permissions           Show permission request history");
       console.log("  /usage                 Show latest token/cost usage");
       console.log("  /metadata              Show latest session metadata");
+      console.log("  /metadata-json         Show raw session metadata JSON");
       console.log("  /queue                 Show queued turns that have not started yet");
       console.log("  /queue-policy          Show current queue delivery policy");
       console.log("  /queue-policy <value>  Set future queue delivery: sequential | coalesce");
@@ -1829,11 +2028,16 @@ async function runRepl(
     }
 
     if (prompt === "/mode") {
-      console.log(JSON.stringify(session.agent.listModes(), null, 2));
+      console.log(formatAgentModes(session.agent.listModes()));
       continue;
     }
 
     if (prompt === "/config") {
+      console.log(formatConfigOptions(session.agent.listConfigOptions()));
+      continue;
+    }
+
+    if (prompt === "/config-json") {
       console.log(JSON.stringify(session.agent.listConfigOptions(), null, 2));
       continue;
     }
@@ -1882,6 +2086,11 @@ async function runRepl(
 
     if (prompt === "/metadata") {
       console.log(formatMetadataSnapshot(session));
+      continue;
+    }
+
+    if (prompt === "/metadata-json") {
+      console.log(JSON.stringify(session.metadata, null, 2));
       continue;
     }
 
@@ -1994,7 +2203,7 @@ async function runRepl(
       const option = resolvedOption.option;
 
       if (value === "") {
-        console.log(JSON.stringify(option, null, 2));
+        console.log(formatConfigOption(option));
         continue;
       }
 
@@ -2128,6 +2337,9 @@ async function createRuntimeSmokeConfig(
 
 async function main(): Promise<void> {
   const options = parseCliOptions(process.argv);
+  if (options.systemPromptFile) {
+    options.systemPrompt = await readFile(options.systemPromptFile, "utf8");
+  }
   const logSink = await configureDemoLogSink(options.logFile);
   const outputGate = createOutputGate({
     onLine: (line) => logSink.writeLine(line),
@@ -2200,22 +2412,7 @@ async function main(): Promise<void> {
         rl,
       });
 
-  if (options.resumeSnapshotPath) {
-    const snapshot = JSON.parse(
-      await readFile(options.resumeSnapshotPath, "utf8"),
-    ) as AcpRuntimeSnapshot;
-    session = await runtime.sessions.resume({
-      agent: snapshot.agent,
-      cwd: snapshot.cwd,
-      handlers: {
-        authentication: createAuthenticationHandler(),
-        ...config.handlers,
-        permission: createPermissionHandler(),
-      },
-      mcpServers: snapshot.mcpServers,
-      sessionId: snapshot.session.id,
-    });
-  } else if (options.resumeLast) {
+  if (options.resumeLast) {
     const latest = await runtime.sessions.list({
       agent: config.agentId,
       cwd: config.cwd,
@@ -2234,6 +2431,7 @@ async function main(): Promise<void> {
         ...config.handlers,
         permission: createPermissionHandler(),
       },
+      initialConfig: options.initialConfig,
       sessionId: latestSessionId,
     });
   } else if (options.resumeSessionId) {
@@ -2245,6 +2443,7 @@ async function main(): Promise<void> {
         ...config.handlers,
         permission: createPermissionHandler(),
       },
+      initialConfig: options.initialConfig,
       sessionId: options.resumeSessionId,
     });
   } else if (options.loadSessionId) {
@@ -2256,6 +2455,7 @@ async function main(): Promise<void> {
         ...config.handlers,
         permission: createPermissionHandler(),
       },
+      initialConfig: options.initialConfig,
       sessionId: options.loadSessionId,
     });
   } else {
@@ -2267,10 +2467,33 @@ async function main(): Promise<void> {
         ...config.handlers,
         permission: createPermissionHandler(),
       },
+      initialConfig: options.initialConfig,
+      systemPrompt: options.systemPrompt,
     });
   }
 
   await logSink.attachSession(session.metadata.id);
+  const initialConfigReport = formatInitialConfigReport(
+    session.initialConfigReport,
+    session.agent.listConfigOptions(),
+  );
+  if (initialConfigReport) {
+    console.log(initialConfigReport);
+    logSink.emit({
+      attributes: {
+        "acp.demo.initial_config.ok": Boolean(
+          session.initialConfigReport?.ok,
+        ),
+        "acp.demo.initial_config.items":
+          session.initialConfigReport?.items.length ?? 0,
+      },
+      body: initialConfigReport,
+      eventName: "acp.demo.initial_config",
+      severityNumber: session.initialConfigReport?.ok
+        ? SeverityNumber.INFO
+        : SeverityNumber.WARN,
+    });
+  }
   logSink.emit({
     attributes: {
       "acp.agent.id": config.agentId,

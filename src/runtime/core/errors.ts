@@ -38,6 +38,14 @@ export class AcpAuthenticationError extends AcpError {
   readonly code: string = "AUTHENTICATION_ERROR";
 }
 
+export class AcpInitialConfigError extends AcpError {
+  readonly code: string = "INITIAL_CONFIG_ERROR";
+}
+
+export class AcpSystemPromptError extends AcpError {
+  readonly code: string = "SYSTEM_PROMPT_ERROR";
+}
+
 export class AcpPermissionError extends AcpError {
   readonly code: string = "PERMISSION_ERROR";
 }

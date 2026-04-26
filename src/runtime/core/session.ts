@@ -2,6 +2,7 @@ import type {
   AcpRuntimeCapabilities,
   AcpRuntimeDiffWatcher,
   AcpRuntimeDiagnostics,
+  AcpRuntimeInitialConfigReport,
   AcpRuntimeOperationBundleWatcher,
   AcpRuntimeOperationWatcher,
   AcpRuntimePermissionRequestWatcher,
@@ -151,6 +152,7 @@ export class AcpRuntimeSession {
   constructor(
     private readonly driver: AcpSessionDriver,
     private readonly options: {
+      initialConfigReport?: AcpRuntimeInitialConfigReport | undefined;
       onClose?: (() => Promise<void> | void) | undefined;
       onSnapshotChanged?:
         | ((snapshot: AcpRuntimeSnapshot) => Promise<void> | void)
@@ -164,6 +166,10 @@ export class AcpRuntimeSession {
 
   get diagnostics(): Readonly<AcpRuntimeDiagnostics> {
     return this.driver.diagnostics;
+  }
+
+  get initialConfigReport(): Readonly<AcpRuntimeInitialConfigReport> | undefined {
+    return this.options.initialConfigReport;
   }
 
   get metadata(): Readonly<AcpRuntimeSessionMetadata> {

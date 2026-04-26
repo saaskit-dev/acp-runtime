@@ -53,12 +53,71 @@ runtime 自有状态默认现在统一放在 `~/.acp-runtime/` 下。
 runtime 默认会把本地会话索引维护在 `~/.acp-runtime/state/runtime-session-registry.json`。
 如需改路径，传 `new AcpRuntime(factory, { state: { sessionRegistryPath } })`；如需关闭本地状态，传 `{ state: false }`。
 
+### Initial Config
+
+宿主希望 session 打开后立刻进入某个 mode/model/reasoning preset 时，可以传 `initialConfig`：
+
+```ts
+const session = await runtime.sessions.start({
+  agent: "codex-acp",
+  cwd: process.cwd(),
+  initialConfig: {
+    mode: "full-access",
+    model: "gpt-5.4",
+    effort: "high",
+  },
+});
+```
+
+ACP 的 config 必须等 `session/new`、`session/load` 或 `session/resume` 返回后才能知道。因此 `initialConfig` 默认是 best-effort：当前 agent 不支持、改名或移除的 option/value 会被跳过并记录到 `session.initialConfigReport`，但 session 仍然会打开。
+
+`mode`、`model`、`effort` 是 runtime 级统一名称。runtime 会把它们映射到当前
+agent 暴露的 config option id/category，并通过 agent profile 补 value alias，所以 CLI
+不需要为 Codex / Claude 提供两套参数。
+
+只有在“配置没应用成功就不应该继续运行”时，才使用 `strict: true` 或单项 `required: true`：
+
+```ts
+await runtime.sessions.start({
+  agent: "claude-acp",
+  cwd,
+  initialConfig: {
+    model: { value: "opus", required: true },
+    effort: { value: "xhigh", aliases: ["max"] },
+  },
+});
+```
+
+### System Prompt
+
+宿主希望在 agent 开始工作前注入 session 级指令时，可以传 `systemPrompt`：
+
+```ts
+const session = await runtime.sessions.start({
+  agent: "claude-acp",
+  cwd,
+  systemPrompt: "用简洁、偏实现的方式回答。",
+});
+```
+
+`systemPrompt` 只在 `sessions.start()` 新建 runtime session 时应用。`load` /
+`resume` 会保留原 session 的指令；`sessions.load()` 和
+`sessions.resume()` 不接收 `systemPrompt` option，出现这个字段会抛
+`AcpSystemPromptError`。
+
+`systemPrompt` 不是 ACP 标准字段，所以 runtime 通过 agent profile 做兼容：
+
+- Claude ACP：在 `session/new` 的 `_meta.systemPrompt` 中传入。
+- Codex ACP：启动时追加 `-c developer_instructions=<prompt>`。
+- 不支持的 agent：直接抛 `AcpSystemPromptError`，不会静默忽略。
+
 ## Session 公共面
 
 `AcpRuntimeSession` 当前暴露：
 
 - `capabilities`
 - `metadata`
+- `initialConfigReport`
 - `diagnostics`
 - `status`
 - `session.agent.*`

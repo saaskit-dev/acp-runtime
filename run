@@ -11,7 +11,7 @@ shift
 case "$target" in
   runtime)
     if [[ $# -eq 0 ]]; then
-      echo 'usage: ./run runtime <agent-id> [--sessions] [--load SESSION_ID] [--resume SESSION_ID] [--resume-last] [--resume-snapshot SNAPSHOT.json] [--prompt TEXT] [--log-file PATH] [--no-log-file] [prompt...]' >&2
+      echo 'usage: ./run runtime <agent-id> [--sessions] [--load SESSION_ID] [--resume SESSION_ID] [--resume-last] [--mode ID] [--model ID] [--effort LEVEL] [--initial-config-strict] [--system-prompt TEXT] [--system-prompt-file PATH] [--prompt TEXT] [--log-file PATH] [--no-log-file] [prompt...]' >&2
       exit 2
     fi
 
@@ -44,12 +44,32 @@ case "$target" in
           shift
           runtime_args+=("--resume=${1:-}")
           ;;
-        --resume-snapshot=*)
+        --resume-snapshot|--resume-snapshot=*)
+          echo 'error: --resume-snapshot was removed; use --resume SESSION_ID or --resume-last' >&2
+          exit 2
+          ;;
+        --config|--config=*)
+          echo 'error: startup --config was removed; use --mode, --model, or --effort' >&2
+          exit 2
+          ;;
+        --mode=*|--model=*|--effort=*)
           runtime_args+=("$1")
           ;;
-        --resume-snapshot)
+        --mode|--model|--effort)
+          option="$1"
           shift
-          runtime_args+=("--resume-snapshot=${1:-}")
+          runtime_args+=("$option=${1:-}")
+          ;;
+        --initial-config-strict|--strict-initial-config)
+          runtime_args+=("$1")
+          ;;
+        --system-prompt=*|--system-prompt-file=*)
+          runtime_args+=("$1")
+          ;;
+        --system-prompt|--system-prompt-file)
+          option="$1"
+          shift
+          runtime_args+=("$option=${1:-}")
           ;;
         --prompt=*)
           prompt="${1#--prompt=}"
@@ -70,6 +90,9 @@ case "$target" in
         --no-log-file)
           log_file=""
           log_arg="--no-log-file"
+          ;;
+        --*)
+          echo "warning: ignoring unknown option: $1" >&2
           ;;
         *)
           if [[ -n "$prompt" ]]; then

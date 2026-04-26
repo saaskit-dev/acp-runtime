@@ -1,10 +1,13 @@
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 
-import { AcpAuthenticationError, AcpProtocolError } from "../core/errors.js";
+import {
+  AcpAuthenticationError,
+  AcpProtocolError,
+  AcpSystemPromptError,
+} from "../core/errors.js";
 import type { AcpSessionDriver, AcpSessionService } from "../core/session-driver.js";
 import type {
   AcpRuntimeAuthorityHandlers,
-  AcpRuntimeConfigValue,
   AcpRuntimeCreateOptions,
   AcpRuntimeListAgentSessionsOptions,
   AcpRuntimeLoadOptions,
@@ -12,6 +15,7 @@ import type {
   AcpRuntimeResumeOptions,
   AcpRuntimeSessionList,
 } from "../core/types.js";
+import type { AcpRuntimeAgent } from "../core/types.js";
 import { AcpClientBridge } from "./authority-bridge.js";
 import type {
   AcpClientInfo,
@@ -24,6 +28,7 @@ import { AcpSdkSessionDriver } from "./driver.js";
 import { emitRuntimeLog } from "../observability/logging.js";
 import { mergeTraceMeta, sessionAttributes, withSpan } from "../observability/tracing.js";
 import { resolveAcpAgentProfile } from "./profiles/index.js";
+import type { AcpAgentProfile } from "./profiles/profile.js";
 
 const DEFAULT_CLIENT_INFO = {
   name: "acp-runtime",
@@ -38,10 +43,14 @@ export function createAcpSessionService(
 ): AcpSessionService {
   return {
     async create(input: AcpRuntimeCreateOptions): Promise<AcpSessionDriver> {
+      const systemPrompt = prepareSystemPrompt({
+        agent: input.agent,
+        systemPrompt: input.systemPrompt,
+      });
       const bootstrap = await bootstrapAcpSession({
         connectionFactory,
         connectionOptions: options,
-        agent: input.agent,
+        agent: systemPrompt.agent,
         cwd: input.cwd,
         handlers: input.handlers,
         observability: getObservabilityOptions(input),
@@ -50,16 +59,16 @@ export function createAcpSessionService(
       const response = await bootstrap.connection.newSession(
         mergeTraceMeta(
           {
+            _meta: systemPrompt.sessionMeta,
             cwd: input.cwd,
             mcpServers: mapMcpServersToAcp(input.mcpServers ?? []),
           },
           getTraceContext(input),
         ),
       );
-      const profile = resolveAcpAgentProfile(input.agent);
 
       const driver = new AcpSdkSessionDriver(bootstrap.bridge, {
-        agent: input.agent,
+        agent: systemPrompt.agent,
         connection: bootstrap.connection,
         cwd: input.cwd,
         dispose: bootstrap.dispose,
@@ -67,7 +76,7 @@ export function createAcpSessionService(
         initializeResponse: bootstrap.initializeResponse,
         mcpServers: input.mcpServers ?? [],
         observability: getObservabilityOptions(input),
-        profile,
+        profile: systemPrompt.profile,
         queue: input.queue,
         response,
         sessionId: response.sessionId,
@@ -143,7 +152,6 @@ export function createAcpSessionService(
           getTraceContext(input),
         ),
       );
-      const profile = resolveAcpAgentProfile(input.agent);
 
       const driver = new AcpSdkSessionDriver(bootstrap.bridge, {
         agent: input.agent,
@@ -154,7 +162,7 @@ export function createAcpSessionService(
         initializeResponse: bootstrap.initializeResponse,
         mcpServers: input.mcpServers ?? [],
         observability: getObservabilityOptions(input),
-        profile,
+        profile: resolveAcpAgentProfile(input.agent),
         queue: input.queue,
         response,
         sessionId: input.sessionId,
@@ -190,7 +198,6 @@ export function createAcpSessionService(
           getTraceContext(input),
         ),
       );
-      const profile = resolveAcpAgentProfile(input.snapshot.agent);
 
       const driver = new AcpSdkSessionDriver(bootstrap.bridge, {
         agent: input.snapshot.agent,
@@ -201,28 +208,11 @@ export function createAcpSessionService(
         initializeResponse: bootstrap.initializeResponse,
         mcpServers: input.snapshot.mcpServers ?? [],
         observability: getObservabilityOptions(input),
-        profile,
+        profile: resolveAcpAgentProfile(input.snapshot.agent),
         queue: input.queue,
         response,
         sessionId: input.snapshot.session.id,
       });
-      try {
-        await applySnapshotMode(
-          bootstrap.connection,
-          input.snapshot.session.id,
-          input.snapshot.currentModeId,
-          getTraceContext(input),
-        );
-        await applySnapshotConfig(
-          bootstrap.connection,
-          input.snapshot.session.id,
-          input.snapshot.config,
-          getTraceContext(input),
-        );
-      } catch (error) {
-        await driver.close().catch(() => {});
-        throw error;
-      }
       return driver;
     },
   };
@@ -364,6 +354,45 @@ async function bootstrapAcpSession(input: {
   };
 }
 
+function prepareSystemPrompt(input: {
+  agent: AcpRuntimeAgent;
+  systemPrompt?: string | undefined;
+}): {
+  agent: AcpRuntimeAgent;
+  profile: AcpAgentProfile;
+  sessionMeta?: Record<string, unknown> | undefined;
+} {
+  const profile = resolveAcpAgentProfile(input.agent);
+  const systemPrompt = input.systemPrompt?.trim();
+  if (!systemPrompt) {
+    return {
+      agent: input.agent,
+      profile,
+    };
+  }
+
+  const agent =
+    profile.applySystemPromptToAgent?.({
+      agent: input.agent,
+      systemPrompt,
+    }) ?? input.agent;
+  const sessionMeta = profile.createSystemPromptSessionMeta?.({
+    systemPrompt,
+  });
+
+  if (agent === input.agent && !sessionMeta) {
+    throw new AcpSystemPromptError(
+      `ACP agent ${input.agent.type ?? input.agent.command} does not support systemPrompt.`,
+    );
+  }
+
+  return {
+    agent,
+    profile: resolveAcpAgentProfile(agent),
+    sessionMeta,
+  };
+}
+
 function getTraceContext(
   input: object,
 ): import("@opentelemetry/api").Context | undefined {
@@ -376,81 +405,4 @@ function getObservabilityOptions(
 ): AcpRuntimeObservabilityOptions | undefined {
   return (input as { _observability?: AcpRuntimeObservabilityOptions })
     ._observability;
-}
-
-async function applySnapshotConfig(
-  connection: import("./connection-types.js").AcpConnection,
-  sessionId: string,
-  config: Readonly<Record<string, AcpRuntimeConfigValue>> | undefined,
-  traceContext?: import("@opentelemetry/api").Context,
-): Promise<void> {
-  if (!config || Object.keys(config).length === 0) {
-    return;
-  }
-
-  if (!connection.setSessionConfigOption) {
-    throw new AcpProtocolError(
-      "ACP agent does not support restoring runtime config options.",
-    );
-  }
-
-  for (const [configId, value] of Object.entries(config)) {
-    if (typeof value === "boolean") {
-      await connection.setSessionConfigOption({
-        ...(mergeTraceMeta(
-          {
-            configId,
-            sessionId,
-            type: "boolean" as const,
-            value,
-          },
-          traceContext,
-        ) as {
-          configId: string;
-          sessionId: string;
-          type: "boolean";
-          value: boolean;
-        }),
-      });
-      continue;
-    }
-
-    await connection.setSessionConfigOption(
-      mergeTraceMeta(
-        {
-          configId,
-          sessionId,
-          value: String(value),
-        },
-        traceContext,
-      ),
-    );
-  }
-}
-
-async function applySnapshotMode(
-  connection: import("./connection-types.js").AcpConnection,
-  sessionId: string,
-  currentModeId: string | undefined,
-  traceContext?: import("@opentelemetry/api").Context,
-): Promise<void> {
-  if (!currentModeId) {
-    return;
-  }
-
-  if (!connection.setSessionMode) {
-    throw new AcpProtocolError(
-      "ACP agent does not support restoring runtime mode state.",
-    );
-  }
-
-  await connection.setSessionMode(
-    mergeTraceMeta(
-      {
-        modeId: currentModeId,
-        sessionId,
-      },
-      traceContext,
-    ),
-  );
 }

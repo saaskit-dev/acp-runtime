@@ -1048,20 +1048,55 @@ export type AcpRuntimeQueuePolicy = {
 
 export type AcpRuntimeQueuePolicyInput = Partial<AcpRuntimeQueuePolicy>;
 
+export type AcpRuntimeSystemPrompt = string;
+
+export type AcpRuntimeInitialConfigValue =
+  | AcpRuntimeConfigValue
+  | {
+      aliases?: readonly AcpRuntimeConfigValue[];
+      required?: boolean;
+      value: AcpRuntimeConfigValue;
+    };
+
+export type AcpRuntimeInitialConfig = {
+  mode?: string | { aliases?: readonly string[]; required?: boolean; value: string };
+  model?: AcpRuntimeInitialConfigValue;
+  effort?: AcpRuntimeInitialConfigValue;
+  strict?: boolean;
+};
+
+export type AcpRuntimeInitialConfigReportItem = {
+  appliedValue?: AcpRuntimeConfigValue;
+  key: string;
+  optionId?: string;
+  reason?: string;
+  requestedValue: AcpRuntimeConfigValue;
+  status: "applied" | "already-set" | "failed" | "skipped";
+};
+
+export type AcpRuntimeInitialConfigReport = {
+  items: readonly AcpRuntimeInitialConfigReportItem[];
+  ok: boolean;
+};
+
 export type AcpRuntimeCreateOptions = {
   agent: AcpRuntimeAgent;
   cwd: string;
   handlers?: AcpRuntimeAuthorityHandlers;
+  initialConfig?: AcpRuntimeInitialConfig;
   mcpServers?: readonly AcpRuntimeMcpServer[];
   queue?: AcpRuntimeQueuePolicyInput;
+  systemPrompt?: AcpRuntimeSystemPrompt;
 };
 
 export type AcpRuntimeStartSessionOptions = {
   agent: AcpRuntimeAgentInput;
   cwd: string;
   handlers?: AcpRuntimeAuthorityHandlers;
+  initialConfig?: AcpRuntimeInitialConfig;
   mcpServers?: readonly AcpRuntimeMcpServer[];
   queue?: AcpRuntimeQueuePolicyInput;
+  systemPrompt?: AcpRuntimeSystemPrompt;
 };
 
 export type AcpRuntimeListAgentSessionsOptions = {
@@ -1095,7 +1130,10 @@ export type AcpRuntimeOptions = {
   state?: AcpRuntimeStateOptions | false;
 };
 
-export type AcpRuntimeLoadOptions = AcpRuntimeCreateOptions & {
+export type AcpRuntimeLoadOptions = Omit<
+  AcpRuntimeCreateOptions,
+  "systemPrompt"
+> & {
   sessionId: string;
 };
 
@@ -1103,6 +1141,7 @@ export type AcpRuntimeLoadSessionOptions = {
   agent?: AcpRuntimeAgentInput;
   cwd?: string;
   handlers?: AcpRuntimeAuthorityHandlers;
+  initialConfig?: AcpRuntimeInitialConfig;
   mcpServers?: readonly AcpRuntimeMcpServer[];
   queue?: AcpRuntimeQueuePolicyInput;
   sessionId: string;
@@ -1110,6 +1149,7 @@ export type AcpRuntimeLoadSessionOptions = {
 
 export type AcpRuntimeResumeOptions = {
   handlers?: AcpRuntimeAuthorityHandlers;
+  initialConfig?: AcpRuntimeInitialConfig;
   queue?: AcpRuntimeQueuePolicyInput;
   snapshot: AcpRuntimeSnapshot;
 };

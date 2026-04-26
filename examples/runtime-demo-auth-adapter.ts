@@ -32,6 +32,7 @@ export async function promptForDemoAuthentication(
   },
 ): Promise<{ cancel: true } | { methodId: string }> {
   const method = await promptForAuthenticationMethod(
+    input.request.agent,
     input.inputCoordinator,
     input.request.methods,
   );
@@ -116,6 +117,9 @@ function resolveDemoAuthenticationSuccessPatterns(input: {
 }
 
 async function promptForAuthenticationMethod(
+  agent: Parameters<
+    NonNullable<AcpRuntimeAuthorityHandlers["authentication"]>
+  >[0]["agent"],
   inputCoordinator: DemoInputCoordinator,
   methods: readonly AcpRuntimeAuthenticationMethod[],
 ): Promise<AcpRuntimeAuthenticationMethod | undefined> {
@@ -125,6 +129,14 @@ async function promptForAuthenticationMethod(
 
   if (methods.length === 1) {
     return methods[0];
+  }
+
+  const defaultMethod = resolveDefaultAuthenticationMethod(agent, methods);
+  if (defaultMethod) {
+    console.log(
+      `[runtime] authentication default: ${defaultMethod.title} (${defaultMethod.id})`,
+    );
+    return defaultMethod;
   }
 
   while (true) {
@@ -158,6 +170,26 @@ async function promptForAuthenticationMethod(
 
     console.log(`Enter a number between 1 and ${methods.length}, or n.`);
   }
+}
+
+function resolveDefaultAuthenticationMethod(
+  agent: Parameters<
+    NonNullable<AcpRuntimeAuthorityHandlers["authentication"]>
+  >[0]["agent"],
+  methods: readonly AcpRuntimeAuthenticationMethod[],
+): AcpRuntimeAuthenticationMethod | undefined {
+  if (agent.type !== "codex-acp") {
+    return undefined;
+  }
+
+  return (
+    methods.find(
+      (method) =>
+        method.type === "agent" && /login|chatgpt/i.test(method.title),
+    ) ??
+    methods.find((method) => method.type === "agent") ??
+    methods[0]
+  );
 }
 
 async function runTerminalAuthentication(

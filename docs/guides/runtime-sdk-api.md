@@ -66,12 +66,72 @@ Passing an agent id keeps launch resolution inside the runtime instead of repeat
 Runtime-owned local state is enabled by default and stored at `~/.acp-runtime/state/runtime-session-registry.json`.
 Use `new AcpRuntime(factory, { state: { sessionRegistryPath } })` to override that path, or `{ state: false }` to disable local state.
 
+### Initial Config
+
+Use `initialConfig` when a host wants a preferred mode/model/reasoning preset immediately after the ACP session is opened:
+
+```ts
+const session = await runtime.sessions.start({
+  agent: "codex-acp",
+  cwd: process.cwd(),
+  initialConfig: {
+    mode: "full-access",
+    model: "gpt-5.4",
+    effort: "high",
+  },
+});
+```
+
+ACP config is discovered only after `session/new`, `session/load`, or `session/resume`. For that reason `initialConfig` is best-effort by default: unsupported or renamed options are skipped and recorded in `session.initialConfigReport`, but the session still opens.
+
+`mode`, `model`, and `effort` are runtime-level names. The runtime
+maps them to the current agent's exposed config option IDs/categories and
+profile-specific value aliases, so hosts do not need separate CLI flags for
+Codex vs. Claude.
+
+Use `strict: true` or per-item `required: true` only when failing startup is better than running with a different agent config:
+
+```ts
+await runtime.sessions.start({
+  agent: "claude-acp",
+  cwd,
+  initialConfig: {
+    model: { value: "opus", required: true },
+    effort: { value: "xhigh", aliases: ["max"] },
+  },
+});
+```
+
+### System Prompt
+
+Use `systemPrompt` when a host wants to apply session-level instructions before the agent starts work:
+
+```ts
+const session = await runtime.sessions.start({
+  agent: "claude-acp",
+  cwd,
+  systemPrompt: "Answer in terse, implementation-focused language.",
+});
+```
+
+`systemPrompt` is only applied when creating a new runtime session with
+`sessions.start()`. Loading or resuming an existing session keeps the session's
+original instructions; `sessions.load()` and `sessions.resume()` do not accept
+a `systemPrompt` option and reject it with `AcpSystemPromptError`.
+
+`systemPrompt` is not an ACP-standard field, so the runtime applies it through agent profiles:
+
+- Claude ACP receives `_meta.systemPrompt` on `session/new`.
+- Codex ACP is launched with `-c developer_instructions=<prompt>`.
+- Unsupported agents reject startup with `AcpSystemPromptError` instead of silently ignoring the prompt.
+
 ## Session Surface
 
 `AcpRuntimeSession` exposes:
 
 - `capabilities`
 - `metadata`
+- `initialConfigReport`
 - `diagnostics`
 - `status`
 - `session.agent.*`

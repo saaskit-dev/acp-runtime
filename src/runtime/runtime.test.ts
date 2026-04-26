@@ -7,12 +7,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ACP_RUNTIME_SNAPSHOT_VERSION } from "./core/constants.js";
 import {
   AcpCreateError,
+  AcpInitialConfigError,
   AcpListError,
   AcpLoadError,
   AcpPermissionDeniedError,
   AcpProtocolError,
   AcpResumeError,
   AcpRuntime,
+  AcpSystemPromptError,
   AcpTurnCancelledError,
   AcpTurnWithdrawnError,
 } from "./index.js";
@@ -1058,6 +1060,189 @@ describe("AcpRuntime public SDK", () => {
     });
   });
 
+  it("applies supported initial config after session startup", async () => {
+    const snapshot = createSnapshot();
+    const backend = new SpySessionBackend(snapshot, () => []);
+    const runtime = createTestRuntime({
+      async create() {
+        return backend;
+      },
+    });
+
+    const session = await runtime.sessions.start({
+      agent: { command: "mock-agent" },
+      cwd: "/tmp/project",
+      initialConfig: {
+        mode: "plan",
+        model: "opus",
+      },
+    });
+
+    expect(backend.agentModeCalls).toEqual(["plan"]);
+    expect(backend.agentConfigOptionCalls).toEqual([
+      { id: "model", value: "opus" },
+    ]);
+    expect(session.initialConfigReport).toEqual({
+      items: [
+        {
+          appliedValue: "plan",
+          key: "mode",
+          optionId: "currentModeId",
+          requestedValue: "plan",
+          status: "applied",
+        },
+        {
+          appliedValue: "opus",
+          key: "model",
+          optionId: "model",
+          requestedValue: "opus",
+          status: "applied",
+        },
+      ],
+      ok: true,
+    });
+    expect(session.metadata.currentModeId).toBe("plan");
+    expect(session.metadata.config?.model).toBe("opus");
+  });
+
+  it("adapts initial model and reasoning aliases through agent profiles", async () => {
+    const snapshot = createSnapshot({
+      agent: {
+        command: "claude-agent-acp",
+        type: "claude-acp",
+      },
+      config: {
+        effort: "medium",
+        model: "sonnet",
+      },
+    });
+    const backend = new SpySessionBackend(snapshot, () => []);
+    backend.metadata.agentConfigOptions = [
+      {
+        category: "model",
+        id: "model",
+        name: "Model",
+        options: [
+          { name: "Sonnet", value: "sonnet" },
+          { name: "Opus", value: "opus" },
+        ],
+        type: "select",
+        value: "sonnet",
+      },
+      {
+        category: "effort",
+        id: "effort",
+        name: "Effort",
+        options: [
+          { name: "Medium", value: "medium" },
+          { name: "Max", value: "max" },
+        ],
+        type: "select",
+        value: "medium",
+      },
+    ];
+    const runtime = createTestRuntime({
+      async create() {
+        return backend;
+      },
+    });
+
+    const session = await runtime.sessions.start({
+      agent: {
+        command: "claude-agent-acp",
+        type: "claude-acp",
+      },
+      cwd: "/tmp/project",
+      initialConfig: {
+        model: "opus",
+        effort: "xhigh",
+      },
+    });
+
+    expect(backend.agentConfigOptionCalls).toEqual([
+      { id: "model", value: "opus" },
+      { id: "effort", value: "max" },
+    ]);
+    expect(session.initialConfigReport?.items).toMatchObject([
+      {
+        appliedValue: "opus",
+        key: "model",
+        optionId: "model",
+        requestedValue: "opus",
+        status: "applied",
+      },
+      {
+        appliedValue: "max",
+        key: "effort",
+        optionId: "effort",
+        requestedValue: "xhigh",
+        status: "applied",
+      },
+    ]);
+  });
+
+  it("keeps sessions usable when best-effort initial config drifts", async () => {
+    const snapshot = createSnapshot();
+    const backend = new SpySessionBackend(snapshot, () => []);
+    const runtime = createTestRuntime({
+      async create() {
+        return backend;
+      },
+    });
+
+    const session = await runtime.sessions.start({
+      agent: { command: "mock-agent" },
+      cwd: "/tmp/project",
+      initialConfig: {
+        mode: "removed-mode",
+        model: "removed-model",
+      },
+    });
+
+    expect(backend.status).toBe("ready");
+    expect(backend.agentModeCalls).toEqual([]);
+    expect(backend.agentConfigOptionCalls).toEqual([]);
+    expect(session.initialConfigReport?.ok).toBe(false);
+    expect(session.initialConfigReport?.items).toEqual([
+      {
+        key: "mode",
+        reason: "Requested mode is not available.",
+        requestedValue: "removed-mode",
+        status: "skipped",
+      },
+      {
+        key: "model",
+        optionId: "model",
+        reason:
+          "Requested value is not supported by the current ACP agent config.",
+        requestedValue: "removed-model",
+        status: "skipped",
+      },
+    ]);
+  });
+
+  it("fails and closes newly created sessions for strict initial config drift", async () => {
+    const snapshot = createSnapshot();
+    const backend = new SpySessionBackend(snapshot, () => []);
+    const runtime = createTestRuntime({
+      async create() {
+        return backend;
+      },
+    });
+
+    await expect(
+      runtime.sessions.start({
+        agent: { command: "mock-agent" },
+        cwd: "/tmp/project",
+        initialConfig: {
+          model: "removed-model",
+          strict: true,
+        },
+      }),
+    ).rejects.toBeInstanceOf(AcpInitialConfigError);
+    expect(backend.status).toBe("closed");
+  });
+
   it("forwards create, load, and resume options to the implementation", async () => {
     const createSnapshotValue = createSnapshot({
       session: { id: "session-create" },
@@ -1833,6 +2018,28 @@ describe("AcpRuntime public SDK", () => {
     expect(backend.status).toBe("closed");
   });
 
+  it("rejects systemPrompt on load because the option is not accepted", async () => {
+    let loadCalls = 0;
+    const runtime = createTestRuntime({
+      async load() {
+        loadCalls += 1;
+        throw new Error("should not load");
+      },
+    });
+
+    await expect(
+      runtime.sessions.load({
+        agent: { command: "mock-agent" },
+        cwd: "/tmp/project",
+        sessionId: "session-1",
+        systemPrompt: "not allowed",
+      } as Parameters<typeof runtime.sessions.load>[0] & {
+        systemPrompt: string;
+      }),
+    ).rejects.toBeInstanceOf(AcpSystemPromptError);
+    expect(loadCalls).toBe(0);
+  });
+
   it("waits for an in-flight close before reopening the same session id", async () => {
     const snapshot = createSnapshot();
     let resolveClose: (() => void) | undefined;
@@ -1919,6 +2126,28 @@ describe("AcpRuntime public SDK", () => {
     expect(backend.status).toBe("ready");
     await second.close();
     expect(backend.status).toBe("closed");
+  });
+
+  it("rejects systemPrompt on resume because the option is not accepted", async () => {
+    let resumeCalls = 0;
+    const runtime = createTestRuntime({
+      async resume() {
+        resumeCalls += 1;
+        throw new Error("should not resume");
+      },
+    });
+
+    await expect(
+      runtime.sessions.resume({
+        agent: { command: "mock-agent" },
+        cwd: "/tmp/project",
+        sessionId: "session-1",
+        systemPrompt: "not allowed",
+      } as Parameters<typeof runtime.sessions.resume>[0] & {
+        systemPrompt: string;
+      }),
+    ).rejects.toBeInstanceOf(AcpSystemPromptError);
+    expect(resumeCalls).toBe(0);
   });
 
   it("deduplicates concurrent load and resume calls for the same session id", async () => {

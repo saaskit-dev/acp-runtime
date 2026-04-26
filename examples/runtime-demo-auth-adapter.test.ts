@@ -1,6 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { createInterface } from "node:readline/promises";
+import { PassThrough } from "node:stream";
+import { describe, expect, it, vi } from "vitest";
 
-import { resolveDemoTerminalAuthenticationRequest } from "./runtime-demo-auth-adapter.js";
+import {
+  promptForDemoAuthentication,
+  resolveDemoTerminalAuthenticationRequest,
+} from "./runtime-demo-auth-adapter.js";
+
+const createSilentLogSink = () => ({
+  attachSession: async () => {},
+  close: async () => {},
+  emit: vi.fn(),
+  writeLine: vi.fn(),
+});
 
 describe("runtime demo auth adapter", () => {
   it("adds Claude host-side login success patterns", () => {
@@ -50,5 +62,53 @@ describe("runtime demo auth adapter", () => {
       "Login successful",
       "Type your message",
     ]);
+  });
+
+  it("defaults Codex authentication to the ChatGPT login agent method", async () => {
+    const promptExclusive = vi.fn(async () => {
+      throw new Error("should not prompt");
+    });
+    const renderer = { writeLine: vi.fn() };
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const rl = createInterface({ input, output });
+
+    try {
+      const result = await promptForDemoAuthentication({
+        inputCoordinator: {
+          close: vi.fn(),
+          nextUserInput: vi.fn(async () => ""),
+          promptExclusive,
+        },
+        logSink: createSilentLogSink(),
+        renderer,
+        request: {
+          agent: {
+            command: "codex-acp",
+            type: "codex-acp",
+          },
+          methods: [
+            {
+              description: "Use your ChatGPT login with Codex CLI.",
+              id: "chatgpt-login",
+              title: "Login with ChatGPT",
+              type: "agent",
+            },
+            {
+              id: "codex-api-key",
+              title: "Use CODEX_API_KEY",
+              type: "env_var",
+              vars: [{ name: "CODEX_API_KEY" }],
+            },
+          ],
+        },
+        rl,
+      });
+
+      expect(result).toEqual({ methodId: "chatgpt-login" });
+      expect(promptExclusive).not.toHaveBeenCalled();
+    } finally {
+      rl.close();
+    }
   });
 });

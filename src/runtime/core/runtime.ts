@@ -4,6 +4,7 @@ import {
   AcpListError,
   AcpLoadError,
   AcpResumeError,
+  AcpSystemPromptError,
 } from "./errors.js";
 import { resolveRuntimeAgentFromRegistry } from "../registry/agent-resolver.js";
 import { AcpRuntimeSession } from "./session.js";
@@ -14,6 +15,7 @@ import {
   type AcpSessionServiceOptions,
 } from "../acp/session-service.js";
 import { SingleFlight } from "./concurrency.js";
+import { applyRuntimeInitialConfig } from "./initial-config.js";
 import type { AcpConnectionFactory } from "../acp/connection-types.js";
 import { resolveRuntimeHomePath } from "../paths.js";
 import { AcpRuntimeSessionRegistry } from "../registry/session-registry.js";
@@ -22,6 +24,8 @@ import type {
   AcpRuntimeAgent,
   AcpRuntimeAgentInput,
   AcpRuntimeCreateOptions,
+  AcpRuntimeInitialConfig,
+  AcpRuntimeInitialConfigReport,
   AcpRuntimeListAgentSessionsOptions,
   AcpRuntimeListSessionsOptions,
   AcpRuntimeLoadOptions,
@@ -93,6 +97,7 @@ export class AcpRuntime {
   private async loadSessionFromInput(
     options: AcpRuntimeLoadSessionOptions,
   ): Promise<AcpRuntimeSession> {
+    assertNoSystemPromptForSessionOpen(options, "load");
     const resolved = await this.resolveSessionOpenOptions(options);
     return this.loadSession({
       ...resolved,
@@ -103,6 +108,7 @@ export class AcpRuntime {
   private async resumeSessionFromInput(
     options: AcpRuntimeResumeSessionOptions,
   ): Promise<AcpRuntimeSession> {
+    assertNoSystemPromptForSessionOpen(options, "resume");
     const resolved = await this.resolveSessionOpenOptions(options);
     const storedSnapshot = await this.getStoredSnapshot(options.sessionId);
     const snapshot: AcpRuntimeSnapshot = {
@@ -118,6 +124,7 @@ export class AcpRuntime {
     };
     return this.resumeSession({
       handlers: options.handlers,
+      initialConfig: options.initialConfig,
       queue: options.queue,
       snapshot,
     });
@@ -143,6 +150,18 @@ export class AcpRuntime {
             _observability: this.options.observability,
             _traceContext: spanContext,
           } as AcpRuntimeCreateOptions);
+          let initialConfigReport:
+            | AcpRuntimeInitialConfigReport
+            | undefined;
+          try {
+            initialConfigReport = await applyRuntimeInitialConfig(
+              driver,
+              options.initialConfig,
+            );
+          } catch (error) {
+            await driver.close().catch(() => {});
+            throw error;
+          }
           const sessionId = driver.snapshot().session.id;
           span.setAttribute("acp.session.id", sessionId);
           emitRuntimeLog({
@@ -156,7 +175,7 @@ export class AcpRuntime {
             context: spanContext,
             eventName: "acp.session.start",
           });
-          return await this.registerManagedSession(driver);
+          return await this.registerManagedSession(driver, initialConfigReport);
         } catch (error) {
           emitRuntimeLog({
             attributes: sessionAttributes({
@@ -215,7 +234,11 @@ export class AcpRuntime {
             if (options.queue) {
               existing.driver.setQueuePolicy(options.queue);
             }
-            return this.acquireSessionHandle(existing);
+            const initialConfigReport = await this.applyInitialConfigForOpen(
+              existing,
+              options.initialConfig,
+            );
+            return this.acquireSessionHandle(existing, initialConfigReport);
           }
 
           const pending = this.pendingOpens.do(options.sessionId, async () => {
@@ -241,6 +264,10 @@ export class AcpRuntime {
           if (options.queue) {
             entry.driver.setQueuePolicy(options.queue);
           }
+          const initialConfigReport = await this.applyInitialConfigForOpen(
+            entry,
+            options.initialConfig,
+          );
           span.setAttribute("acp.session.id", entry.sessionId);
           emitRuntimeLog({
             attributes: sessionAttributes({
@@ -254,7 +281,7 @@ export class AcpRuntime {
             context: spanContext,
             eventName: "acp.session.load",
           });
-          return this.acquireSessionHandle(entry);
+          return this.acquireSessionHandle(entry, initialConfigReport);
         } catch (error) {
           emitRuntimeLog({
             attributes: sessionAttributes({
@@ -436,7 +463,11 @@ export class AcpRuntime {
             if (options.queue) {
               existing.driver.setQueuePolicy(options.queue);
             }
-            return this.acquireSessionHandle(existing);
+            const initialConfigReport = await this.applyInitialConfigForOpen(
+              existing,
+              options.initialConfig,
+            );
+            return this.acquireSessionHandle(existing, initialConfigReport);
           }
 
           const pending = this.pendingOpens.do(sessionId, async () => {
@@ -462,6 +493,10 @@ export class AcpRuntime {
           if (options.queue) {
             entry.driver.setQueuePolicy(options.queue);
           }
+          const initialConfigReport = await this.applyInitialConfigForOpen(
+            entry,
+            options.initialConfig,
+          );
           span.setAttribute("acp.session.id", entry.sessionId);
           emitRuntimeLog({
             attributes: sessionAttributes({
@@ -475,7 +510,7 @@ export class AcpRuntime {
             context: spanContext,
             eventName: "acp.session.resume",
           });
-          return this.acquireSessionHandle(entry);
+          return this.acquireSessionHandle(entry, initialConfigReport);
         } catch (error) {
           emitRuntimeLog({
             attributes: sessionAttributes({
@@ -511,9 +546,10 @@ export class AcpRuntime {
 
   private async registerManagedSession(
     driver: AcpSessionDriver,
+    initialConfigReport?: AcpRuntimeInitialConfigReport | undefined,
   ): Promise<AcpRuntimeSession> {
     const entry = await this.registerManagedSessionEntry(driver);
-    return this.acquireSessionHandle(entry);
+    return this.acquireSessionHandle(entry, initialConfigReport);
   }
 
   private async registerManagedSessionEntry(
@@ -547,13 +583,20 @@ export class AcpRuntime {
     return entry;
   }
 
-  private acquireSessionHandle(entry: ManagedSessionEntry): AcpRuntimeSession {
+  private acquireSessionHandle(
+    entry: ManagedSessionEntry,
+    initialConfigReport?: AcpRuntimeInitialConfigReport | undefined,
+  ): AcpRuntimeSession {
     entry.refCount += 1;
-    return this.createSession(entry);
+    return this.createSession(entry, initialConfigReport);
   }
 
-  private createSession(entry: ManagedSessionEntry): AcpRuntimeSession {
+  private createSession(
+    entry: ManagedSessionEntry,
+    initialConfigReport?: AcpRuntimeInitialConfigReport | undefined,
+  ): AcpRuntimeSession {
     return new AcpRuntimeSession(entry.driver, {
+      initialConfigReport,
       onClose: async () => {
         await this.releaseSession(entry.sessionId, entry.driver);
       },
@@ -561,6 +604,21 @@ export class AcpRuntime {
         await this.sessionRegistry?.rememberSnapshot(snapshot);
       },
     });
+  }
+
+  private async applyInitialConfigForOpen(
+    entry: ManagedSessionEntry,
+    initialConfig: AcpRuntimeInitialConfig | undefined,
+  ): Promise<AcpRuntimeInitialConfigReport | undefined> {
+    try {
+      return await applyRuntimeInitialConfig(entry.driver, initialConfig);
+    } catch (error) {
+      if (entry.refCount === 0 && this.activeSessions.get(entry.sessionId) === entry) {
+        this.activeSessions.delete(entry.sessionId);
+        await entry.driver.close().catch(() => {});
+      }
+      throw error;
+    }
   }
 
   private async releaseSession(
@@ -622,6 +680,7 @@ export class AcpRuntime {
       agent,
       cwd,
       handlers: options.handlers,
+      initialConfig: options.initialConfig,
       mcpServers: options.mcpServers ?? storedSnapshot?.mcpServers,
       queue: options.queue,
     };
@@ -677,4 +736,18 @@ function createSessionRegistry(
         resolveRuntimeHomePath("state", "runtime-session-registry.json"),
     ),
   });
+}
+
+function assertNoSystemPromptForSessionOpen(
+  options: object,
+  action: "load" | "resume",
+): void {
+  if (
+    Object.prototype.hasOwnProperty.call(options, "systemPrompt") &&
+    (options as { systemPrompt?: unknown }).systemPrompt !== undefined
+  ) {
+    throw new AcpSystemPromptError(
+      `sessions.${action}() does not accept option "systemPrompt". Use sessions.start() to create a new session with a system prompt.`,
+    );
+  }
 }

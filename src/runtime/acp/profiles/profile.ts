@@ -8,12 +8,35 @@ import type {
 import type {
   AcpRuntimeOperation,
   AcpRuntimeOperationKind,
+  AcpRuntimeConfigValue,
   AcpRuntimeSessionMetadata,
+  AcpRuntimeSystemPrompt,
 } from "../../core/types.js";
 import type { AcpRuntimeAgent } from "../../core/types.js";
 import type { AcpRuntimeTurnState } from "../turn-state.js";
 
+export type AcpRuntimeInitialConfigKey = "mode" | "model" | "effort";
+
+export type AcpRuntimeInitialConfigOptionSelector = {
+  categories: readonly string[];
+  ids: readonly string[];
+};
+
 export type AcpAgentProfile = {
+  applySystemPromptToAgent?(input: {
+    agent: AcpRuntimeAgent;
+    systemPrompt: AcpRuntimeSystemPrompt;
+  }): AcpRuntimeAgent;
+  createSystemPromptSessionMeta?(input: {
+    systemPrompt: AcpRuntimeSystemPrompt;
+  }): Record<string, unknown> | undefined;
+  createInitialConfigAliases?(input: {
+    key: AcpRuntimeInitialConfigKey;
+    value: AcpRuntimeConfigValue;
+  }): readonly AcpRuntimeConfigValue[];
+  createInitialConfigOptionSelector?(input: {
+    key: AcpRuntimeInitialConfigKey;
+  }): AcpRuntimeInitialConfigOptionSelector;
   inferDeniedOperationFamily(input: {
     metadata: AcpRuntimeSessionMetadata;
     operation: AcpRuntimeOperation;
@@ -47,6 +70,12 @@ export function createAgentProfile(
   overrides: AgentProfileOverrides,
 ): AcpAgentProfile {
   return {
+    applySystemPromptToAgent: overrides.applySystemPromptToAgent,
+    createSystemPromptSessionMeta: overrides.createSystemPromptSessionMeta,
+    createInitialConfigAliases: overrides.createInitialConfigAliases,
+    createInitialConfigOptionSelector:
+      overrides.createInitialConfigOptionSelector ??
+      createInitialConfigOptionSelector,
     inferDeniedOperationFamily:
       overrides.inferDeniedOperationFamily ?? inferDeniedOperationFamily,
     inferOperationTarget: overrides.inferOperationTarget ?? inferOperationTarget,
@@ -56,6 +85,28 @@ export function createAgentProfile(
     normalizePromptError:
       overrides.normalizePromptError ?? normalizePromptError,
   };
+}
+
+function createInitialConfigOptionSelector(input: {
+  key: AcpRuntimeInitialConfigKey;
+}): AcpRuntimeInitialConfigOptionSelector {
+  switch (input.key) {
+    case "mode":
+      return {
+        categories: ["mode"],
+        ids: ["mode"],
+      };
+    case "model":
+      return {
+        categories: ["model"],
+        ids: ["model"],
+      };
+    case "effort":
+      return {
+        categories: ["effort", "thought_level"],
+        ids: ["effort", "reasoning_effort"],
+      };
+  }
 }
 
 function inferDeniedOperationFamily(_input: {

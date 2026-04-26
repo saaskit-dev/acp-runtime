@@ -76,6 +76,79 @@ function collectEvents(): {
 }
 
 describe("AcpRuntime x simulator-agent ACP", () => {
+  it("restores persisted start config through real load and resume opens", async () => {
+    const cliPath = resolveBuiltSimulatorWorkspaceCliPath();
+    const { projectDir, storageDir } = await createTestDirs();
+    const sessionRegistryPath = join(storageDir, "runtime-session-registry.json");
+    const agent = {
+      args: [cliPath, "--storage-dir", storageDir],
+      command: process.execPath,
+      type: SIMULATOR_AGENT_ACP_REGISTRY_ID,
+    };
+    const handlers = createAuthorityHandlers();
+    const runtime = new AcpRuntime(createStdioAcpConnectionFactory(), {
+      state: {
+        sessionRegistryPath,
+      },
+    });
+
+    const started = await runtime.sessions.start({
+      agent,
+      cwd: projectDir,
+      handlers,
+      initialConfig: {
+        mode: "yolo",
+        model: "claude",
+        effort: "high",
+      },
+    });
+    const sessionId = started.metadata.id;
+    expect(started.metadata.currentModeId).toBe("yolo");
+    expect(started.metadata.config).toMatchObject({
+      "approval-policy": "yolo",
+      model: "claude",
+      reasoning: "high",
+    });
+
+    const loadRuntime = new AcpRuntime(createStdioAcpConnectionFactory(), {
+      state: {
+        sessionRegistryPath,
+      },
+    });
+    const loaded = await loadRuntime.sessions.load({
+      agent,
+      cwd: projectDir,
+      handlers,
+      sessionId,
+    });
+    expect(loaded.metadata.currentModeId).toBe("yolo");
+    expect(loaded.metadata.config).toMatchObject({
+      "approval-policy": "yolo",
+      model: "claude",
+      reasoning: "high",
+    });
+
+    const resumeRuntime = new AcpRuntime(createStdioAcpConnectionFactory(), {
+      state: {
+        sessionRegistryPath,
+      },
+    });
+    const resumed = await resumeRuntime.sessions.resume({
+      handlers,
+      sessionId,
+    });
+    expect(resumed.metadata.currentModeId).toBe("yolo");
+    expect(resumed.metadata.config).toMatchObject({
+      "approval-policy": "yolo",
+      model: "claude",
+      reasoning: "high",
+    });
+
+    await resumed.close();
+    await loaded.close().catch(() => {});
+    await started.close().catch(() => {});
+  });
+
   it("creates, configures, snapshots, and resumes simulator sessions through the runtime", async () => {
     const cliPath = resolveBuiltSimulatorWorkspaceCliPath();
     const { projectDir, storageDir } = await createTestDirs();
