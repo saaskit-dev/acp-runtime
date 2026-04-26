@@ -312,12 +312,25 @@ describe("SimulatorAgentAcp", () => {
     });
     expect(readResponse.stopReason).toBe("end_turn");
 
+    const relativeReadResponse = await clientConnection.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "Read ./README.md and tell me the first heading." }],
+    });
+    expect(relativeReadResponse.stopReason).toBe("end_turn");
+
     const writeResponse = await clientConnection.prompt({
       sessionId: session.sessionId,
       prompt: [{ type: "text", text: "/write /tmp/project/notes.txt reference text" }],
     });
     expect(writeResponse.stopReason).toBe("end_turn");
     expect(memoryClient.files.get("/tmp/project/notes.txt")).toBe("reference text");
+
+    const relativeWriteResponse = await clientConnection.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "Create ./.tmp/tmp-output.txt containing the word READY." }],
+    });
+    expect(relativeWriteResponse.stopReason).toBe("end_turn");
+    expect(memoryClient.files.get("/tmp/project/.tmp/tmp-output.txt")).toBe("READY");
 
     const runResponse = await clientConnection.prompt({
       sessionId: session.sessionId,

@@ -1,5 +1,5 @@
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 import { isAbsolute } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -203,6 +203,10 @@ function ensureAbsolutePath(pathValue: string, fieldName: string): void {
   if (!isAbsolute(pathValue)) {
     throw RequestError.invalidParams({ field: fieldName }, `${fieldName} must be an absolute path`);
   }
+}
+
+function resolveSessionPath(session: StoredSession, pathValue: string): string {
+  return isAbsolute(pathValue) ? pathValue : resolvePath(session.cwd, pathValue);
 }
 
 function ensureAdditionalDirectories(paths: string[] | undefined): string[] {
@@ -528,14 +532,25 @@ function detectPromptAction(text: string): PromptAction {
     return { type: "rename", title: renameSessionMatch[1].trim() };
   }
 
-  const readMatch = trimmed.match(/^(?:read|open|show|cat)\s+([/~A-Za-z0-9._/-]+)$/i);
-  if (readMatch && readMatch[1].startsWith("/")) {
+  const readMatch = trimmed.match(/\b(?:read|open|show|cat)\s+((?:\/|\.{1,2}\/)[A-Za-z0-9._/-]+)\b/i);
+  if (readMatch) {
     return { type: "read", path: readMatch[1] };
   }
 
   const writeMatch = trimmed.match(/^(?:write|save)\s+([/~A-Za-z0-9._/-]+)\s*[:\-]?\s+(.+)$/i);
-  if (writeMatch && writeMatch[1].startsWith("/")) {
+  if (writeMatch && (writeMatch[1].startsWith("/") || writeMatch[1].startsWith("./") || writeMatch[1].startsWith("../"))) {
     return { type: "write", path: writeMatch[1], content: writeMatch[2] };
+  }
+
+  const createFileMatch = trimmed.match(
+    /\b(?:create|write|save)\s+((?:\/|\.{1,2}\/)[A-Za-z0-9._/-]+)\s+(?:containing|with|as)\s+(?:the\s+word\s+)?["'`]?([^."'`]+)["'`]?/i,
+  );
+  if (createFileMatch) {
+    return {
+      type: "write",
+      path: createFileMatch[1],
+      content: createFileMatch[2].trim(),
+    };
   }
 
   const scenarioMatch = trimmed.match(
@@ -1937,6 +1952,7 @@ export class SimulatorAgentAcp implements Agent {
     pathValue: string,
   ): Promise<{ content: string; summary: string }> {
     this.ensureToolCapability("fs/read_text_file", Boolean(this.clientCapabilities?.fs?.readTextFile));
+    pathValue = resolveSessionPath(session, pathValue);
     ensureAbsolutePath(pathValue, "path");
 
     await this.emitToolCall(session, faultState, {
@@ -2019,6 +2035,7 @@ export class SimulatorAgentAcp implements Agent {
     if (!this.canMutate(session)) {
       return `Current mode ${this.currentPermissionMode(session)} blocks file edits. Switch to accept-edits or yolo.`;
     }
+    pathValue = resolveSessionPath(session, pathValue);
     ensureAbsolutePath(pathValue, "path");
 
     let oldText: string | undefined;
@@ -2209,7 +2226,7 @@ export class SimulatorAgentAcp implements Agent {
     action: Extract<PromptAction, { type: "scenario" }>,
     planContents: string[] | null,
   ): Promise<string> {
-    const pathValue = action.path;
+    const pathValue = resolveSessionPath(session, action.path);
     ensureAbsolutePath(pathValue, "path");
 
     const commandText = action.command?.trim() || "git status";
