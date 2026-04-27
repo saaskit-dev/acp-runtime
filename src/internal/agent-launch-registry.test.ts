@@ -88,6 +88,105 @@ describe("agent launch registry", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("resolves short aliases through the same registry path", async () => {
+    mockStat.mockResolvedValueOnce({
+      mtimeMs: Date.now(),
+    });
+    mockReadFile.mockResolvedValueOnce(JSON.stringify({
+      agents: [
+        {
+          description: "GitHub Copilot",
+          distribution: {
+            npx: {
+              args: ["--acp"],
+              package: "@github/copilot@1.0.36",
+            },
+          },
+          id: "github-copilot-cli",
+          name: "GitHub Copilot",
+          version: "1.0.36",
+        },
+      ],
+      version: "1",
+    }));
+
+    const {
+      resolveAgentLaunch,
+      resolveAgentRegistryId,
+    } = await import("./agent-launch-registry.js");
+
+    expect(resolveAgentRegistryId("copilot")).toBe("github-copilot-cli");
+    expect(await resolveAgentLaunch("copilot")).toEqual({
+      args: [
+        "--yes",
+        "-p",
+        "@github/copilot@1.0.36",
+        "copilot",
+        "--acp",
+      ],
+      command: "npx",
+      env: undefined,
+    });
+  });
+
+  it("returns canonical agent types from runtime registry aliases", async () => {
+    mockStat.mockResolvedValueOnce({
+      mtimeMs: Date.now(),
+    });
+    mockReadFile.mockResolvedValueOnce(JSON.stringify({
+      agents: [
+        {
+          description: "GitHub Copilot",
+          distribution: {
+            npx: {
+              args: ["--acp"],
+              package: "@github/copilot@1.0.36",
+            },
+          },
+          id: "github-copilot-cli",
+          name: "GitHub Copilot",
+          version: "1.0.36",
+        },
+      ],
+      version: "1",
+    }));
+
+    const { resolveRuntimeAgentFromRegistry } = await import(
+      "../runtime/registry/agent-resolver.js"
+    );
+
+    await expect(resolveRuntimeAgentFromRegistry("copilot")).resolves.toEqual({
+      args: [
+        "--yes",
+        "-p",
+        "@github/copilot@1.0.36",
+        "copilot",
+        "--acp",
+      ],
+      command: "npx",
+      env: undefined,
+      type: "github-copilot-cli",
+    });
+  });
+
+  it("resolves local simulator aliases without hitting the ACP registry", async () => {
+    const {
+      LOCAL_SIMULATOR_AGENT_ID,
+      getAgentMeta,
+      resolveAgentLaunch,
+      resolveAgentRegistryId,
+    } = await import("./agent-launch-registry.js");
+
+    expect(resolveAgentRegistryId("sim")).toBe(LOCAL_SIMULATOR_AGENT_ID);
+    expect(await getAgentMeta("simulator")).toMatchObject({
+      name: "Simulator Agent ACP (Local)",
+    });
+    expect(await resolveAgentLaunch("sim")).toMatchObject({
+      command: process.execPath,
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("resolves Codex ACP npx launch config from cached registry metadata", async () => {
     mockStat.mockResolvedValueOnce({
       mtimeMs: Date.now(),

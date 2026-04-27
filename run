@@ -8,10 +8,41 @@ fi
 target="$1"
 shift
 
+list_agents() {
+  registry_url="https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"
+
+  if command -v jq >/dev/null 2>&1 && registry_json="$(curl -fsSL "$registry_url" 2>/dev/null)"; then
+    printf '%s\n' "$registry_json" \
+      | jq -r '.agents[] | [.id, .name, .version] | @tsv'
+    return
+  fi
+
+  node -e '
+const registryUrl = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
+const response = await fetch(registryUrl);
+if (!response.ok) {
+  throw new Error(`Failed to fetch ACP registry: ${response.status} ${response.statusText}`);
+}
+const registry = await response.json();
+for (const agent of registry.agents ?? []) {
+  console.log(`${agent.id}\t${agent.name}\t${agent.version}`);
+}
+'
+}
+
 case "$target" in
+  agents)
+    list_agents
+    ;;
   runtime)
+    if [[ $# -gt 0 && "$1" == "--list-agents" ]]; then
+      list_agents
+      exit 0
+    fi
+
     if [[ $# -eq 0 ]]; then
       echo 'usage: ./run runtime <agent-id> [--sessions] [--load SESSION_ID] [--resume SESSION_ID] [--resume-last] [--mode ID] [--model ID] [--effort LEVEL] [--initial-config-strict] [--system-prompt TEXT] [--system-prompt-file PATH] [--prompt TEXT] [--log-file PATH] [--no-log-file] [prompt...]' >&2
+      echo '       ./run runtime --list-agents' >&2
       exit 2
     fi
 
@@ -114,22 +145,13 @@ case "$target" in
       runtime_args+=("--log-file=$log_file")
     fi
 
-    agent_id="$agent"
-    if [[ "$agent_id" == "claude" ]]; then
-      agent_id="claude-acp"
-    elif [[ "$agent_id" == "codex" ]]; then
-      agent_id="codex-acp"
-    elif [[ "$agent_id" == "simulator" ]]; then
-      agent_id="simulator-agent-acp-local"
-    fi
-
     pnpm run build:self
 
     if [[ -n "$prompt" ]]; then
-      exec node dist/examples/runtime-sdk-demo.js "$agent_id" "${runtime_args[@]}" "$prompt"
+      exec node dist/examples/runtime-sdk-demo.js "$agent" "${runtime_args[@]}" "$prompt"
     fi
 
-    exec node dist/examples/runtime-sdk-demo.js "$agent_id" "${runtime_args[@]}"
+    exec node dist/examples/runtime-sdk-demo.js "$agent" "${runtime_args[@]}"
     ;;
   *)
     exec make "$target" "$@"

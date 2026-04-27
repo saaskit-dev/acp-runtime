@@ -1,4 +1,7 @@
-import type { AcpRuntimeAgent } from "../../core/types.js";
+import {
+  ACP_RUNTIME_TERMINAL_AUTH_SUCCESS_PATTERNS_META_KEY,
+  type AcpRuntimeAgent,
+} from "../../core/types.js";
 import { createAgentProfile, type AcpAgentProfile } from "./profile.js";
 
 export function createClaudeCodeAgentProfile(
@@ -29,6 +32,22 @@ export function createClaudeCodeAgentProfile(
             ids: ["effort", "reasoning_effort"],
           };
       }
+    },
+    normalizeRuntimeAuthenticationMethods({ methods }) {
+      return methods.map((method) =>
+        method.id === "claude-login"
+          ? {
+              ...method,
+              meta: {
+                ...(method.meta ?? {}),
+                [ACP_RUNTIME_TERMINAL_AUTH_SUCCESS_PATTERNS_META_KEY]: [
+                  "Login successful",
+                  "Type your message",
+                ],
+              },
+            }
+          : method,
+      );
     },
     inferDeniedOperationFamily({ metadata, operation }) {
       if (

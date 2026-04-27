@@ -19,15 +19,25 @@
 | `resolveRuntimeCachePath(...)` | API 文档默认路径小节 |
 | `resolveRuntimeAgentFromRegistry(...)` | 阶段 3 |
 | `resolveRuntimeTerminalAuthenticationRequest(...)` | 阶段 7 |
+| `selectRuntimeAuthenticationMethod(...)` / `runtimeAuthenticationTerminalSuccessPatterns(...)` | demo auth adapter 与单元测试 |
+| `resolveRuntimeAgentModeId(...)` / `listRuntimeAgentModeKeys(...)` | interactive smoke CLI 与单元测试 |
+
+agent-specific 兼容通过 runtime profiles 覆盖。宿主不应该复制每个 agent 的
+workaround；当新 agent 的行为和 runtime 期望的 ACP shape 不一致时，应优先在
+`src/runtime/acp/profiles` 下补兼容和测试。
 
 ## Runtime Session 管理
 
 | API | 覆盖位置 |
 | --- | --- |
 | `runtime.sessions.start(...)` | 阶段 1 |
+| `runtime.sessions.fork(...)` | 单元测试 |
 | `runtime.sessions.load(...)` | 阶段 3 |
 | `runtime.sessions.resume(...)` | 阶段 3 |
 | `runtime.sessions.list(...)` | 阶段 3 和阶段 6 |
+| `runtime.sessions.delete(...)` | 单元测试 |
+| `runtime.sessions.refresh()` | 单元测试 |
+| `runtime.sessions.watch(...)` | 单元测试 |
 
 ## Session Getter
 
@@ -104,7 +114,11 @@
 | `createSimulatorAgentAcpAgent(...)` | 阶段 1 显式 agent 路径 |
 | `createClaudeCodeAcpAgent(...)` | 与阶段 1 显式 agent 路径同模式 |
 | `createCodexAcpAgent(...)` | 与阶段 1 显式 agent 路径同模式 |
+| `createCursorAcpAgent(...)` | 与阶段 1 显式 agent 路径同模式 |
 | `createGeminiCliAcpAgent(...)` | 与阶段 1 显式 agent 路径同模式 |
+| `createGitHubCopilotAcpAgent(...)` | 与阶段 1 显式 agent 路径同模式 |
+| `createOpenCodeAcpAgent(...)` | 与阶段 1 显式 agent 路径同模式 |
+| `createPiAcpAgent(...)` | 与阶段 1 显式 agent 路径同模式 |
 | `*_COMMAND` / `*_PACKAGE` / `*_REGISTRY_ID` 常量 | 显式启动与工具集成元数据 |
 
 ## Typed Runtime Errors

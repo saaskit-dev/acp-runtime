@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ACP_RUNTIME_SNAPSHOT_VERSION } from "./core/constants.js";
 import {
   AcpCreateError,
+  AcpForkError,
   AcpInitialConfigError,
   AcpListError,
   AcpLoadError,
@@ -24,7 +25,9 @@ import type { AcpSessionDriver, AcpSessionService } from "./core/session-driver.
 import type {
   AcpRuntimeAgentConfigOption,
   AcpRuntimeAgentMode,
+  AcpRuntimeAgent,
   AcpRuntimeCreateOptions,
+  AcpRuntimeForkSessionOptions,
   AcpRuntimeHistoryEntry,
   AcpRuntimeOperation,
   AcpRuntimeOperationBundle,
@@ -496,6 +499,9 @@ function createTestRuntime(
         async create() {
           throw new Error("not used");
         },
+        async fork() {
+          throw new Error("not used");
+        },
         async load() {
           throw new Error("not used");
         },
@@ -663,6 +669,44 @@ describe("AcpRuntime public SDK", () => {
       cwd: "/tmp/project",
       }),
     );
+  });
+
+  it("does not require a dedicated helper for registry id startup", async () => {
+    const snapshot = createSnapshot();
+    const backend = new SpySessionBackend(snapshot, () => []);
+    let resolvedAgentId: string | undefined;
+    let createOptions: AcpRuntimeCreateOptions | undefined;
+
+    const runtime = createTestRuntime(
+      {
+        async create(options: AcpRuntimeCreateOptions) {
+          createOptions = options;
+          return backend;
+        },
+      },
+      {
+        async agentResolver(agentId) {
+          resolvedAgentId = agentId;
+          return {
+            args: ["acp"],
+            command: "future-agent",
+            type: agentId,
+          };
+        },
+      },
+    );
+
+    await runtime.sessions.start({
+      agent: "future-registry-agent",
+      cwd: "/tmp/project",
+    });
+
+    expect(resolvedAgentId).toBe("future-registry-agent");
+    expect(createOptions?.agent).toEqual({
+      args: ["acp"],
+      command: "future-agent",
+      type: "future-registry-agent",
+    });
   });
 
   it("exposes namespaced runtime session helpers", async () => {
@@ -1041,7 +1085,7 @@ describe("AcpRuntime public SDK", () => {
       },
     ]);
 
-    await session.agent.setMode("plan");
+    await session.agent.setMode("Plan");
     await session.agent.setConfigOption("model", "opus");
 
     expect(backend.agentModeCalls).toEqual(["plan"]);
@@ -1717,10 +1761,57 @@ describe("AcpRuntime public SDK", () => {
     });
   });
 
-  it("wraps creation, list, load, and resume failures in typed runtime errors", async () => {
+  it("forks a stored session and registers the new forked session", async () => {
+    const sourceSnapshot = createSnapshot({
+      session: {
+        id: "source-session",
+      },
+    });
+    const forkedSnapshot = createSnapshot({
+      session: {
+        id: "forked-session",
+      },
+    });
+    const sessionRegistryPath = await createSessionRegistryPath();
+    const registry = createSessionRegistry(sessionRegistryPath);
+    await registry.rememberSnapshot(sourceSnapshot);
+    let forkOptions:
+      | (AcpRuntimeForkSessionOptions & {
+          agent: AcpRuntimeAgent;
+          cwd: string;
+        })
+      | undefined;
+
+    const runtime = createTestRuntime(
+      {
+        async fork(options) {
+          forkOptions = options;
+          return new SpySessionBackend(forkedSnapshot, () => []);
+        },
+      },
+      { state: { sessionRegistryPath } },
+    );
+
+    const forked = await runtime.sessions.fork({
+      sessionId: "source-session",
+    });
+
+    expect(forkOptions?.sessionId).toBe("source-session");
+    expect(forkOptions?.agent).toEqual(sourceSnapshot.agent);
+    expect(forkOptions?.cwd).toBe(sourceSnapshot.cwd);
+    expect(forked.metadata.id).toBe("forked-session");
+    await expect(
+      readStoredSnapshot(sessionRegistryPath, "forked-session"),
+    ).resolves.toEqual(forkedSnapshot);
+  });
+
+  it("wraps creation, fork, list, load, and resume failures in typed runtime errors", async () => {
     const runtime = createTestRuntime({
       async create() {
         throw new Error("create failed");
+      },
+      async fork() {
+        throw new Error("fork failed");
       },
       async listAgentSessions() {
         throw new Error("list failed");
@@ -1739,6 +1830,14 @@ describe("AcpRuntime public SDK", () => {
         cwd: "/tmp/project",
       }),
     ).rejects.toBeInstanceOf(AcpCreateError);
+
+    await expect(
+      runtime.sessions.fork({
+        agent: { command: "mock-agent" },
+        cwd: "/tmp/project",
+        sessionId: "session-1",
+      }),
+    ).rejects.toBeInstanceOf(AcpForkError);
 
     await expect(
       runtime.sessions.list({
@@ -1783,6 +1882,9 @@ describe("AcpRuntime public SDK", () => {
       {
         sessionService: {
           async create() {
+            return backend;
+          },
+          async fork() {
             return backend;
           },
           async listAgentSessions() {
@@ -1933,6 +2035,29 @@ describe("AcpRuntime public SDK", () => {
           updatedAt: "2026-04-12T00:00:11.000Z",
         },
       ],
+    });
+  });
+
+  it("exposes registry watch, delete, and refresh through the runtime sessions API", async () => {
+    const sessionRegistryPath = await createSessionRegistryPath();
+    const registry = createSessionRegistry(sessionRegistryPath);
+    await registry.rememberSnapshot(createSnapshot());
+    const runtime = createTestRuntime({}, { state: { sessionRegistryPath } });
+    const updates: string[] = [];
+    const stopWatching = runtime.sessions.watch((update) => {
+      updates.push(update.type);
+    });
+
+    runtime.sessions.refresh();
+    await expect(runtime.sessions.delete("session-1")).resolves.toBe(true);
+    await expect(runtime.sessions.delete("session-1")).resolves.toBe(false);
+    stopWatching();
+    runtime.sessions.refresh();
+
+    expect(updates).toEqual(["refresh", "session_deleted"]);
+    await expect(runtime.sessions.list({ source: "local" })).resolves.toEqual({
+      nextCursor: undefined,
+      sessions: [],
     });
   });
 

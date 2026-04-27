@@ -21,6 +21,7 @@ export function mapInitializeResponseToCapabilities(input: {
   return {
     agent: {
       authentication: Boolean(input.response.authMethods?.length),
+      fork: Boolean(agentCapabilities?.sessionCapabilities?.fork),
       load: Boolean(agentCapabilities?.loadSession),
       mcp: Boolean(agentCapabilities?.mcpCapabilities),
       prompt: true,

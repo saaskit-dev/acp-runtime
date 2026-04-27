@@ -11,13 +11,10 @@ export function mapPromptToAcp(prompt: AcpRuntimePrompt): ContentBlock[] {
     return [];
   }
 
-  const first = prompt[0];
-  if (isPromptMessage(first)) {
-    const blocks: ContentBlock[] = [];
-    for (const message of prompt) {
-      if (!isPromptMessage(message)) {
-        throw new Error("Mixed prompt part/message arrays are not supported.");
-      }
+  const blocks: ContentBlock[] = [];
+  for (const item of prompt) {
+    if (isPromptMessage(item)) {
+      const message = item;
       const prefix = `[${message.role}]`;
       if (typeof message.content === "string") {
         blocks.push({
@@ -34,12 +31,12 @@ export function mapPromptToAcp(prompt: AcpRuntimePrompt): ContentBlock[] {
       blocks.push(
         ...message.content.flatMap((part) => mapPromptPartToAcp(part)),
       );
+      continue;
     }
-    return blocks;
-  }
 
-  const parts = prompt as readonly import("../core/types.js").AcpRuntimePromptPart[];
-  return parts.flatMap((part) => mapPromptPartToAcp(part));
+    blocks.push(...mapPromptPartToAcp(item));
+  }
+  return blocks;
 }
 
 function mapPromptPartToAcp(

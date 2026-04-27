@@ -377,8 +377,7 @@ export type AcpRuntimePromptMessage = {
 
 export type AcpRuntimePrompt =
   | string
-  | readonly AcpRuntimePromptPart[]
-  | readonly AcpRuntimePromptMessage[];
+  | readonly (AcpRuntimePromptMessage | AcpRuntimePromptPart)[];
 
 export type AcpRuntimePlanPriority = ValueOf<
   typeof AcpRuntimePlanPriority
@@ -503,6 +502,12 @@ export type AcpRuntimeAuthenticationMethodMeta = Readonly<
   Record<string, unknown>
 >;
 
+export const ACP_RUNTIME_AUTHENTICATION_DEFAULT_METHOD_META_KEY =
+  "acp-runtime/default-auth-method" as const;
+
+export const ACP_RUNTIME_TERMINAL_AUTH_SUCCESS_PATTERNS_META_KEY =
+  "acp-runtime/terminal-success-patterns" as const;
+
 export type AcpRuntimeAuthenticationMethodBase = {
   description?: string;
   id: string;
@@ -562,6 +567,7 @@ export type AcpRuntimeAgentInfo = {
 
 export type AcpRuntimeAgentCapabilities = {
   authentication?: boolean;
+  fork?: boolean;
   load?: boolean;
   mcp?: boolean;
   prompt?: boolean;
@@ -1146,6 +1152,8 @@ export type AcpRuntimeLoadSessionOptions = {
   queue?: AcpRuntimeQueuePolicyInput;
   sessionId: string;
 };
+
+export type AcpRuntimeForkSessionOptions = AcpRuntimeLoadSessionOptions;
 
 export type AcpRuntimeResumeOptions = {
   handlers?: AcpRuntimeAuthorityHandlers;

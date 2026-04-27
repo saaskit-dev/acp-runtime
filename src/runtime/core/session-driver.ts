@@ -1,6 +1,7 @@
 import type {
   AcpRuntimeAgentConfigOption,
   AcpRuntimeAgentMode,
+  AcpRuntimeAgent,
   AcpRuntimeCapabilities,
   AcpRuntimeConfigValue,
   AcpRuntimeCreateOptions,
@@ -14,6 +15,7 @@ import type {
   AcpRuntimeToolCallWatcher,
   AcpRuntimeToolObjectWatcher,
   AcpRuntimeDiagnostics,
+  AcpRuntimeForkSessionOptions,
   AcpRuntimeListAgentSessionsOptions,
   AcpRuntimeLoadOptions,
   AcpRuntimeOperationBundle,
@@ -140,6 +142,12 @@ export type AcpSessionDriver = {
 
 export type AcpSessionService = {
   create(options: AcpRuntimeCreateOptions): Promise<AcpSessionDriver>;
+  fork(
+    options: AcpRuntimeForkSessionOptions & {
+      agent: AcpRuntimeAgent;
+      cwd: string;
+    },
+  ): Promise<AcpSessionDriver>;
   listAgentSessions(
     options: AcpRuntimeListAgentSessionsOptions,
   ): Promise<AcpRuntimeSessionList>;

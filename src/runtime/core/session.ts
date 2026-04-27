@@ -25,6 +25,7 @@ import type {
 } from "./types.js";
 import { AcpRuntimeTurnEventType } from "./types.js";
 import { AcpProtocolError } from "./errors.js";
+import { resolveRuntimeAgentModeId } from "./mode-utils.js";
 import type { AcpSessionDriver } from "./session-driver.js";
 
 export class AcpRuntimeSession {
@@ -203,7 +204,14 @@ export class AcpRuntimeSession {
 
   private async applyAgentMode(modeId: string): Promise<void> {
     this.assertOpen();
-    await this.driver.setAgentMode(modeId);
+    const resolvedMode = resolveRuntimeAgentModeId(
+      this.driver.listAgentModes(),
+      modeId,
+    );
+    if (resolvedMode.error && !resolvedMode.error.startsWith("unknown mode:")) {
+      throw new AcpProtocolError(resolvedMode.error);
+    }
+    await this.driver.setAgentMode(resolvedMode.modeId ?? modeId);
     await this.options.onSnapshotChanged?.(this.driver.snapshot());
   }
 

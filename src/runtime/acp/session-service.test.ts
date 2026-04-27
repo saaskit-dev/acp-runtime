@@ -170,6 +170,160 @@ describe("AcpSessionService observability", () => {
     ).rejects.toBeInstanceOf(AcpSystemPromptError);
   });
 
+  it("skips authenticate when an agent reports authentication is not implemented", async () => {
+    let authenticateCalls = 0;
+    let newSessionCalls = 0;
+
+    const service = createAcpSessionService(async () => ({
+      connection: {
+        authenticate: async () => {
+          authenticateCalls += 1;
+          const error = new Error("Internal error") as Error & {
+            data?: unknown;
+          };
+          error.name = "RequestError";
+          error.data = { details: "Authentication not implemented" };
+          throw error;
+        },
+        cancel: async () => {},
+        closeSession: async () => ({}),
+        initialize: async () =>
+          ({
+            agentCapabilities: {},
+            authMethods: [
+              {
+                id: "agent-login",
+                name: "Agent Login",
+              },
+            ],
+            protocolVersion: "0.2.0",
+          }) as import("@agentclientprotocol/sdk").InitializeResponse,
+        newSession: async () => {
+          newSessionCalls += 1;
+          return {
+            sessionId: "session-1",
+          } as import("@agentclientprotocol/sdk").NewSessionResponse;
+        },
+        prompt: async () => {
+          throw new Error("not used");
+        },
+        signal: new AbortController().signal,
+        closed: Promise.resolve(),
+      },
+    }));
+
+    const driver = await service.create({
+      agent: {
+        command: "mock-agent",
+        type: "mock-agent",
+      },
+      cwd: "/tmp/project",
+      handlers: {
+        authentication: async ({ methods }) => ({
+          methodId: methods[0]?.id ?? "agent-login",
+        }),
+      },
+    });
+    await driver.close();
+
+    expect(authenticateCalls).toBe(1);
+    expect(newSessionCalls).toBe(1);
+  });
+
+  it("automatically authenticates protocol-only agent methods without a host auth handler", async () => {
+    const authenticateMethodIds: string[] = [];
+
+    const service = createAcpSessionService(async () => ({
+      connection: {
+        authenticate: async (input) => {
+          authenticateMethodIds.push(input.methodId);
+          return {};
+        },
+        cancel: async () => {},
+        closeSession: async () => ({}),
+        initialize: async () =>
+          ({
+            agentCapabilities: {},
+            authMethods: [
+              {
+                id: "agent-login",
+                name: "Agent Login",
+              },
+            ],
+            protocolVersion: "0.2.0",
+          }) as import("@agentclientprotocol/sdk").InitializeResponse,
+        newSession: async () =>
+          ({
+            sessionId: "session-1",
+          }) as import("@agentclientprotocol/sdk").NewSessionResponse,
+        prompt: async () => {
+          throw new Error("not used");
+        },
+        signal: new AbortController().signal,
+        closed: Promise.resolve(),
+      },
+    }));
+
+    const driver = await service.create({
+      agent: {
+        command: "mock-agent",
+        type: "mock-agent",
+      },
+      cwd: "/tmp/project",
+    });
+    await driver.close();
+
+    expect(authenticateMethodIds).toEqual(["agent-login"]);
+  });
+
+  it("does not automatically run terminal authentication without a host auth handler", async () => {
+    let authenticateCalls = 0;
+
+    const service = createAcpSessionService(async () => ({
+      connection: {
+        authenticate: async () => {
+          authenticateCalls += 1;
+          return {};
+        },
+        cancel: async () => {},
+        closeSession: async () => ({}),
+        initialize: async () =>
+          ({
+            agentCapabilities: {},
+            authMethods: [
+              {
+                args: ["login"],
+                id: "terminal-login",
+                name: "Terminal Login",
+                type: "terminal",
+              },
+            ],
+            protocolVersion: "0.2.0",
+          }) as import("@agentclientprotocol/sdk").InitializeResponse,
+        newSession: async () =>
+          ({
+            sessionId: "session-1",
+          }) as import("@agentclientprotocol/sdk").NewSessionResponse,
+        prompt: async () => {
+          throw new Error("not used");
+        },
+        signal: new AbortController().signal,
+        closed: Promise.resolve(),
+      },
+    }));
+
+    const driver = await service.create({
+      agent: {
+        command: "mock-agent",
+        type: "mock-agent",
+      },
+      cwd: "/tmp/project",
+    });
+    await driver.close();
+
+    expect(authenticateCalls).toBe(0);
+  });
+
   it("ignores systemPrompt on load and does not send session metadata", async () => {
     let loadSessionParams:
       | import("@agentclientprotocol/sdk").LoadSessionRequest

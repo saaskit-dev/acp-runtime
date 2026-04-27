@@ -9,6 +9,7 @@ import type {
   AcpRuntimeOperation,
   AcpRuntimeOperationKind,
   AcpRuntimeConfigValue,
+  AcpRuntimeAuthenticationMethod,
   AcpRuntimeSessionMetadata,
   AcpRuntimeSystemPrompt,
 } from "../../core/types.js";
@@ -58,6 +59,12 @@ export type AcpAgentProfile = {
     agent: AcpRuntimeAgent;
     authMethods: readonly AuthMethod[] | undefined;
   }): readonly AuthMethod[] | undefined;
+  normalizeRuntimeAuthenticationMethods?(input: {
+    agent: AcpRuntimeAgent;
+    methods: readonly AcpRuntimeAuthenticationMethod[];
+  }):
+    | Promise<readonly AcpRuntimeAuthenticationMethod[]>
+    | readonly AcpRuntimeAuthenticationMethod[];
   normalizePromptError?(input: {
     error: unknown;
     turn: AcpRuntimeTurnState;
@@ -82,6 +89,9 @@ export function createAgentProfile(
     mapOperationKind: overrides.mapOperationKind ?? mapOperationKind,
     normalizeInitializeAuthMethods:
       overrides.normalizeInitializeAuthMethods ?? normalizeInitializeAuthMethods,
+    normalizeRuntimeAuthenticationMethods:
+      overrides.normalizeRuntimeAuthenticationMethods ??
+      normalizeRuntimeAuthenticationMethods,
     normalizePromptError:
       overrides.normalizePromptError ?? normalizePromptError,
   };
@@ -188,6 +198,13 @@ function normalizeInitializeAuthMethods(_input: {
   authMethods: readonly AuthMethod[] | undefined;
 }): readonly AuthMethod[] | undefined {
   return _input.authMethods;
+}
+
+function normalizeRuntimeAuthenticationMethods(input: {
+  agent: AcpRuntimeAgent;
+  methods: readonly AcpRuntimeAuthenticationMethod[];
+}): readonly AcpRuntimeAuthenticationMethod[] {
+  return input.methods;
 }
 
 function normalizePromptError(_input: {

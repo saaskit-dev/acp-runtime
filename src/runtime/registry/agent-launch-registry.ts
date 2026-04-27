@@ -76,8 +76,30 @@ export type AgentLaunchConfig = {
   env?: Record<string, string | undefined>;
 };
 
+export const ACP_REGISTRY_AGENT_ALIASES = {
+  claude: "claude-acp",
+  codex: "codex-acp",
+  copilot: "github-copilot-cli",
+  "cursor-agent": "cursor",
+  "gemini-cli": "gemini",
+  github: "github-copilot-cli",
+  "github-copilot": "github-copilot-cli",
+  "open-code": "opencode",
+  pi: "pi-acp",
+  qwen: "qwen-code",
+  sim: LOCAL_SIMULATOR_AGENT_ID,
+  simulator: LOCAL_SIMULATOR_AGENT_ID,
+} as const;
+
+export function resolveAgentRegistryId(agentId: string): string {
+  const normalized = agentId.trim();
+  return ACP_REGISTRY_AGENT_ALIASES[
+    normalized.toLowerCase() as keyof typeof ACP_REGISTRY_AGENT_ALIASES
+  ] ?? normalized;
+}
+
 function isLocalSimulatorAgent(agentId: string): boolean {
-  return agentId === LOCAL_SIMULATOR_AGENT_ID;
+  return resolveAgentRegistryId(agentId) === LOCAL_SIMULATOR_AGENT_ID;
 }
 
 function resolveLocalSimulatorLaunch(): AgentLaunchConfig {
@@ -313,16 +335,18 @@ function resolveUvx(dist: UvxDistribution): AgentLaunchConfig {
 }
 
 export async function resolveAgentLaunch(agentId: string): Promise<AgentLaunchConfig> {
-  if (isLocalSimulatorAgent(agentId)) {
+  const resolvedAgentId = resolveAgentRegistryId(agentId);
+
+  if (isLocalSimulatorAgent(resolvedAgentId)) {
     return resolveLocalSimulatorLaunch();
   }
 
   const registry = await fetchRegistry();
-  const agent = findAgent(registry, agentId);
+  const agent = findAgent(registry, resolvedAgentId);
   const { distribution } = agent;
 
   if (distribution.binary) {
-    return resolveBinary(agentId, distribution.binary);
+    return resolveBinary(resolvedAgentId, distribution.binary);
   }
 
   if (distribution.npx) {
@@ -333,11 +357,13 @@ export async function resolveAgentLaunch(agentId: string): Promise<AgentLaunchCo
     return resolveUvx(distribution.uvx);
   }
 
-  throw new Error(`Agent "${agentId}" has no supported distribution type`);
+  throw new Error(`Agent "${resolvedAgentId}" has no supported distribution type`);
 }
 
 export async function getAgentMeta(agentId: string): Promise<{ name: string; version: string; description: string }> {
-  if (isLocalSimulatorAgent(agentId)) {
+  const resolvedAgentId = resolveAgentRegistryId(agentId);
+
+  if (isLocalSimulatorAgent(resolvedAgentId)) {
     return {
       name: "Simulator Agent ACP (Local)",
       version: "0.1.0",
@@ -346,7 +372,7 @@ export async function getAgentMeta(agentId: string): Promise<{ name: string; ver
   }
 
   const registry = await fetchRegistry();
-  const agent = findAgent(registry, agentId);
+  const agent = findAgent(registry, resolvedAgentId);
   return { name: agent.name, version: agent.version, description: agent.description };
 }
 

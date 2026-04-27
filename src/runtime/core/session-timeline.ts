@@ -932,19 +932,14 @@ function promptToThreadText(prompt: AcpRuntimePrompt): string {
     return "";
   }
 
-  const first = prompt[0];
-  if (isPromptMessage(first)) {
-    return prompt
-      .flatMap((message) =>
-        isPromptMessage(message) && message.role === "user"
-          ? normalizePromptContent(message.content)
-          : [],
-      )
-      .join("\n\n")
-      .trim();
-  }
-
-  return normalizePromptContent(prompt as readonly AcpRuntimePromptPart[])
+  return prompt
+    .flatMap((item) =>
+      isPromptMessage(item)
+        ? item.role === "user"
+          ? normalizePromptContent(item.content)
+          : []
+        : normalizePromptPart(item),
+    )
     .join("\n")
     .trim();
 }

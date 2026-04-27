@@ -39,6 +39,24 @@ Internal runtime implementation is currently organized around:
 - `acp/profiles/`
 - `acp/driver.ts`
 
+## Adapter Boundary
+
+`acp-runtime` is responsible for hiding ACP agent implementation differences
+from host integrations. Once an agent `type` is known, compatibility behavior
+belongs in the SDK/runtime profile or adapter layer, not in every host.
+
+Examples of differences that should be absorbed by the runtime:
+
+- registry id and short-alias launch resolution
+- mode id/name/URI normalization
+- auth method quirks, including terminal auth that is only a setup entrypoint
+- agent-specific system prompt delivery
+- config option aliases and value aliases
+- protocol shape drift and benign agent-specific errors
+
+Demos and harnesses may expose these behaviors for testing, but should call
+runtime APIs and profiles instead of duplicating per-agent workarounds.
+
 ## Runtime Construction
 
 `AcpRuntime` is the top-level host SDK object.
@@ -51,6 +69,9 @@ Public host surface:
 
 Registry-backed helper:
 - `resolveRuntimeAgentFromRegistry(agentId)`
+- `selectRuntimeAuthenticationMethod(methods)`
+- `runtimeAuthenticationTerminalSuccessPatterns(method)`
+- `resolveRuntimeTerminalAuthenticationRequest({ agent, method })`
 - `resolveRuntimeHomePath(...segments)`
 - `resolveRuntimeCachePath(...segments)`
 
@@ -63,6 +84,13 @@ Default runtime-owned state now lives under `~/.acp-runtime/`.
 
 For most host integrations, `runtime.sessions.start({ agent: "claude-acp", ... })` should be the default path.
 Passing an agent id keeps launch resolution inside the runtime instead of repeating `command` / `args` rules in every host.
+Any id listed in the ACP registry should work through this path even when this
+package does not export a dedicated `createXxxAcpAgent(...)` helper for that
+agent. Dedicated helpers are optional convenience APIs for callers that want to
+override launch mode, package version, environment, or arguments explicitly.
+Common short aliases are normalized by the same registry resolver, so
+`claude`, `codex`, `pi`, `copilot`, `sim`, and `simulator` can be used anywhere
+an agent id is accepted.
 Runtime-owned local state is enabled by default and stored at `~/.acp-runtime/state/runtime-session-registry.json`.
 Use `new AcpRuntime(factory, { state: { sessionRegistryPath } })` to override that path, or `{ state: false }` to disable local state.
 
@@ -263,14 +291,19 @@ For a local recent-session view, use `runtime.sessions.list({ source: "local" })
 For a merged view, use `runtime.sessions.list({ source: "all", agent, cwd })`.
 Returned references include `source: "local" | "remote" | "both"` when the source is known.
 
-Current TypeScript SDK coverage for session management stops at:
+Current ACP agent-backed session management coverage includes:
 - `session/list`
 - `session/load`
 - `session/resume`
 - `session/close`
+- unstable `session/fork`, exposed as `runtime.sessions.fork(...)`
 
-It does **not** currently expose a watch/delete/refresh family comparable to Zed's higher-level session-history management.
-`acp-runtime` does not fake those APIs. Hosts that need deletion or refresh today should model that in their own registry/UI layer.
+Local runtime session-history management also exposes:
+- `runtime.sessions.watch(...)`
+- `runtime.sessions.delete(...)`
+- `runtime.sessions.refresh()`
+
+Those local registry APIs operate on the runtime-owned recent-session index. They do not pretend to delete or refresh remote agent history unless the ACP agent exposes such protocol methods.
 
 ## Prompt Model
 
@@ -306,6 +339,17 @@ Host-provided authority is modeled through:
 
 These are runtime abstractions over client-side capability delegation.
 
+Authentication handlers should use SDK policy helpers rather than hard-coding
+agent ids. `selectRuntimeAuthenticationMethod(...)` applies runtime/profile
+metadata such as `acp-runtime/default-auth-method` and safely auto-selects the
+only available method. `runtimeAuthenticationTerminalSuccessPatterns(...)` reads
+profile-provided terminal completion hints, and
+`resolveRuntimeTerminalAuthenticationRequest(...)` resolves generic terminal
+execution data from the selected method.
+If no authentication handler is provided, the runtime may automatically select
+and authenticate a safe protocol-only `agent` method. Terminal and env-var auth
+still require a host handler because they need UI or local process execution.
+
 ## Core Public Models
 
 ### Capabilities
@@ -317,7 +361,8 @@ These are runtime abstractions over client-side capability delegation.
 - `client`
 
 `authMethods` describe agent-advertised or runtime-normalized login options.
-Host-side login execution policy, such as terminal success-pattern matching,
+Agent-specific login quirks are normalized by profiles into runtime metadata.
+Host-side UI policy, such as whether to prompt before selecting a method,
 belongs in the host or adapter layer rather than the runtime core model.
 
 For the full compatibility boundary, see

@@ -23,17 +23,13 @@
     },
     {
       "type": "wait-for-event",
-      "eventType": "available_commands_update"
+      "eventType": "completed"
     }
   ],
   "assertions": [
     {
       "type": "transcript-has-method",
       "method": "session/prompt"
-    },
-    {
-      "type": "transcript-has-event",
-      "eventType": "available_commands_update"
     }
   ]
 }

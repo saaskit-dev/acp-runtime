@@ -60,4 +60,12 @@ async function main(): Promise<void> {
   }
 }
 
-void main();
+void main().then(
+  () => {
+    process.exit(process.exitCode ?? 0);
+  },
+  (error) => {
+    console.error(error);
+    process.exit(1);
+  },
+);

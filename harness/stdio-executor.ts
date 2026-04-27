@@ -447,13 +447,125 @@ async function createConnection(
     throw new Error("Failed to create stdio pipes for agent process");
   }
 
-  const input = Writable.toWeb(child.stdin);
-  const output = Readable.toWeb(child.stdout);
+  const input = nodeWritableToWeb(child.stdin);
+  const output = nodeReadableToWeb(child.stdout);
   const client = new HarnessClient(state, emitWireEntry);
   const stream = acp.ndJsonStream(input, output);
   const connection = new acp.ClientSideConnection(() => client, stream);
+  void connection.closed.catch(() => {
+    // Individual request promises surface failures. Avoid process-level
+    // unhandled rejections when an agent closes stdio early.
+  });
 
   return { connection, child };
+}
+
+function nodeReadableToWeb(
+  stream: AsyncIterable<Buffer | Uint8Array | string> &
+    Pick<Readable, "destroy" | "off" | "on">,
+): ReadableStream<Uint8Array> {
+  let cancelled = false;
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      let closed = false;
+      const cleanup = () => {
+        stream.off("data", onData);
+        stream.off("end", onClose);
+        stream.off("close", onClose);
+        stream.off("error", onError);
+      };
+      const onData = (chunk: Buffer | Uint8Array | string) => {
+        if (cancelled || closed) {
+          return;
+        }
+        controller.enqueue(normalizeReadableChunk(chunk));
+      };
+      const onClose = () => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        cleanup();
+        if (!cancelled) {
+          controller.close();
+        }
+      };
+      const onError = (error: unknown) => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        cleanup();
+        if (!cancelled) {
+          controller.error(error);
+        }
+      };
+
+      stream.on("data", onData);
+      stream.on("end", onClose);
+      stream.on("close", onClose);
+      stream.on("error", onError);
+    },
+    cancel(reason) {
+      cancelled = true;
+      stream.destroy(toError(reason));
+    },
+  });
+}
+
+function nodeWritableToWeb(
+  stream: Pick<Writable, "destroy" | "end" | "write">,
+): WritableStream<Uint8Array> {
+  return new WritableStream<Uint8Array>({
+    async write(chunk) {
+      await new Promise<void>((resolve, reject) => {
+        stream.write(chunk, (error?: Error | null) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    },
+    async close() {
+      await new Promise<void>((resolve, reject) => {
+        stream.end((error?: Error | null) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    },
+    abort(reason) {
+      stream.destroy(toError(reason));
+    },
+  });
+}
+
+function normalizeReadableChunk(
+  chunk: Buffer | Uint8Array | string,
+): Uint8Array {
+  if (typeof chunk === "string") {
+    return new TextEncoder().encode(chunk);
+  }
+
+  return chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+}
+
+function toError(reason: unknown): Error | undefined {
+  if (reason instanceof Error) {
+    return reason;
+  }
+
+  if (reason === undefined) {
+    return undefined;
+  }
+
+  return new Error(String(reason));
 }
 
 function hasObservedEvent(state: RuntimeClientState, eventType: string): boolean {
@@ -1021,6 +1133,11 @@ async function executeStep(
           payload: response,
         });
         return response;
+      });
+      void context.state.promptPromise.catch(() => {
+        // Some cases wait for intermediate events instead of awaiting prompt
+        // completion. If that step fails and teardown closes stdio, the prompt
+        // request rejects; the step failure should remain the reported result.
       });
       return;
     }

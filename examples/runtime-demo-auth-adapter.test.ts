@@ -3,6 +3,10 @@ import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  ACP_RUNTIME_AUTHENTICATION_DEFAULT_METHOD_META_KEY,
+  ACP_RUNTIME_TERMINAL_AUTH_SUCCESS_PATTERNS_META_KEY,
+} from "@saaskit-dev/acp-runtime";
+import {
   promptForDemoAuthentication,
   resolveDemoTerminalAuthenticationRequest,
 } from "./runtime-demo-auth-adapter.js";
@@ -15,7 +19,7 @@ const createSilentLogSink = () => ({
 });
 
 describe("runtime demo auth adapter", () => {
-  it("adds Claude host-side login success patterns", () => {
+  it("consumes Claude profile login success patterns", () => {
     const request = resolveDemoTerminalAuthenticationRequest({
       agent: {
         command: "claude",
@@ -24,6 +28,12 @@ describe("runtime demo auth adapter", () => {
       method: {
         args: ["/login"],
         id: "claude-login",
+        meta: {
+          [ACP_RUNTIME_TERMINAL_AUTH_SUCCESS_PATTERNS_META_KEY]: [
+            "Login successful",
+            "Type your message",
+          ],
+        },
         title: "Login",
         type: "terminal",
       },
@@ -39,7 +49,7 @@ describe("runtime demo auth adapter", () => {
     });
   });
 
-  it("adds Gemini host-side login success patterns", () => {
+  it("consumes Gemini profile login success patterns", () => {
     const request = resolveDemoTerminalAuthenticationRequest({
       agent: {
         command: "gemini",
@@ -52,6 +62,10 @@ describe("runtime demo auth adapter", () => {
             command: "gemini",
             label: "gemini /auth",
           },
+          [ACP_RUNTIME_TERMINAL_AUTH_SUCCESS_PATTERNS_META_KEY]: [
+            "Login successful",
+            "Type your message",
+          ],
         },
         title: "Login",
         type: "agent",
@@ -64,7 +78,7 @@ describe("runtime demo auth adapter", () => {
     ]);
   });
 
-  it("defaults Codex authentication to the ChatGPT login agent method", async () => {
+  it("uses SDK metadata to select the default authentication method", async () => {
     const promptExclusive = vi.fn(async () => {
       throw new Error("should not prompt");
     });
@@ -91,6 +105,9 @@ describe("runtime demo auth adapter", () => {
             {
               description: "Use your ChatGPT login with Codex CLI.",
               id: "chatgpt-login",
+              meta: {
+                [ACP_RUNTIME_AUTHENTICATION_DEFAULT_METHOD_META_KEY]: true,
+              },
               title: "Login with ChatGPT",
               type: "agent",
             },
@@ -107,6 +124,52 @@ describe("runtime demo auth adapter", () => {
 
       expect(result).toEqual({ methodId: "chatgpt-login" });
       expect(promptExclusive).not.toHaveBeenCalled();
+    } finally {
+      rl.close();
+    }
+  });
+
+  it("does not run terminal auth when an adapter has removed terminal metadata", async () => {
+    const renderer = { writeLine: vi.fn() };
+    const logSink = createSilentLogSink();
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const rl = createInterface({ input, output });
+
+    try {
+      const result = await promptForDemoAuthentication({
+        inputCoordinator: {
+          close: vi.fn(),
+          nextUserInput: vi.fn(async () => ""),
+          promptExclusive: vi.fn(async () => {
+            throw new Error("should not prompt");
+          }),
+        },
+        logSink,
+        renderer,
+        request: {
+          agent: {
+            command: "npx",
+            type: "github-copilot-cli",
+          },
+          methods: [
+            {
+              id: "copilot-login",
+              title: "Log in with Copilot CLI",
+              type: "agent",
+            },
+          ],
+        },
+        rl,
+      });
+
+      expect(result).toEqual({ methodId: "copilot-login" });
+      expect(logSink.emit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          eventName: "acp.demo.authentication.selected",
+        }),
+      );
+      expect(renderer.writeLine).not.toHaveBeenCalled();
     } finally {
       rl.close();
     }

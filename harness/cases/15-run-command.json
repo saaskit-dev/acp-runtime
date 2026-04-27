@@ -9,6 +9,12 @@
     },
     "opencode": {
       "prompt": "Use the execute tool to run `pwd`. Wait for the command output, then answer with only the resulting path."
+    },
+    "cursor": {
+      "prompt": "Use your command execution tool to run `pwd`. Wait for the command output, then answer with only the resulting path."
+    },
+    "pi-acp": {
+      "prompt": "Use your command execution tool to run `pwd`. Wait for the command output, then answer with only the resulting path."
     }
   },
   "title": "Run Command",

@@ -5,6 +5,8 @@ import { SeverityNumber } from "@opentelemetry/api-logs";
 
 import {
   resolveRuntimeTerminalAuthenticationRequest,
+  runtimeAuthenticationTerminalSuccessPatterns,
+  selectRuntimeAuthenticationMethod,
   type AcpRuntimeAuthenticationMethod,
   type AcpRuntimeAuthorityHandlers,
   type AcpRuntimeTerminalAuthenticationRequest,
@@ -32,7 +34,6 @@ export async function promptForDemoAuthentication(
   },
 ): Promise<{ cancel: true } | { methodId: string }> {
   const method = await promptForAuthenticationMethod(
-    input.request.agent,
     input.inputCoordinator,
     input.request.methods,
   );
@@ -94,32 +95,11 @@ export function resolveDemoTerminalAuthenticationRequest(input: {
 
   return {
     ...request,
-    successPatterns: resolveDemoAuthenticationSuccessPatterns(input),
+    successPatterns: runtimeAuthenticationTerminalSuccessPatterns(input.method),
   };
 }
 
-// This is a host-side login strategy table, not ACP core semantics.
-function resolveDemoAuthenticationSuccessPatterns(input: {
-  agent: Parameters<
-    NonNullable<AcpRuntimeAuthorityHandlers["authentication"]>
-  >[0]["agent"];
-  method: AcpRuntimeAuthenticationMethod;
-}): readonly string[] | undefined {
-  if (input.method.id === "claude-login") {
-    return ["Login successful", "Type your message"];
-  }
-
-  if (input.agent.type === "gemini" && input.method.id === "spawn-gemini-cli") {
-    return ["Login successful", "Type your message"];
-  }
-
-  return undefined;
-}
-
 async function promptForAuthenticationMethod(
-  agent: Parameters<
-    NonNullable<AcpRuntimeAuthorityHandlers["authentication"]>
-  >[0]["agent"],
   inputCoordinator: DemoInputCoordinator,
   methods: readonly AcpRuntimeAuthenticationMethod[],
 ): Promise<AcpRuntimeAuthenticationMethod | undefined> {
@@ -131,7 +111,7 @@ async function promptForAuthenticationMethod(
     return methods[0];
   }
 
-  const defaultMethod = resolveDefaultAuthenticationMethod(agent, methods);
+  const defaultMethod = selectRuntimeAuthenticationMethod(methods);
   if (defaultMethod) {
     console.log(
       `[runtime] authentication default: ${defaultMethod.title} (${defaultMethod.id})`,
@@ -172,31 +152,11 @@ async function promptForAuthenticationMethod(
   }
 }
 
-function resolveDefaultAuthenticationMethod(
-  agent: Parameters<
-    NonNullable<AcpRuntimeAuthorityHandlers["authentication"]>
-  >[0]["agent"],
-  methods: readonly AcpRuntimeAuthenticationMethod[],
-): AcpRuntimeAuthenticationMethod | undefined {
-  if (agent.type !== "codex-acp") {
-    return undefined;
-  }
-
-  return (
-    methods.find(
-      (method) =>
-        method.type === "agent" && /login|chatgpt/i.test(method.title),
-    ) ??
-    methods.find((method) => method.type === "agent") ??
-    methods[0]
-  );
-}
-
 async function runTerminalAuthentication(
   rl: Interface,
   request: DemoTerminalAuthenticationRequest,
 ): Promise<void> {
-  rl.pause();
+  pauseReadlineIfOpen(rl);
   console.log(`[runtime] auth: ${request.label}`);
 
   const child = spawn(request.command, [...request.args], {
@@ -207,6 +167,10 @@ async function runTerminalAuthentication(
     stdio: ["inherit", "pipe", "pipe"],
     windowsHide: true,
   });
+  const signalCancellation = createTerminalAuthenticationSignalCancellation(
+    child,
+    request,
+  );
 
   let transcript = "";
   const appendOutput = (chunk: string) => {
@@ -225,9 +189,57 @@ async function runTerminalAuthentication(
   });
 
   try {
-    await waitForTerminalAuthentication(child, () => transcript, request);
+    await waitForTerminalAuthentication(
+      child,
+      () => transcript,
+      request,
+      signalCancellation.promise,
+    );
   } finally {
+    signalCancellation.dispose();
+    await terminateTerminalAuthenticationProcess(child);
+    resumeReadlineIfOpen(rl);
+  }
+}
+
+function pauseReadlineIfOpen(rl: Interface): void {
+  try {
+    rl.pause();
+  } catch (error) {
+    if (!isReadlineClosedError(error)) {
+      throw error;
+    }
+  }
+}
+
+function resumeReadlineIfOpen(rl: Interface): void {
+  try {
     rl.resume();
+  } catch (error) {
+    if (!isReadlineClosedError(error)) {
+      throw error;
+    }
+  }
+}
+
+function isReadlineClosedError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    error.code === "ERR_USE_AFTER_CLOSE"
+  );
+}
+
+type TerminalAuthenticationCancellation = {
+  signal: NodeJS.Signals;
+};
+
+class TerminalAuthenticationInterruptedError extends Error {
+  readonly exitCode = 130;
+
+  constructor(label: string, signal: NodeJS.Signals) {
+    super(`Authentication command "${label}" cancelled by ${signal}.`);
+    this.name = "TerminalAuthenticationInterruptedError";
   }
 }
 
@@ -239,6 +251,7 @@ async function waitForTerminalAuthentication(
   >,
   getTranscript: () => string,
   request: DemoTerminalAuthenticationRequest,
+  cancellation: Promise<TerminalAuthenticationCancellation>,
 ): Promise<void> {
   const exitPromise = new Promise<number | null>((resolve, reject) => {
     child.once("error", reject);
@@ -246,7 +259,17 @@ async function waitForTerminalAuthentication(
   });
 
   if (!request.successPatterns || request.successPatterns.length === 0) {
-    const code = await exitPromise;
+    const result = await Promise.race([
+      exitPromise.then((code) => ({ code, kind: "exit" as const })),
+      cancellation.then((value) => ({ ...value, kind: "cancelled" as const })),
+    ]);
+    if (result.kind === "cancelled") {
+      throw new TerminalAuthenticationInterruptedError(
+        request.label,
+        result.signal,
+      );
+    }
+    const code = result.code;
     if (code !== 0) {
       throw new Error(
         `Authentication command "${request.label}" failed with exit code ${code ?? "<none>"}.`,
@@ -269,6 +292,7 @@ async function waitForTerminalAuthentication(
   const result = await Promise.race([
     successPromise.then(() => "success" as const),
     exitPromise.then((code) => ({ code, kind: "exit" as const })),
+    cancellation.then((value) => ({ ...value, kind: "cancelled" as const })),
   ]);
 
   if (result === "success") {
@@ -276,7 +300,118 @@ async function waitForTerminalAuthentication(
     return;
   }
 
+  if (result.kind === "cancelled") {
+    throw new TerminalAuthenticationInterruptedError(
+      request.label,
+      result.signal,
+    );
+  }
+
   throw new Error(
     `Authentication command "${request.label}" exited before success was detected (exit=${result.code ?? "<none>"}).`,
   );
+}
+
+function createTerminalAuthenticationSignalCancellation(
+  child: import("node:child_process").ChildProcess,
+  request: DemoTerminalAuthenticationRequest,
+): {
+  dispose(): void;
+  promise: Promise<TerminalAuthenticationCancellation>;
+} {
+  let settled = false;
+  let resolveCancellation: (value: TerminalAuthenticationCancellation) => void;
+  const promise = new Promise<TerminalAuthenticationCancellation>((resolve) => {
+    resolveCancellation = resolve;
+  });
+
+  const onSignal = (signal: NodeJS.Signals) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    console.log(`[runtime] auth: cancelling ${request.label} (${signal})`);
+    try {
+      child.kill(signal);
+    } catch {
+      // best effort; the finalizer escalates if the child ignores the signal.
+    }
+    resolveCancellation({ signal });
+  };
+
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+
+  return {
+    dispose() {
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+    },
+    promise,
+  };
+}
+
+async function terminateTerminalAuthenticationProcess(
+  child: import("node:child_process").ChildProcess,
+): Promise<void> {
+  if (!isTerminalAuthenticationProcessRunning(child)) {
+    return;
+  }
+
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    // best effort
+  }
+
+  if (await waitForTerminalAuthenticationExit(child, 1_500)) {
+    return;
+  }
+
+  if (isTerminalAuthenticationProcessRunning(child)) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // best effort
+    }
+    await waitForTerminalAuthenticationExit(child, 1_000);
+  }
+}
+
+function isTerminalAuthenticationProcessRunning(
+  child: import("node:child_process").ChildProcess,
+): boolean {
+  return child.exitCode === null && child.signalCode === null;
+}
+
+function waitForTerminalAuthenticationExit(
+  child: import("node:child_process").ChildProcess,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (!isTerminalAuthenticationProcessRunning(child)) {
+    return Promise.resolve(true);
+  }
+
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      finish(false);
+    }, timeoutMs);
+    const finish = (value: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      child.off("close", onExit);
+      child.off("exit", onExit);
+      resolve(value);
+    };
+    const onExit = () => {
+      finish(true);
+    };
+
+    child.once("close", onExit);
+    child.once("exit", onExit);
+  });
 }

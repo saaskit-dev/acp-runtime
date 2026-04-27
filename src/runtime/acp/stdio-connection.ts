@@ -86,8 +86,8 @@ export function createStdioAcpConnectionFactory(
     const stream = createTappedStream(
       createNdJsonMessageStream(
         input.agent.command,
-        nodeWritableToWeb(child.stdin),
-        nodeReadableToWeb(child.stdout),
+        nodeWritableToWeb(child.stdin, { preferNative: false }),
+        nodeReadableToWeb(child.stdout, { preferNative: false }),
       ),
       {
         agent: input.agent,
@@ -159,41 +159,50 @@ export function nodeReadableToWeb(
   }
 
   let cancelled = false;
-  let onError: ((error: unknown) => void) | undefined;
 
   return new ReadableStream<Uint8Array>({
     start(controller) {
-      onError = (error: unknown) => {
-        controller.error(error);
+      let closed = false;
+      const cleanup = () => {
+        stream.off("data", onData);
+        stream.off("end", onClose);
+        stream.off("close", onClose);
+        stream.off("error", onError);
+      };
+      const onData = (chunk: Buffer | Uint8Array | string) => {
+        if (cancelled || closed) {
+          return;
+        }
+        controller.enqueue(normalizeReadableChunk(chunk));
+      };
+      const onClose = () => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        cleanup();
+        if (!cancelled) {
+          controller.close();
+        }
+      };
+      const onError = (error: unknown) => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        cleanup();
+        if (!cancelled) {
+          controller.error(error);
+        }
       };
 
+      stream.on("data", onData);
+      stream.on("end", onClose);
+      stream.on("close", onClose);
       stream.on("error", onError);
-
-      void (async () => {
-        try {
-          for await (const chunk of stream) {
-            if (cancelled) {
-              break;
-            }
-            controller.enqueue(normalizeReadableChunk(chunk));
-          }
-          if (!cancelled) {
-            controller.close();
-          }
-        } catch (error) {
-          if (!cancelled) {
-            controller.error(error);
-          }
-        } finally {
-          stream.off("error", onError);
-        }
-      })();
     },
     cancel(reason) {
       cancelled = true;
-      if (onError) {
-        stream.off("error", onError);
-      }
       stream.destroy(toError(reason));
     },
   });
@@ -280,6 +289,13 @@ function wrapConnectionWithExit(
     initialize(params) {
       return withExit("initialize", connection.initialize(params));
     },
+    unstable_forkSession: connection.unstable_forkSession
+      ? (params) =>
+          withExit(
+            "unstable_forkSession",
+            connection.unstable_forkSession(params),
+          )
+      : undefined,
     listSessions: connection.listSessions
       ? (params) => withExit("listSessions", connection.listSessions(params))
       : undefined,

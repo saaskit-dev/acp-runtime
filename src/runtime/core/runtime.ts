@@ -1,6 +1,7 @@
 import {
   AcpError,
   AcpCreateError,
+  AcpForkError,
   AcpListError,
   AcpLoadError,
   AcpResumeError,
@@ -24,6 +25,7 @@ import type {
   AcpRuntimeAgent,
   AcpRuntimeAgentInput,
   AcpRuntimeCreateOptions,
+  AcpRuntimeForkSessionOptions,
   AcpRuntimeInitialConfig,
   AcpRuntimeInitialConfigReport,
   AcpRuntimeListAgentSessionsOptions,
@@ -36,6 +38,7 @@ import type {
   AcpRuntimeResumeSessionOptions,
   AcpRuntimeSessionList,
   AcpRuntimeSessionReference,
+  AcpRuntimeStoredSessionWatcher,
   AcpRuntimeSnapshot,
   AcpRuntimeStartSessionOptions,
 } from "./types.js";
@@ -65,12 +68,18 @@ export class AcpRuntime {
   readonly sessions = {
     start: (options: AcpRuntimeStartSessionOptions) =>
       this.startSessionFromInput(options),
+    fork: (options: AcpRuntimeForkSessionOptions) =>
+      this.forkSessionFromInput(options),
     load: (options: AcpRuntimeLoadSessionOptions) =>
       this.loadSessionFromInput(options),
     resume: (options: AcpRuntimeResumeSessionOptions) =>
       this.resumeSessionFromInput(options),
     list: (options: AcpRuntimeListSessionsOptions = {}) =>
       this.listSessions(options),
+    delete: (sessionId: string) => this.deleteStoredSession(sessionId),
+    refresh: () => this.refreshStoredSessions(),
+    watch: (watcher: AcpRuntimeStoredSessionWatcher) =>
+      this.watchStoredSessions(watcher),
   } as const;
 
   constructor(connectionFactory: AcpConnectionFactory, options?: AcpRuntimeOptions);
@@ -100,6 +109,17 @@ export class AcpRuntime {
     assertNoSystemPromptForSessionOpen(options, "load");
     const resolved = await this.resolveSessionOpenOptions(options);
     return this.loadSession({
+      ...resolved,
+      sessionId: options.sessionId,
+    });
+  }
+
+  private async forkSessionFromInput(
+    options: AcpRuntimeForkSessionOptions,
+  ): Promise<AcpRuntimeSession> {
+    assertNoSystemPromptForSessionOpen(options, "fork");
+    const resolved = await this.resolveSessionOpenOptions(options);
+    return this.forkSession({
       ...resolved,
       sessionId: options.sessionId,
     });
@@ -362,6 +382,82 @@ export class AcpRuntime {
     );
   }
 
+  private async forkSession(
+    options: AcpRuntimeForkSessionOptions & {
+      agent: AcpRuntimeAgent;
+      cwd: string;
+    },
+  ): Promise<AcpRuntimeSession> {
+    return withSpan(
+      "acp.session.fork",
+      {
+        attributes: sessionAttributes({
+          action: "fork",
+          agent: options.agent,
+          cwd: options.cwd,
+          sessionId: options.sessionId,
+        }),
+      },
+      async (span, spanContext) => {
+        try {
+          await this.ensureRegistryHydrated();
+          const driver = await this.sessionService.fork({
+            ...options,
+            _observability: this.options.observability,
+            _traceContext: spanContext,
+          } as AcpRuntimeForkSessionOptions & {
+            agent: AcpRuntimeAgent;
+            cwd: string;
+          });
+          let initialConfigReport:
+            | AcpRuntimeInitialConfigReport
+            | undefined;
+          try {
+            initialConfigReport = await applyRuntimeInitialConfig(
+              driver,
+              options.initialConfig,
+            );
+          } catch (error) {
+            await driver.close().catch(() => {});
+            throw error;
+          }
+          const forkedSessionId = driver.snapshot().session.id;
+          span.setAttribute("acp.session.id", forkedSessionId);
+          emitRuntimeLog({
+            attributes: sessionAttributes({
+              action: "fork",
+              agent: options.agent,
+              cwd: options.cwd,
+              sessionId: forkedSessionId,
+            }),
+            body: "Runtime session forked.",
+            context: spanContext,
+            eventName: "acp.session.fork",
+          });
+          return await this.registerManagedSession(driver, initialConfigReport);
+        } catch (error) {
+          emitRuntimeLog({
+            attributes: sessionAttributes({
+              action: "fork",
+              agent: options.agent,
+              cwd: options.cwd,
+              sessionId: options.sessionId,
+            }),
+            body: error instanceof Error ? error.message : String(error),
+            context: spanContext,
+            eventName: "acp.session.fork.failed",
+            exception: error,
+            severityNumber: SeverityNumber.ERROR,
+          });
+          if (error instanceof AcpError) {
+            throw error;
+          }
+          throw new AcpForkError("Failed to fork runtime session.", error);
+        }
+      },
+    );
+  }
+
   private async listSessions(
     options: AcpRuntimeListSessionsOptions,
   ): Promise<AcpRuntimeSessionList> {
@@ -542,6 +638,21 @@ export class AcpRuntime {
       nextCursor: undefined,
       sessions: [],
     };
+  }
+
+  private async deleteStoredSession(sessionId: string): Promise<boolean> {
+    await this.ensureRegistryHydrated();
+    return this.sessionRegistry?.deleteSession(sessionId) ?? false;
+  }
+
+  private refreshStoredSessions(): void {
+    this.sessionRegistry?.notifyRefresh();
+  }
+
+  private watchStoredSessions(
+    watcher: AcpRuntimeStoredSessionWatcher,
+  ): () => void {
+    return this.sessionRegistry?.watch(watcher) ?? (() => {});
   }
 
   private async registerManagedSession(
@@ -740,7 +851,7 @@ function createSessionRegistry(
 
 function assertNoSystemPromptForSessionOpen(
   options: object,
-  action: "load" | "resume",
+  action: "fork" | "load" | "resume",
 ): void {
   if (
     Object.prototype.hasOwnProperty.call(options, "systemPrompt") &&

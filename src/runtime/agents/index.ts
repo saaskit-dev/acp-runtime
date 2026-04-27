@@ -4,6 +4,46 @@ export {
   CODEX_ACP_REGISTRY_ID,
   createCodexAcpAgent,
 } from "./codex-acp.js";
+
+export {
+  OPENCODE_ACP_COMMAND,
+  OPENCODE_ACP_PACKAGE,
+  OPENCODE_ACP_REGISTRY_ID,
+  createOpenCodeAcpAgent,
+} from "./opencode-acp.js";
+export type {
+  OpenCodeAcpAgentOptions,
+  OpenCodeAcpLaunchMode,
+} from "./opencode-acp.js";
+
+export {
+  GITHUB_COPILOT_ACP_COMMAND,
+  GITHUB_COPILOT_ACP_PACKAGE,
+  GITHUB_COPILOT_ACP_REGISTRY_ID,
+  createGitHubCopilotAcpAgent,
+} from "./github-copilot-acp.js";
+export type {
+  GitHubCopilotAcpAgentOptions,
+  GitHubCopilotAcpLaunchMode,
+} from "./github-copilot-acp.js";
+
+export {
+  CURSOR_ACP_COMMAND,
+  CURSOR_ACP_REGISTRY_ID,
+  createCursorAcpAgent,
+} from "./cursor-acp.js";
+export type { CursorAcpAgentOptions } from "./cursor-acp.js";
+
+export {
+  PI_ACP_COMMAND,
+  PI_ACP_PACKAGE,
+  PI_ACP_REGISTRY_ID,
+  createPiAcpAgent,
+} from "./pi-acp.js";
+export type {
+  PiAcpAgentOptions,
+  PiAcpLaunchMode,
+} from "./pi-acp.js";
 export type {
   CodexAcpAgentOptions,
   CodexAcpLaunchMode,

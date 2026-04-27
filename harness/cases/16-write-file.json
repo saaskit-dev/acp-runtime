@@ -6,6 +6,15 @@
   "probes": {
     "simulator-agent-acp-local": {
       "prompt": "/write /tmp/acp-harness-test.txt READY"
+    },
+    "opencode": {
+      "prompt": "Use your file editing or command execution tool to create ./.tmp/tmp-output.txt containing exactly READY. Wait for the tool call to complete, then answer done."
+    },
+    "cursor": {
+      "prompt": "Use your file editing or command execution tool to create ./.tmp/tmp-output.txt containing exactly READY. Wait for the tool call to complete, then answer done."
+    },
+    "pi-acp": {
+      "prompt": "Use your file editing or command execution tool to create ./.tmp/tmp-output.txt containing exactly READY. Wait for the tool call to complete, then answer done."
     }
   },
   "title": "Write File",

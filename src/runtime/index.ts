@@ -1,6 +1,10 @@
 export { AcpRuntime } from "./core/runtime.js";
 export { AcpRuntimeSession } from "./core/session.js";
 export { resolveRuntimeAgentFromRegistry } from "./registry/agent-resolver.js";
+export {
+  ACP_REGISTRY_AGENT_ALIASES,
+  resolveAgentRegistryId as resolveRuntimeAgentId,
+} from "./registry/agent-launch-registry.js";
 export { ACP_RUNTIME_SNAPSHOT_VERSION } from "./core/constants.js";
 export {
   ACP_RUNTIME_CACHE_DIR_ENV_VAR,
@@ -20,9 +24,20 @@ export * from "./agents/index.js";
 export { createStdioAcpConnectionFactory } from "./acp/stdio-connection.js";
 export { resolveRuntimeTerminalAuthenticationRequest } from "./acp/auth-methods.js";
 export {
+  runtimeAuthenticationTerminalSuccessPatterns,
+  selectRuntimeAuthenticationMethod,
+} from "./core/authentication-utils.js";
+export {
+  listRuntimeAgentModeKeys,
+  resolveRuntimeAgentModeId,
+  runtimeAgentModeKey,
+  runtimeAgentModeUriFragment,
+} from "./core/mode-utils.js";
+export {
   AcpAuthenticationError,
   AcpCreateError,
   AcpError,
+  AcpForkError,
   AcpInitialConfigError,
   AcpLoadError,
   AcpListError,
@@ -40,6 +55,8 @@ export {
 export {
   AcpRuntimeAgentConfigOptionType,
   AcpRuntimeAuthenticationMethodType,
+  ACP_RUNTIME_AUTHENTICATION_DEFAULT_METHOD_META_KEY,
+  ACP_RUNTIME_TERMINAL_AUTH_SUCCESS_PATTERNS_META_KEY,
   AcpRuntimeChangeType,
   AcpRuntimeContentPartType,
   AcpRuntimeMcpTransportType,
@@ -102,6 +119,7 @@ export type {
   AcpRuntimeDiffWatcher,
   AcpRuntimeDiagnostics,
   AcpRuntimeFilesystemHandler,
+  AcpRuntimeForkSessionOptions,
   AcpRuntimeInitialConfig,
   AcpRuntimeInitialConfigReport,
   AcpRuntimeInitialConfigReportItem,

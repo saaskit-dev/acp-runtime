@@ -4,6 +4,8 @@ import type {
   Client,
   CloseSessionRequest,
   CloseSessionResponse,
+  ForkSessionRequest,
+  ForkSessionResponse,
   InitializeRequest,
   InitializeResponse,
   ListSessionsRequest,
@@ -33,6 +35,9 @@ export type AcpConnection = {
   ): Promise<AuthenticateResponse | void>;
   cancel(params: { sessionId: string }): Promise<void>;
   initialize(params: InitializeRequest): Promise<InitializeResponse>;
+  unstable_forkSession?(
+    params: ForkSessionRequest,
+  ): Promise<ForkSessionResponse>;
   listSessions?(params: ListSessionsRequest): Promise<ListSessionsResponse>;
   loadSession?(params: LoadSessionRequest): Promise<LoadSessionResponse>;
   newSession(params: NewSessionRequest): Promise<NewSessionResponse>;

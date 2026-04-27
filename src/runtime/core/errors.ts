@@ -14,6 +14,10 @@ export class AcpCreateError extends AcpError {
   readonly code: string = "CREATE_ERROR";
 }
 
+export class AcpForkError extends AcpError {
+  readonly code: string = "FORK_ERROR";
+}
+
 export class AcpLoadError extends AcpError {
   readonly code: string = "LOAD_ERROR";
 }

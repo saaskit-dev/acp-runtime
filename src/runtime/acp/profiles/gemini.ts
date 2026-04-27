@@ -3,7 +3,10 @@ import type {
   PromptResponse,
 } from "@agentclientprotocol/sdk";
 
-import type { AcpRuntimeAgent } from "../../core/types.js";
+import {
+  ACP_RUNTIME_TERMINAL_AUTH_SUCCESS_PATTERNS_META_KEY,
+  type AcpRuntimeAgent,
+} from "../../core/types.js";
 import { createAgentProfile, type AcpAgentProfile } from "./profile.js";
 
 export const GEMINI_TERMINAL_AUTH_METHOD_ID = "spawn-gemini-cli";
@@ -38,6 +41,10 @@ export function createGeminiAgentProfile(
               env: agent.env ?? {},
               label: "gemini /auth",
             },
+            [ACP_RUNTIME_TERMINAL_AUTH_SUCCESS_PATTERNS_META_KEY]: [
+              "Login successful",
+              "Type your message",
+            ],
           },
           description: "Login with your Google or Vertex AI account",
           id: GEMINI_TERMINAL_AUTH_METHOD_ID,

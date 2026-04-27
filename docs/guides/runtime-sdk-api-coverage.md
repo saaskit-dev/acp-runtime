@@ -21,15 +21,26 @@ also read [Runtime SDK Read Models](runtime-sdk-read-models.md).
 | `resolveRuntimeCachePath(...)` | API guide default-path section |
 | `resolveRuntimeAgentFromRegistry(...)` | Stage 3, [runtime-sdk-stage-3-session-recovery.ts](../../examples/runtime-sdk-stage-3-session-recovery.ts) |
 | `resolveRuntimeTerminalAuthenticationRequest(...)` | Stage 7, [runtime-sdk-stage-7-host-authority.ts](../../examples/runtime-sdk-stage-7-host-authority.ts) |
+| `selectRuntimeAuthenticationMethod(...)` / `runtimeAuthenticationTerminalSuccessPatterns(...)` | Demo auth adapter and unit coverage |
+| `resolveRuntimeAgentModeId(...)` / `listRuntimeAgentModeKeys(...)` | Interactive smoke CLI and unit coverage |
+
+Agent-specific compatibility is covered through runtime profiles. Hosts should
+not duplicate per-agent workarounds; add coverage under `src/runtime/acp/profiles`
+when a new agent exposes behavior that differs from the ACP shape expected by
+the runtime.
 
 ## Runtime Session Management
 
 | API | Coverage |
 | --- | --- |
 | `runtime.sessions.start(...)` | Stage 1, [runtime-sdk-stage-1-minimal.ts](../../examples/runtime-sdk-stage-1-minimal.ts) |
+| `runtime.sessions.fork(...)` | Unit coverage, [runtime.test.ts](../../src/runtime/runtime.test.ts) |
 | `runtime.sessions.load(...)` | Stage 3, [runtime-sdk-stage-3-session-recovery.ts](../../examples/runtime-sdk-stage-3-session-recovery.ts) |
 | `runtime.sessions.resume(...)` | Stage 3, [runtime-sdk-stage-3-session-recovery.ts](../../examples/runtime-sdk-stage-3-session-recovery.ts) |
 | `runtime.sessions.list(...)` | Stage 3 and Stage 6, [runtime-sdk-stage-6-stored-sessions.ts](../../examples/runtime-sdk-stage-6-stored-sessions.ts) |
+| `runtime.sessions.delete(...)` | Unit coverage, [runtime.test.ts](../../src/runtime/runtime.test.ts) |
+| `runtime.sessions.refresh()` | Unit coverage, [runtime.test.ts](../../src/runtime/runtime.test.ts) |
+| `runtime.sessions.watch(...)` | Unit coverage, [runtime.test.ts](../../src/runtime/runtime.test.ts) |
 
 ## Session Getters
 
@@ -134,7 +145,11 @@ also read [Runtime SDK Read Models](runtime-sdk-read-models.md).
 | `createSimulatorAgentAcpAgent(...)` | Stage 1 explicit path, [runtime-sdk-stage-1-minimal.ts](../../examples/runtime-sdk-stage-1-minimal.ts) |
 | `createClaudeCodeAcpAgent(...)` | Manual-agent override path, same pattern as Stage 1 explicit start |
 | `createCodexAcpAgent(...)` | Manual-agent override path, same pattern as Stage 1 explicit start |
+| `createCursorAcpAgent(...)` | Manual-agent override path, same pattern as Stage 1 explicit start |
 | `createGeminiCliAcpAgent(...)` | Manual-agent override path, same pattern as Stage 1 explicit start |
+| `createGitHubCopilotAcpAgent(...)` | Manual-agent override path, same pattern as Stage 1 explicit start |
+| `createOpenCodeAcpAgent(...)` | Manual-agent override path, same pattern as Stage 1 explicit start |
+| `createPiAcpAgent(...)` | Manual-agent override path, same pattern as Stage 1 explicit start |
 | `*_COMMAND`, `*_PACKAGE`, `*_REGISTRY_ID` constants | agent launch metadata for explicit startup and tooling integration |
 
 ## Typed Runtime Errors

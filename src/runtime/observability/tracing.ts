@@ -163,7 +163,7 @@ export function recordException(span: Span, error: unknown): void {
 }
 
 export function sessionAttributes(input: {
-  action: "list" | "load" | "resume" | "start";
+  action: "fork" | "list" | "load" | "resume" | "start";
   agent: AcpRuntimeAgent;
   cwd: string;
   sessionId?: string;

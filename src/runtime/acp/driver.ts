@@ -2165,32 +2165,13 @@ function coalescePrompts(prompts: readonly AcpRuntimePrompt[]): AcpRuntimePrompt
     return (prompts as readonly string[]).join("\n\n");
   }
 
-  const messages: AcpRuntimePromptMessage[] = [];
+  const items: Array<AcpRuntimePromptMessage | AcpRuntimePromptPart> = [];
   for (const prompt of prompts) {
     if (typeof prompt === "string") {
-      messages.push({ content: prompt, role: "user" });
+      items.push({ content: prompt, role: "user" });
       continue;
     }
-    if (isPromptMessageArray(prompt)) {
-      messages.push(...prompt);
-      continue;
-    }
-    messages.push({
-      content: prompt as readonly AcpRuntimePromptPart[],
-      role: "user",
-    });
+    items.push(...prompt);
   }
-  return messages;
-}
-
-function isPromptMessageArray(
-  prompt: readonly AcpRuntimePromptPart[] | readonly AcpRuntimePromptMessage[],
-): prompt is readonly AcpRuntimePromptMessage[] {
-  const first = prompt[0];
-  return Boolean(
-    first &&
-      typeof first === "object" &&
-      "role" in first &&
-      "content" in first,
-  );
+  return items;
 }
