@@ -18,7 +18,11 @@ import {
   AcpRuntimeThreadEntryKind,
   AcpRuntimeTurnEventType,
   createStdioAcpConnectionFactory,
+  listRuntimeAgentModeKeys,
+  resolveRuntimeAgentId,
+  resolveRuntimeAgentModeId,
   resolveRuntimeHomePath,
+  runtimeAgentModeKey,
   type AcpRuntimeHistoryEntry,
   type AcpRuntimeInitialConfig,
   type AcpRuntimeInitialConfigReport,
@@ -115,13 +119,6 @@ type TurnEventProjection = {
   project(event: AcpRuntimeTurnEvent): TurnEventProjectionInstruction;
 };
 
-const AGENT_ALIASES: Record<string, string> = {
-  claude: "claude-acp",
-  codex: "codex-acp",
-  gemini: "gemini",
-  simulator: "simulator-agent-acp-local",
-};
-
 const LOCAL_COMMANDS = [
   "/help",
   "/mode",
@@ -150,9 +147,9 @@ const DEFAULT_LOG_FILE = resolveRuntimeHomePath("logs", "runtime.log");
 
 function resolveAgentId(inputAgent: string | undefined): string {
   if (!inputAgent) {
-    return AGENT_ALIASES.simulator;
+    return resolveRuntimeAgentId("simulator");
   }
-  return AGENT_ALIASES[inputAgent] ?? inputAgent;
+  return resolveRuntimeAgentId(inputAgent);
 }
 
 function isLocalSimulatorAgent(agentId: string): boolean {
@@ -580,7 +577,7 @@ function completeLocalCommand(
   }
 
   if (parts[0] === "/mode") {
-    const modes = session?.agent.listModes().map((mode) => mode.id) ?? [];
+    const modes = listRuntimeAgentModeKeys(session?.agent.listModes() ?? []);
     const current = trailingSpace ? "" : (parts[1] ?? "");
     const matches = modes.filter((mode) => mode.startsWith(current));
     return [matches.length > 0 ? matches : modes, current];
@@ -664,11 +661,14 @@ function formatAgentModes(
 
   return [
     "[runtime] modes",
-    ...modes.map((mode) =>
-      mode.description
-        ? `  ${mode.id.padEnd(20)} ${mode.name} - ${mode.description}`
-        : `  ${mode.id.padEnd(20)} ${mode.name}`,
-    ),
+    ...modes.map((mode) => {
+      const key = runtimeAgentModeKey(mode);
+      const id = key === mode.id ? "" : ` (${mode.id})`;
+      return mode.description
+        ? `  ${key.padEnd(12)} ${mode.name}${id} - ${mode.description}`
+        : `  ${key.padEnd(12)} ${mode.name}${id}`;
+    }),
+    "usage: /mode <id|name>",
   ].join("\n");
 }
 
@@ -1112,8 +1112,25 @@ function color(code: string, text: string): string {
 }
 
 function formatUnknownError(error: unknown): string {
+  return formatUnknownErrorWithCauses(error);
+}
+
+function formatUnknownErrorWithCauses(
+  error: unknown,
+  seen = new Set<unknown>(),
+): string {
   if (error instanceof Error) {
-    return error.stack ?? `${error.name}: ${error.message}`;
+    if (getErrorExitCode(error) !== undefined) {
+      return `${error.name}: ${error.message}`;
+    }
+    const formatted = error.stack ?? `${error.name}: ${error.message}`;
+    const cause = (error as { cause?: unknown }).cause;
+    if (cause === undefined || seen.has(cause)) {
+      return formatted;
+    }
+    seen.add(error);
+    seen.add(cause);
+    return `${formatted}\nCaused by: ${formatUnknownErrorWithCauses(cause, seen)}`;
   }
 
   try {
@@ -1121,6 +1138,19 @@ function formatUnknownError(error: unknown): string {
   } catch {
     return String(error);
   }
+}
+
+function getErrorExitCode(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+
+  const value = (error as { exitCode?: unknown }).exitCode;
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    return undefined;
+  }
+
+  return value;
 }
 
 function shortenForTerminal(text: string, max = 160): string {
@@ -1995,15 +2025,12 @@ async function runRepl(
         "Use plain text for agent prompts. Local commands: /help, /mode, /config, /thread, /diffs, /terminals, /toolcalls, /operations, /permissions, /usage, /metadata, /queue, /queue-policy, /queue-clear, /drop, /cancel, /insert, /slash, /exit",
       );
       console.log("  /mode                  Show available modes");
-      console.log("  /mode <id>             Switch current mode");
+      console.log("  /mode <id|name>        Switch current mode");
       console.log("  /config                Show config options");
       console.log("  /config <id|category>  Show one config option");
       console.log("  /config <id> <value>   Set one config option");
       console.log("  /config <id>=<value>   Set one config option");
       console.log("  /config-json           Show raw config option JSON");
-      console.log("  startup flags           --mode=<id> --model=<id> --effort=<level>");
-      console.log("  startup strict          --initial-config-strict fails startup if any initial config is skipped");
-      console.log("  startup prompt          --system-prompt=<text> or --system-prompt-file=<path>");
       console.log("  /thread                Show structured thread entries");
       console.log("  /diffs                 Show session diff objects");
       console.log("  /terminals             Show terminal objects and output previews");
@@ -2146,11 +2173,18 @@ async function runRepl(
     }
 
     if (prompt.startsWith("/mode ")) {
-      const modeId = prompt.slice("/mode ".length).trim();
-      if (modeId === "") {
-        console.log("usage: /mode <id>");
+      const requestedMode = prompt.slice("/mode ".length).trim();
+      const resolvedMode = resolveRuntimeAgentModeId(
+        session.agent.listModes(),
+        requestedMode,
+      );
+      if (!resolvedMode.modeId) {
+        console.log(
+          resolvedMode.error ? `[runtime] ${resolvedMode.error}` : "usage: /mode <id|name>",
+        );
         continue;
       }
+      const modeId = resolvedMode.modeId;
       try {
         await session.agent.setMode(modeId);
         logSink.emit({
@@ -2169,6 +2203,7 @@ async function runRepl(
         logSink.emit({
           attributes: {
             "acp.agent.mode": modeId,
+            "acp.agent.mode.requested": requestedMode,
             "acp.demo.command.name": "mode",
           },
           body: formatted,
@@ -2176,7 +2211,7 @@ async function runRepl(
           exception: error,
           severityNumber: SeverityNumber.ERROR,
         });
-        console.error(`[runtime] failed to set mode ${modeId}`);
+        console.error(`[runtime] failed to set mode ${requestedMode}`);
         console.error(formatted);
       }
       continue;
@@ -2557,5 +2592,5 @@ async function main(): Promise<void> {
 
 void main().catch((error: unknown) => {
   console.error(formatUnknownError(error));
-  process.exitCode = 1;
+  process.exitCode = getErrorExitCode(error) ?? 1;
 });
