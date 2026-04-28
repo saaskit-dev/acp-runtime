@@ -1,0 +1,39 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "acp-relay-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-27",
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "AcpRelayShard",
+        "name": "ACP_RELAY_SHARDS"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "new_sqlite_classes": ["AcpRelayShard"],
+      "tag": "v1"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "ACP_RELAY_DB",
+      "database_name": "acp-relay",
+      "database_id": "replace-with-d1-database-id"
+    }
+  ],
+  "vars": {
+    "ACP_RELAY_CLIENT_RECONNECT_GRACE_MS": "30000",
+    "ACP_RELAY_DAEMON_RECONNECT_GRACE_MS": "30000",
+    "ACP_RELAY_HEARTBEAT_INTERVAL_MS": "30000",
+    "ACP_RELAY_HEARTBEAT_TIMEOUT_MS": "45000",
+    "ACP_RELAY_MAX_BUFFERED_FRAMES_PER_CONNECTION": "64",
+    "ACP_RELAY_MAX_CONNECTIONS_PER_ACCOUNT": "64",
+    "ACP_RELAY_TICKET_KID": "relay-production"
+  },
+  "observability": {
+    "enabled": true
+  }
+}
