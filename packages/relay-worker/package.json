@@ -8,6 +8,7 @@
     "db:migrations:apply:local": "wrangler d1 migrations apply acp-relay --local",
     "db:migrations:apply:remote": "wrangler d1 migrations apply acp-relay --remote",
     "deploy": "wrangler deploy",
+    "deploy:staging": "wrangler deploy --config wrangler.staging.jsonc",
     "dev": "wrangler dev",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json"
