@@ -193,6 +193,313 @@ describe("AcpRemoteRuntimeAgent", () => {
     });
     expect(startCalled).toBe(false);
   });
+
+  it("handles session lifecycle: create, list, close", async () => {
+    const streams = createStreamPair();
+    const session = createFakeRuntimeSession({ onPrompt() {} });
+    let listCalled = false;
+    let closeCalled = false;
+    const runtime = {
+      sessions: {
+        async list() {
+          listCalled = true;
+          return { sessions: [{ cwd: "/workspace", id: "s-1", title: "S1" }] };
+        },
+        async load() {
+          return session;
+        },
+        async resume() {
+          return session;
+        },
+        async start() {
+          return session;
+        },
+      },
+    };
+
+    const agentConnection = new AgentSideConnection(
+      (connection) =>
+        createAcpRemoteRuntimeAgent({
+          connection,
+          options: { agent: { command: "fake", type: "fake" }, runtime },
+        }),
+      streams.server,
+    );
+    void agentConnection.closed.catch(() => {});
+
+    const clientConnection = new ClientSideConnection(
+      () =>
+        ({
+          async requestPermission() {
+            return { outcome: { optionId: "allow_once", outcome: "selected" } };
+          },
+          async sessionUpdate() {},
+        }) satisfies Client,
+      streams.client,
+    );
+    void clientConnection.closed.catch(() => {});
+
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+
+    const created = await clientConnection.newSession({
+      cwd: "/workspace",
+      mcpServers: [],
+    });
+    expect(created.sessionId).toBe("runtime-session-1");
+
+    const listed = await clientConnection.listSessions({ cwd: "/workspace" });
+    expect(listCalled).toBe(true);
+    expect(listed.sessions).toHaveLength(1);
+
+    session.close = async () => {
+      closeCalled = true;
+    };
+    await clientConnection.closeSession({ sessionId: created.sessionId });
+    expect(closeCalled).toBe(true);
+  });
+
+  it("handles setSessionMode and setSessionConfigOption", async () => {
+    const streams = createStreamPair();
+    let modeSet: string | undefined;
+    let configSet: { id: string; value: unknown } | undefined;
+    const session = createFakeRuntimeSession({ onPrompt() {} });
+    session.agent.setMode = async (modeId: string) => {
+      modeSet = modeId;
+    };
+    session.agent.setConfigOption = async (configId: string, value: unknown) => {
+      configSet = { id: configId, value };
+    };
+    const runtime = {
+      sessions: {
+        async list() {
+          return { sessions: [] };
+        },
+        async load() {
+          return session;
+        },
+        async resume() {
+          return session;
+        },
+        async start() {
+          return session;
+        },
+      },
+    };
+
+    const agentConnection = new AgentSideConnection(
+      (connection) =>
+        createAcpRemoteRuntimeAgent({
+          connection,
+          options: { agent: { command: "fake", type: "fake" }, runtime },
+        }),
+      streams.server,
+    );
+    void agentConnection.closed.catch(() => {});
+
+    const clientConnection = new ClientSideConnection(
+      () =>
+        ({
+          async requestPermission() {
+            return { outcome: { optionId: "allow_once", outcome: "selected" } };
+          },
+          async sessionUpdate() {},
+        }) satisfies Client,
+      streams.client,
+    );
+    void clientConnection.closed.catch(() => {});
+
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+
+    const created = await clientConnection.newSession({
+      cwd: "/workspace",
+      mcpServers: [],
+    });
+
+    await clientConnection.setSessionMode({
+      modeId: "plan",
+      sessionId: created.sessionId,
+    });
+    expect(modeSet).toBe("plan");
+
+    await clientConnection.setSessionConfigOption({
+      configId: "auto_approve",
+      sessionId: created.sessionId,
+      type: "boolean",
+      value: true,
+    });
+    expect(configSet).toEqual({ id: "auto_approve", value: true });
+  });
+
+  it("forwards permission prompts to the remote client", async () => {
+    const streams = createStreamPair();
+    let permissionRequested = false;
+    const session = createFakeRuntimeSession({ onPrompt() {} });
+    session.turn.start = (prompt) => ({
+      completion: Promise.resolve({
+        output: [{ text: "done", type: "text" }],
+        outputText: "done",
+        turnId: "turn-perm",
+      }),
+      events: (async function* () {
+        yield { turnId: "turn-perm", type: AcpRuntimeTurnEventType.Started };
+        yield {
+          turnId: "turn-perm",
+          type: AcpRuntimeTurnEventType.Completed,
+          output: [{ text: "done", type: "text" }],
+          outputText: "done",
+        };
+      })(),
+      turnId: "turn-perm",
+    });
+    const runtime = {
+      sessions: {
+        async list() {
+          return { sessions: [] };
+        },
+        async load() {
+          return session;
+        },
+        async resume() {
+          return session;
+        },
+        async start() {
+          return session;
+        },
+      },
+    };
+
+    const agentConnection = new AgentSideConnection(
+      (connection) =>
+        createAcpRemoteRuntimeAgent({
+          connection,
+          options: { agent: { command: "fake", type: "fake" }, runtime },
+        }),
+      streams.server,
+    );
+    void agentConnection.closed.catch(() => {});
+
+    const clientConnection = new ClientSideConnection(
+      () =>
+        ({
+          async requestPermission() {
+            permissionRequested = true;
+            return { outcome: { optionId: "allow_session", outcome: "selected" } };
+          },
+          async sessionUpdate() {},
+        }) satisfies Client,
+      streams.client,
+    );
+    void clientConnection.closed.catch(() => {});
+
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+
+    const created = await clientConnection.newSession({
+      cwd: "/workspace",
+      mcpServers: [],
+    });
+
+    const response = await clientConnection.prompt({
+      prompt: [{ text: "do something risky", type: "text" }],
+      sessionId: created.sessionId,
+    });
+    expect(response.stopReason).toBe("end_turn");
+  });
+
+  it("handles turn cancellation", async () => {
+    const streams = createStreamPair();
+    let cancelCalled = false;
+    const session = createFakeRuntimeSession({ onPrompt() {} });
+    let resolveCancel: () => void;
+    const cancelPromise = new Promise<void>((resolve) => {
+      resolveCancel = resolve;
+    });
+    session.turn.cancel = async () => {
+      cancelCalled = true;
+      resolveCancel();
+      return true;
+    };
+    session.turn.start = () => ({
+      completion: new Promise(() => {}),
+      events: (async function* () {
+        yield { turnId: "turn-cancel", type: AcpRuntimeTurnEventType.Started };
+        await cancelPromise;
+        yield { turnId: "turn-cancel", type: AcpRuntimeTurnEventType.Cancelled };
+      })(),
+      turnId: "turn-cancel",
+    });
+    const runtime = {
+      sessions: {
+        async list() {
+          return { sessions: [] };
+        },
+        async load() {
+          return session;
+        },
+        async resume() {
+          return session;
+        },
+        async start() {
+          return session;
+        },
+      },
+    };
+
+    const agentConnection = new AgentSideConnection(
+      (connection) =>
+        createAcpRemoteRuntimeAgent({
+          connection,
+          options: { agent: { command: "fake", type: "fake" }, runtime },
+        }),
+      streams.server,
+    );
+    void agentConnection.closed.catch(() => {});
+
+    const clientConnection = new ClientSideConnection(
+      () =>
+        ({
+          async requestPermission() {
+            return { outcome: { optionId: "allow_once", outcome: "selected" } };
+          },
+          async sessionUpdate() {},
+        }) satisfies Client,
+      streams.client,
+    );
+    void clientConnection.closed.catch(() => {});
+
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+
+    const created = await clientConnection.newSession({
+      cwd: "/workspace",
+      mcpServers: [],
+    });
+
+    const promptPromise = clientConnection.prompt({
+      prompt: [{ text: "long task", type: "text" }],
+      sessionId: created.sessionId,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    clientConnection.cancel({
+      sessionId: created.sessionId,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(cancelCalled).toBe(true);
+    void promptPromise.catch(() => {});
+  });
 });
 
 function createStreamPair(): { client: Stream; server: Stream } {
