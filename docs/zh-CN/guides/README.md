@@ -13,3 +13,5 @@
 - [Runtime SDK 读模型说明](runtime-sdk-read-models.md)
 - [Runtime SDK Minimal Demo](runtime-sdk-minimal-demo.md)
 - [Runtime SDK Demo](runtime-sdk-demo.md)
+- [Remote ACP Runtime 实施计划](remote-acp-runtime-implementation-plan.md)
+- [Remote ACP Runtime 部署指南](remote-acp-runtime-deployment.md)
