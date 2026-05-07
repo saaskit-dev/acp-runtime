@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import { createMemoryWebSocketPair } from "../shared/test-helpers.js";
+
 import {
   ACP_REMOTE_PROTOCOL_VERSION,
   AcpRemoteChannelKind,
@@ -54,10 +56,10 @@ describe("remote ACP protocol", () => {
   it("checks ticket expiration and scopes", () => {
     const ticket: AcpRemoteConnectionTicket = {
       accountId: "acct-1",
-      clientDeviceId: "client-1",
+      clientId: "client-1",
       connectionId: "conn-1",
       expiresAt: "2026-04-27T00:10:00.000Z",
-      hostId: "host-1",
+      daemonId: "host-1",
       issuedAt: "2026-04-27T00:00:00.000Z",
       jti: "ticket-1",
       policyVersion: 1,
@@ -85,8 +87,8 @@ describe("remote ACP protocol", () => {
       connectionId: "conn-1",
       grant: {
         accountId: "acct-1",
-        clientDeviceId: "client-1",
-        hostId: "host-1",
+        clientId: "client-1",
+        daemonId: "host-1",
         policyVersion: 1,
         scopes: ["acp:connect", "acp:turn:send"],
       },
@@ -99,14 +101,14 @@ describe("remote ACP protocol", () => {
     await expect(
       verifyAcpRemoteSignedConnectionTicket(ticket, key, {
         connectionId: "conn-1",
-        hostId: "host-1",
+        daemonId: "host-1",
         now: new Date("2026-04-27T00:00:30.000Z"),
         requiredScopes: ["acp:connect"],
       }),
     ).resolves.toMatchObject({
       accountId: "acct-1",
       connectionId: "conn-1",
-      hostId: "host-1",
+      daemonId: "host-1",
     });
     await expect(
       verifyAcpRemoteSignedConnectionTicket(
@@ -114,7 +116,7 @@ describe("remote ACP protocol", () => {
           ...ticket,
           payload: {
             ...ticket.payload,
-            hostId: "host-2",
+            daemonId: "host-2",
           },
         },
         key,
@@ -127,6 +129,55 @@ describe("remote ACP protocol", () => {
     ).rejects.toThrow("expired");
   });
 
+  it("signs and verifies connection tickets with Ed25519 public keys", async () => {
+    const keyPair = await createAcpRemoteDeviceKeyPair();
+    const signingKey = {
+      kid: "relay-test-ed25519",
+      privateKey: keyPair.privateKey,
+    };
+    const ticket = await createAcpRemoteSignedConnectionTicket({
+      connectionId: "conn-ed25519",
+      grant: {
+        accountId: "acct-1",
+        clientId: "client-1",
+        daemonId: "host-1",
+        policyVersion: 1,
+        scopes: ["acp:connect"],
+      },
+      jti: "ticket-ed25519",
+      key: signingKey,
+      now: new Date("2026-04-27T00:00:00.000Z"),
+      ttlMs: 60_000,
+    });
+
+    expect(ticket).toMatchObject({
+      alg: "Ed25519",
+      kid: "relay-test-ed25519",
+    });
+    await expect(
+      verifyAcpRemoteSignedConnectionTicket(
+        ticket,
+        [
+          {
+            alg: "Ed25519",
+            kid: "relay-test-ed25519",
+            publicKey: keyPair.publicKey,
+          },
+        ],
+        {
+          connectionId: "conn-ed25519",
+          daemonId: "host-1",
+          now: new Date("2026-04-27T00:00:30.000Z"),
+          requiredScopes: ["acp:connect"],
+        },
+      ),
+    ).resolves.toMatchObject({
+      accountId: "acct-1",
+      connectionId: "conn-ed25519",
+      daemonId: "host-1",
+    });
+  });
+
   it("verifies tickets after JSON transport drops undefined optional fields", async () => {
     const key = {
       kid: "test-key",
@@ -136,8 +187,8 @@ describe("remote ACP protocol", () => {
       connectionId: "conn-undefined",
       grant: {
         accountId: "acct-1",
-        clientDeviceId: undefined,
-        hostId: "host-1",
+        clientId: undefined,
+        daemonId: "host-1",
         policyVersion: 1,
         scopes: ["acp:connect"],
         workspaceId: undefined,
@@ -154,14 +205,14 @@ describe("remote ACP protocol", () => {
     await expect(
       verifyAcpRemoteSignedConnectionTicket(transported, key, {
         connectionId: "conn-undefined",
-        hostId: "host-1",
+        daemonId: "host-1",
         now: new Date("2026-04-27T00:00:30.000Z"),
         requiredScopes: ["acp:connect"],
       }),
     ).resolves.toMatchObject({
       accountId: "acct-1",
       connectionId: "conn-undefined",
-      hostId: "host-1",
+      daemonId: "host-1",
     });
   });
 
@@ -169,9 +220,9 @@ describe("remote ACP protocol", () => {
     const keyPair = await createAcpRemoteDeviceKeyPair();
     const proofInput = {
       accountId: "acct-1",
-      clientDeviceId: "client-1",
+      clientId: "client-1",
       connectionId: "conn-1",
-      hostId: "host-1",
+      daemonId: "host-1",
       nonce: "a1b2c3d4e5f6g7h8",
       ticketJti: "ticket-1",
       timestamp: String(Date.parse("2026-04-27T00:00:00.000Z")),
@@ -196,7 +247,7 @@ describe("remote ACP protocol", () => {
         now: new Date("2026-04-27T00:00:30.000Z"),
         proof: {
           ...proof,
-          hostId: "host-2",
+          daemonId: "host-2",
         },
         publicKey: keyPair.publicKey,
       }),
@@ -242,78 +293,3 @@ describe("remote ACP protocol", () => {
     writer.releaseLock();
   });
 });
-
-class MemoryWebSocket {
-  private readonly closeListeners = new Set<() => void>();
-  private readonly errorListeners = new Set<() => void>();
-  private readonly messageListeners = new Set<(event: { data: unknown }) => void>();
-  private closed = false;
-  peer?: MemoryWebSocket;
-
-  addEventListener(type: "close" | "error", listener: () => void): void;
-  addEventListener(type: "message", listener: (event: { data: unknown }) => void): void;
-  addEventListener(
-    type: "close" | "error" | "message",
-    listener: (() => void) | ((event: { data: unknown }) => void),
-  ): void {
-    if (type === "message") {
-      this.messageListeners.add(listener as (event: { data: unknown }) => void);
-    } else if (type === "close") {
-      this.closeListeners.add(listener as () => void);
-    } else {
-      this.errorListeners.add(listener as () => void);
-    }
-  }
-
-  close(): void {
-    if (this.closed) {
-      return;
-    }
-    this.closed = true;
-    for (const listener of this.closeListeners) {
-      listener();
-    }
-    this.peer?.close();
-  }
-
-  removeEventListener(type: "close" | "error", listener: () => void): void;
-  removeEventListener(type: "message", listener: (event: { data: unknown }) => void): void;
-  removeEventListener(
-    type: "close" | "error" | "message",
-    listener: (() => void) | ((event: { data: unknown }) => void),
-  ): void {
-    if (type === "message") {
-      this.messageListeners.delete(listener as (event: { data: unknown }) => void);
-    } else if (type === "close") {
-      this.closeListeners.delete(listener as () => void);
-    } else {
-      this.errorListeners.delete(listener as () => void);
-    }
-  }
-
-  send(data: string): void {
-    if (this.closed) {
-      return;
-    }
-    queueMicrotask(() => {
-      this.peer?.receive(data);
-    });
-  }
-
-  private receive(data: string): void {
-    if (this.closed) {
-      return;
-    }
-    for (const listener of this.messageListeners) {
-      listener({ data });
-    }
-  }
-}
-
-function createMemoryWebSocketPair(): [MemoryWebSocket, MemoryWebSocket] {
-  const left = new MemoryWebSocket();
-  const right = new MemoryWebSocket();
-  left.peer = right;
-  right.peer = left;
-  return [left, right];
-}

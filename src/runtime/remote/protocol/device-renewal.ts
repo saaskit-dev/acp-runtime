@@ -1,8 +1,8 @@
 export type AcpRemoteDeviceRenewalProofInput = {
   accountId: string;
-  clientDeviceId: string;
+  clientId: string;
   connectionId: string;
-  hostId: string;
+  daemonId: string;
   nonce: string;
   ticketJti: string;
   timestamp: string;
@@ -115,9 +115,9 @@ export async function verifyAcpRemoteDeviceRenewalProof(input: {
 function deviceRenewalPayload(input: AcpRemoteDeviceRenewalProofInput): string {
   return [
     input.accountId,
-    input.clientDeviceId,
+    input.clientId,
     input.connectionId,
-    input.hostId,
+    input.daemonId,
     input.ticketJti,
     input.timestamp,
     input.nonce,

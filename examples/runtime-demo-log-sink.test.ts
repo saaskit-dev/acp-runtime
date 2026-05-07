@@ -3,6 +3,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SeverityNumber } from "@opentelemetry/api-logs";
 import { describe, expect, it } from "vitest";
+import type {
+  AcpRelayLogUploadRecord,
+  AcpRelayLogUploader,
+} from "@saaskit-dev/acp-runtime";
 
 import { configureDemoLogSink } from "./runtime-demo-log-sink.js";
 
@@ -32,8 +36,26 @@ describe("runtime demo log sink", () => {
       expect(sink.sessionRawLogFile).toBe(
         join(root, "sessions", "session-1", "runtime.log.jsonl"),
       );
+      expect(sink.categoryLogFiles).toMatchObject({
+        errors: `${logFile}.errors.jsonl`,
+        events: `${logFile}.events.jsonl`,
+        spans: `${logFile}.spans.jsonl`,
+        text: `${logFile}.text.jsonl`,
+      });
+      expect(sink.sessionCategoryLogFiles).toMatchObject({
+        errors: join(root, "sessions", "session-1", "runtime.log.errors.jsonl"),
+        events: join(root, "sessions", "session-1", "runtime.log.events.jsonl"),
+        spans: join(root, "sessions", "session-1", "runtime.log.spans.jsonl"),
+        text: join(root, "sessions", "session-1", "runtime.log.text.jsonl"),
+      });
       expect((await stat(sink.sessionLogFile ?? "")).isFile()).toBe(true);
       expect((await stat(sink.sessionRawLogFile ?? "")).isFile()).toBe(true);
+      for (const path of Object.values(sink.categoryLogFiles ?? {})) {
+        expect((await stat(path)).isFile()).toBe(true);
+      }
+      for (const path of Object.values(sink.sessionCategoryLogFiles ?? {})) {
+        expect((await stat(path)).isFile()).toBe(true);
+      }
 
       await expect(readFile(logFile, "utf8")).resolves.toContain(
         "rendered timeline line",
@@ -66,6 +88,16 @@ describe("runtime demo log sink", () => {
       expect(record.instrumentationScope).toMatchObject({
         name: "@saaskit-dev/acp-runtime/demo",
       });
+
+      await expect(readFile(`${logFile}.text.jsonl`, "utf8")).resolves.toContain(
+        "rendered timeline line",
+      );
+      await expect(readFile(`${logFile}.events.jsonl`, "utf8")).resolves.toContain(
+        "acp.demo.tool.completed",
+      );
+      await expect(readFile(`${logFile}.errors.jsonl`, "utf8")).resolves.toContain(
+        "acp.demo.tool.completed",
+      );
     } finally {
       await rm(root, { force: true, recursive: true });
     }
@@ -91,5 +123,40 @@ describe("runtime demo log sink", () => {
     } finally {
       await rm(root, { force: true, recursive: true });
     }
+  });
+
+  it("uploads human and OTel log records to relay without requiring a local log file", async () => {
+    const text: string[] = [];
+    const records: AcpRelayLogUploadRecord[] = [];
+    const relayUploader: AcpRelayLogUploader = {
+      async close() {},
+      emit(record) {
+        records.push(record);
+      },
+      async flush() {},
+      writeText(message) {
+        text.push(message);
+      },
+    };
+
+    const sink = await configureDemoLogSink(undefined, { relayUploader });
+    sink.writeLine("\u001b[31mrelay timeline\u001b[0m");
+    sink.emit({
+      body: "relay event",
+      eventName: "acp.demo.relay",
+    });
+    await sink.close();
+
+    expect(text).toContain("relay timeline");
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          body: "relay event",
+          eventName: "acp.demo.relay",
+          kind: "otel_log",
+          severityNumber: SeverityNumber.INFO,
+        }),
+      ]),
+    );
   });
 });

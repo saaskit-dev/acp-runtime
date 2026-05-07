@@ -1,6 +1,6 @@
 export type AcpDaemonRegistrationProofInput = {
   accountId: string;
-  hostId: string;
+  daemonId: string;
   nonce: string;
   timestamp: string;
 };
@@ -51,7 +51,7 @@ export async function createDaemonRegistrationKeySignature(
     input.privateKey,
     toArrayBuffer(new TextEncoder().encode(daemonRegistrationPayload(input))),
   );
-  return bytesToHex(new Uint8Array(signature));
+  return bytesToBase64Url(new Uint8Array(signature));
 }
 
 export async function verifyDaemonRegistrationProof(
@@ -95,19 +95,23 @@ async function verifyDaemonRegistrationKeySignature(
     signature: string;
   },
 ): Promise<boolean> {
-  const publicKey = await crypto.subtle.importKey(
-    "raw",
-    toArrayBuffer(base64UrlToBytes(input.publicKey)),
-    "Ed25519",
-    false,
-    ["verify"],
-  );
-  return crypto.subtle.verify(
-    "Ed25519",
-    publicKey,
-    toArrayBuffer(hexToBytes(input.signature)),
-    toArrayBuffer(new TextEncoder().encode(daemonRegistrationPayload(input))),
-  );
+  try {
+    const publicKey = await crypto.subtle.importKey(
+      "raw",
+      toArrayBuffer(base64UrlToBytes(input.publicKey)),
+      "Ed25519",
+      false,
+      ["verify"],
+    );
+    return crypto.subtle.verify(
+      "Ed25519",
+      publicKey,
+      toArrayBuffer(base64UrlToBytes(input.signature)),
+      toArrayBuffer(new TextEncoder().encode(daemonRegistrationPayload(input))),
+    );
+  } catch {
+    return false;
+  }
 }
 
 function daemonRegistrationPayload(
@@ -115,7 +119,7 @@ function daemonRegistrationPayload(
 ): string {
   return [
     input.accountId,
-    input.hostId,
+    input.daemonId,
     input.timestamp,
     input.nonce,
   ].join("\n");
@@ -125,23 +129,6 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   return copy.buffer;
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return [...bytes]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-function hexToBytes(value: string): Uint8Array {
-  if (value.length % 2 !== 0 || !/^[0-9a-f]*$/iu.test(value)) {
-    return new Uint8Array();
-  }
-  const bytes = new Uint8Array(value.length / 2);
-  for (let index = 0; index < value.length; index += 2) {
-    bytes[index / 2] = Number.parseInt(value.slice(index, index + 2), 16);
-  }
-  return bytes;
 }
 
 function bytesToBase64Url(bytes: Uint8Array): string {

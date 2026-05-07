@@ -27,7 +27,10 @@ import { mapInitializeResponseToCapabilities } from "./capability-mapper.js";
 import { mapMcpServersToAcp } from "./connection-types.js";
 import { AcpSdkSessionDriver } from "./driver.js";
 import { selectRuntimeAuthenticationMethod } from "../core/authentication-utils.js";
-import { emitRuntimeLog } from "../observability/logging.js";
+import {
+  emitRuntimeLog,
+  emitRuntimeSuppressedError,
+} from "../observability/logging.js";
 import { mergeTraceMeta, sessionAttributes, withSpan } from "../observability/tracing.js";
 import { resolveAcpAgentProfile } from "./profiles/index.js";
 import type { AcpAgentProfile } from "./profiles/profile.js";
@@ -86,7 +89,19 @@ export function createAcpSessionService(
         });
         return driver;
       } catch (error) {
-        await Promise.resolve(bootstrap.dispose?.()).catch(() => {});
+        await Promise.resolve(bootstrap.dispose?.()).catch((disposeError) => {
+          emitRuntimeSuppressedError({
+            attributes: sessionAttributes({
+              action: "start",
+              agent: systemPrompt.agent,
+              cwd: input.cwd,
+            }),
+            body: "ACP session cleanup failed after create error.",
+            context: getTraceContext(input),
+            eventName: "acp.session.cleanup.failed",
+            exception: disposeError,
+          });
+        });
         throw error;
       }
     },
@@ -138,7 +153,20 @@ export function createAcpSessionService(
         });
         return driver;
       } catch (error) {
-        await Promise.resolve(bootstrap.dispose?.()).catch(() => {});
+        await Promise.resolve(bootstrap.dispose?.()).catch((disposeError) => {
+          emitRuntimeSuppressedError({
+            attributes: sessionAttributes({
+              action: "fork",
+              agent: input.agent,
+              cwd: input.cwd,
+              sessionId: input.sessionId,
+            }),
+            body: "ACP session cleanup failed after fork error.",
+            context: getTraceContext(input),
+            eventName: "acp.session.cleanup.failed",
+            exception: disposeError,
+          });
+        });
         throw error;
       }
     },
@@ -231,7 +259,20 @@ export function createAcpSessionService(
         driver.sealHistoryReplay();
         return driver;
       } catch (error) {
-        await Promise.resolve(bootstrap.dispose?.()).catch(() => {});
+        await Promise.resolve(bootstrap.dispose?.()).catch((disposeError) => {
+          emitRuntimeSuppressedError({
+            attributes: sessionAttributes({
+              action: "load",
+              agent: input.agent,
+              cwd: input.cwd,
+              sessionId: input.sessionId,
+            }),
+            body: "ACP session cleanup failed after load error.",
+            context: getTraceContext(input),
+            eventName: "acp.session.cleanup.failed",
+            exception: disposeError,
+          });
+        });
         throw error;
       }
     },
@@ -280,7 +321,20 @@ export function createAcpSessionService(
         });
         return driver;
       } catch (error) {
-        await Promise.resolve(bootstrap.dispose?.()).catch(() => {});
+        await Promise.resolve(bootstrap.dispose?.()).catch((disposeError) => {
+          emitRuntimeSuppressedError({
+            attributes: sessionAttributes({
+              action: "resume",
+              agent: input.snapshot.agent,
+              cwd: input.snapshot.cwd,
+              sessionId: input.snapshot.session.id,
+            }),
+            body: "ACP session cleanup failed after resume error.",
+            context: getTraceContext(input),
+            eventName: "acp.session.cleanup.failed",
+            exception: disposeError,
+          });
+        });
         throw error;
       }
     },
@@ -418,7 +472,19 @@ async function bootstrapAcpSession(input: {
       initializeResponse: normalizedInitializeResponse,
     };
   } catch (error) {
-    await Promise.resolve(handle.dispose?.()).catch(() => {});
+    await Promise.resolve(handle.dispose?.()).catch((disposeError) => {
+      emitRuntimeSuppressedError({
+        attributes: sessionAttributes({
+          action: "start",
+          agent: input.agent,
+          cwd: input.cwd,
+        }),
+        body: "ACP connection cleanup failed after bootstrap error.",
+        context: input.traceContext,
+        eventName: "acp.session.bootstrap.cleanup.failed",
+        exception: disposeError,
+      });
+    });
     throw error;
   }
 }

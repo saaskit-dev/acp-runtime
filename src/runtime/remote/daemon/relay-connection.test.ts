@@ -2,6 +2,8 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { MemoryWebSocket, createMemoryWebSocketPair, waitFor } from "../shared/test-helpers.js";
+
 import {
   ClientSideConnection,
   PROTOCOL_VERSION,
@@ -28,6 +30,7 @@ import {
   createAcpRemoteSignedConnectionTicket,
   createAcpJsonRpcWebSocketStream,
   type AcpRemoteDataFrame,
+  type AcpRemoteFrame,
   type AcpRemoteSignedConnectionTicket,
 } from "../protocol/index.js";
 import { createAcpRemoteDaemonConnection } from "./relay-connection.js";
@@ -60,7 +63,7 @@ describe("ACP remote daemon relay connection", () => {
         command: process.execPath,
         type: SIMULATOR_AGENT_ACP_REGISTRY_ID,
       },
-      hostId: "host-smoke",
+      daemonId: "host-smoke",
       runtime: createUnusedRuntime(),
       socket: daemonSocket,
       ticketVerificationKeys: [relayTicketKey],
@@ -83,6 +86,88 @@ describe("ACP remote daemon relay connection", () => {
     daemon.close();
   });
 
+  it("logs relay ACP frames with trace context", async () => {
+    const [daemonSocket, relaySocket] = createMemoryWebSocketPair();
+    const debugContexts: {
+      direction?: string;
+      method?: string;
+      traceId?: string;
+    }[] = [];
+    const ticket = await createAcpRemoteSignedConnectionTicket({
+      connectionId: "conn-trace",
+      grant: {
+        accountId: "acct-smoke",
+        clientDeviceId: "client-smoke",
+        daemonId: "host-smoke",
+        policyVersion: 1,
+        scopes: ["acp:connect"],
+      },
+      jti: "ticket-trace",
+      key: relayTicketKey,
+      now: new Date("2026-04-27T00:00:00.000Z"),
+      ttlMs: 60_000,
+    });
+
+    const daemon = createAcpRemoteDaemonConnection({
+      agent: {
+        command: process.execPath,
+        type: SIMULATOR_AGENT_ACP_REGISTRY_ID,
+      },
+      daemonId: "host-smoke",
+      debugLog(_message, context) {
+        if (context) {
+          debugContexts.push(context);
+        }
+      },
+      now: () => new Date("2026-04-27T00:00:30.000Z"),
+      runtime: createUnusedRuntime(),
+      socket: daemonSocket,
+      ticketVerificationKeys: [relayTicketKey],
+    });
+
+    relaySocket.send(
+      JSON.stringify({
+        connectionId: "conn-trace",
+        endpoint: AcpRemoteEndpointKind.Client,
+        frameType: AcpRemoteFrameType.Hello,
+        protocolVersion: ACP_REMOTE_PROTOCOL_VERSION,
+        ticket,
+      }),
+    );
+    relaySocket.send(
+      JSON.stringify({
+        channelId: "acp",
+        channelKind: AcpRemoteChannelKind.Acp,
+        connectionId: "conn-trace",
+        frameType: AcpRemoteFrameType.Data,
+        payload: {
+          id: 1,
+          jsonrpc: "2.0",
+          method: "initialize",
+          params: {
+            _meta: {
+              traceparent:
+                "00-11111111111111111111111111111111-2222222222222222-01",
+            },
+            clientCapabilities: {},
+            protocolVersion: PROTOCOL_VERSION,
+          },
+        },
+        seq: 1,
+      } satisfies AcpRemoteDataFrame),
+    );
+
+    await waitFor(() =>
+      debugContexts.some(
+        (context) =>
+          context.direction === "relay_to_daemon" &&
+          context.method === "initialize" &&
+          context.traceId === "11111111111111111111111111111111",
+      ),
+    );
+    daemon.close();
+  });
+
   it("rejects ACP data before a valid connection ticket", async () => {
     const [daemonSocket, relaySocket] = createMemoryWebSocketPair();
     const closeFrames: unknown[] = [];
@@ -98,7 +183,7 @@ describe("ACP remote daemon relay connection", () => {
         command: process.execPath,
         type: SIMULATOR_AGENT_ACP_REGISTRY_ID,
       },
-      hostId: "host-smoke",
+      daemonId: "host-smoke",
       runtime: createUnusedRuntime(),
       socket: daemonSocket,
       ticketVerificationKeys: [relayTicketKey],
@@ -131,6 +216,59 @@ describe("ACP remote daemon relay connection", () => {
     daemon.close();
   });
 
+  it("rejects connection tickets when verification keys are not configured", async () => {
+    const [daemonSocket, relaySocket] = createMemoryWebSocketPair();
+    const closeFrames: unknown[] = [];
+    relaySocket.addEventListener("message", (event) => {
+      const frame = assertAcpRemoteFrame(JSON.parse(String(event.data)));
+      if (frame.frameType === AcpRemoteFrameType.Close) {
+        closeFrames.push(frame);
+      }
+    });
+    const ticket = await createAcpRemoteSignedConnectionTicket({
+      connectionId: "conn-unverified",
+      grant: {
+        accountId: "acct-smoke",
+        clientId: "client-smoke",
+        daemonId: "host-smoke",
+        policyVersion: 1,
+        scopes: ["acp:connect", "acp:session:create"],
+      },
+      jti: "ticket-unverified",
+      key: relayTicketKey,
+      now: new Date("2026-04-27T00:00:00.000Z"),
+      ttlMs: 60_000,
+    });
+
+    const daemon = createAcpRemoteDaemonConnection({
+      agent: {
+        command: process.execPath,
+        type: SIMULATOR_AGENT_ACP_REGISTRY_ID,
+      },
+      daemonId: "host-smoke",
+      runtime: createUnusedRuntime(),
+      socket: daemonSocket,
+    });
+
+    relaySocket.send(
+      JSON.stringify({
+        connectionId: "conn-unverified",
+        endpoint: AcpRemoteEndpointKind.Client,
+        frameType: AcpRemoteFrameType.Hello,
+        protocolVersion: ACP_REMOTE_PROTOCOL_VERSION,
+        ticket,
+      }),
+    );
+
+    await waitFor(() => closeFrames.length > 0);
+    expect(closeFrames[0]).toMatchObject({
+      code: "invalid_ticket",
+      connectionId: "conn-unverified",
+      frameType: AcpRemoteFrameType.Close,
+    });
+    daemon.close();
+  });
+
   it("rejects scoped ACP methods missing from the connection ticket", async () => {
     const [nativeClientSocket, nativeRelaySocket] = createMemoryWebSocketPair();
     const [daemonSocket, daemonRelaySocket] = createMemoryWebSocketPair();
@@ -139,7 +277,7 @@ describe("ACP remote daemon relay connection", () => {
       grant: {
         accountId: "acct-smoke",
         clientDeviceId: "client-smoke",
-        hostId: "host-smoke",
+        daemonId: "host-smoke",
         policyVersion: 1,
         scopes: ["acp:connect"],
       },
@@ -160,7 +298,7 @@ describe("ACP remote daemon relay connection", () => {
         command: process.execPath,
         type: SIMULATOR_AGENT_ACP_REGISTRY_ID,
       },
-      hostId: "host-smoke",
+      daemonId: "host-smoke",
       now: () => new Date("2026-04-27T00:00:30.000Z"),
       runtime: createUnusedRuntime(),
       socket: daemonSocket,
@@ -228,7 +366,7 @@ describe("ACP remote daemon relay connection", () => {
       grant: {
         accountId: "acct-smoke",
         clientDeviceId: "client-smoke",
-        hostId: "host-smoke",
+        daemonId: "host-smoke",
         policyVersion: 1,
         scopes: ["acp:connect", "acp:session:create"],
         workspaceRoots: ["/ticket-allowed"],
@@ -251,7 +389,7 @@ describe("ACP remote daemon relay connection", () => {
         command: "fake-agent",
         type: "fake",
       },
-      hostId: "host-smoke",
+      daemonId: "host-smoke",
       now: () => new Date("2026-04-27T00:00:30.000Z"),
       runtime: {
         sessions: {
@@ -326,7 +464,7 @@ describe("ACP remote daemon relay connection", () => {
       grant: {
         accountId: "acct-smoke",
         clientDeviceId: "client-smoke",
-        hostId: "host-smoke",
+        daemonId: "host-smoke",
         policyVersion: 1,
         scopes: ["acp:connect", "acp:session:create"],
       },
@@ -344,7 +482,7 @@ describe("ACP remote daemon relay connection", () => {
         command: "fake-agent",
         type: "fake",
       },
-      hostId: "host-smoke",
+      daemonId: "host-smoke",
       now: () => new Date("2026-04-27T00:00:30.000Z"),
       runtime: {
         sessions: {
@@ -372,7 +510,7 @@ describe("ACP remote daemon relay connection", () => {
         connectionId: "conn-dup",
         endpoint: AcpRemoteEndpointKind.Client,
         frameType: AcpRemoteFrameType.Hello,
-        hostId: "host-smoke",
+        daemonId: "host-smoke",
         protocolVersion: ACP_REMOTE_PROTOCOL_VERSION,
         ticket,
       }),
@@ -463,6 +601,135 @@ describe("ACP remote daemon relay connection", () => {
     daemon.close();
   });
 
+  it("queues daemon outbound frames instead of closing when the ack window is full", async () => {
+    const [daemonSocket, relaySocket] = createMemoryWebSocketPair();
+    const outboundFrames: AcpRemoteFrame[] = [];
+    const ticket = await createAcpRemoteSignedConnectionTicket({
+      connectionId: "conn-outbound-queue",
+      grant: {
+        accountId: "acct-smoke",
+        clientDeviceId: "client-smoke",
+        daemonId: "host-smoke",
+        policyVersion: 1,
+        scopes: ["acp:connect", "acp:session:create", "acp:turn:send"],
+      },
+      jti: "ticket-outbound-queue",
+      key: relayTicketKey,
+      now: new Date("2026-04-27T00:00:00.000Z"),
+      ttlMs: 60_000,
+    });
+    relaySocket.addEventListener("message", (event) => {
+      outboundFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+
+    const daemon = createAcpRemoteDaemonConnection({
+      agent: {
+        command: "fake-agent",
+        type: "fake",
+      },
+      daemonId: "host-smoke",
+      maxBufferedFramesPerConnection: 2,
+      now: () => new Date("2026-04-27T00:00:30.000Z"),
+      runtime: {
+        sessions: {
+          async list() {
+            return { sessions: [] };
+          },
+          async load() {
+            throw new Error("Unexpected remote load.");
+          },
+          async resume() {
+            throw new Error("Unexpected remote resume.");
+          },
+          async start() {
+            return createFakeRuntimeSession({ textEventCount: 5 });
+          },
+        },
+      },
+      socket: daemonSocket,
+      ticketVerificationKeys: [relayTicketKey],
+    });
+
+    relaySocket.send(
+      JSON.stringify({
+        connectionId: "conn-outbound-queue",
+        endpoint: AcpRemoteEndpointKind.Client,
+        frameType: AcpRemoteFrameType.Hello,
+        daemonId: "host-smoke",
+        protocolVersion: ACP_REMOTE_PROTOCOL_VERSION,
+        ticket,
+      }),
+    );
+    relaySocket.send(createRelayAcpFrame("conn-outbound-queue", 1, {
+      id: 1,
+      jsonrpc: "2.0",
+      method: "initialize",
+      params: {
+        clientCapabilities: {},
+        protocolVersion: PROTOCOL_VERSION,
+      },
+    }));
+    await waitFor(() =>
+      outboundFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcResultPayload(frame.payload, 1),
+      ),
+    );
+    ackLatestDataFrame(relaySocket, outboundFrames, "conn-outbound-queue");
+
+    relaySocket.send(createRelayAcpFrame("conn-outbound-queue", 2, {
+      id: 2,
+      jsonrpc: "2.0",
+      method: "session/new",
+      params: {
+        cwd: "/tmp/project",
+        mcpServers: [],
+      },
+    }));
+    await waitFor(() =>
+      outboundFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcResultPayload(frame.payload, 2),
+      ),
+    );
+    ackLatestDataFrame(relaySocket, outboundFrames, "conn-outbound-queue");
+
+    outboundFrames.length = 0;
+    relaySocket.send(createRelayAcpFrame("conn-outbound-queue", 3, {
+      id: 3,
+      jsonrpc: "2.0",
+      method: "session/prompt",
+      params: {
+        prompt: [{ text: "burst", type: "text" }],
+        sessionId: "runtime-session-1",
+      },
+    }));
+
+    await waitFor(
+      () =>
+        outboundFrames.filter((frame) => frame.frameType === AcpRemoteFrameType.Data)
+          .length === 2,
+    );
+    await delay(20);
+    expect(
+      outboundFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Close),
+    ).toBe(false);
+
+    ackLatestDataFrame(relaySocket, outboundFrames, "conn-outbound-queue");
+    await waitFor(
+      () =>
+        outboundFrames.filter((frame) => frame.frameType === AcpRemoteFrameType.Data)
+          .length >= 3,
+    );
+    expect(
+      outboundFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Close),
+    ).toBe(false);
+
+    daemon.close();
+  });
+
   it("runs a native ACP client prompt through relay frames into simulator-backed runtime", async () => {
     const root = await mkdtemp(join(tmpdir(), "acp-remote-smoke-"));
     const projectDir = join(root, "project");
@@ -478,7 +745,7 @@ describe("ACP remote daemon relay connection", () => {
       grant: {
         accountId: "acct-smoke",
         clientDeviceId: "client-smoke",
-        hostId: "host-smoke",
+        daemonId: "host-smoke",
         policyVersion: 1,
         scopes: [
           "acp:connect",
@@ -506,7 +773,7 @@ describe("ACP remote daemon relay connection", () => {
         command: process.execPath,
         type: SIMULATOR_AGENT_ACP_REGISTRY_ID,
       },
-      hostId: "host-smoke",
+      daemonId: "host-smoke",
       now: () => new Date("2026-04-27T00:00:30.000Z"),
       runtime,
       socket: daemonSocket,
@@ -562,73 +829,6 @@ describe("ACP remote daemon relay connection", () => {
   });
 });
 
-class MemoryWebSocket {
-  private readonly closeListeners = new Set<() => void>();
-  private readonly errorListeners = new Set<() => void>();
-  private readonly messageListeners = new Set<(event: { data: unknown }) => void>();
-  private closed = false;
-  peer?: MemoryWebSocket;
-
-  addEventListener(type: "close" | "error", listener: () => void): void;
-  addEventListener(type: "message", listener: (event: { data: unknown }) => void): void;
-  addEventListener(
-    type: "close" | "error" | "message",
-    listener: (() => void) | ((event: { data: unknown }) => void),
-  ): void {
-    if (type === "message") {
-      this.messageListeners.add(listener as (event: { data: unknown }) => void);
-    } else if (type === "close") {
-      this.closeListeners.add(listener as () => void);
-    } else {
-      this.errorListeners.add(listener as () => void);
-    }
-  }
-
-  close(): void {
-    if (this.closed) {
-      return;
-    }
-    this.closed = true;
-    for (const listener of this.closeListeners) {
-      listener();
-    }
-    this.peer?.close();
-  }
-
-  removeEventListener(type: "close" | "error", listener: () => void): void;
-  removeEventListener(type: "message", listener: (event: { data: unknown }) => void): void;
-  removeEventListener(
-    type: "close" | "error" | "message",
-    listener: (() => void) | ((event: { data: unknown }) => void),
-  ): void {
-    if (type === "message") {
-      this.messageListeners.delete(listener as (event: { data: unknown }) => void);
-    } else if (type === "close") {
-      this.closeListeners.delete(listener as () => void);
-    } else {
-      this.errorListeners.delete(listener as () => void);
-    }
-  }
-
-  send(data: string): void {
-    if (this.closed) {
-      return;
-    }
-    queueMicrotask(() => {
-      this.peer?.receive(data);
-    });
-  }
-
-  private receive(data: string): void {
-    if (this.closed) {
-      return;
-    }
-    for (const listener of this.messageListeners) {
-      listener({ data });
-    }
-  }
-}
-
 function createUnusedRuntime(): Parameters<
   typeof createAcpRemoteDaemonConnection
 >[0]["runtime"] {
@@ -650,7 +850,7 @@ function createUnusedRuntime(): Parameters<
   };
 }
 
-function createFakeRuntimeSession(): AcpRuntimeSession {
+function createFakeRuntimeSession(options: { textEventCount?: number } = {}): AcpRuntimeSession {
   return {
     agent: {
       listConfigOptions: () => [],
@@ -709,30 +909,54 @@ function createFakeRuntimeSession(): AcpRuntimeSession {
           outputText: "hello from runtime",
           turnId: "turn-1",
         }),
-        events: createTurnEvents(),
+        events: createTurnEvents(options.textEventCount),
         turnId: "turn-1",
       }),
-      stream: () => createTurnEvents(),
+      stream: () => createTurnEvents(options.textEventCount),
     },
   } as unknown as AcpRuntimeSession;
 }
 
-async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    if (predicate()) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error("Timed out waiting for condition.");
+function createRelayAcpFrame(
+  connectionId: string,
+  seq: number,
+  payload: AnyMessage,
+): string {
+  return JSON.stringify({
+    channelId: "acp",
+    channelKind: AcpRemoteChannelKind.Acp,
+    connectionId,
+    frameType: AcpRemoteFrameType.Data,
+    payload,
+    seq,
+  } satisfies AcpRemoteDataFrame);
 }
 
-function createMemoryWebSocketPair(): [MemoryWebSocket, MemoryWebSocket] {
-  const left = new MemoryWebSocket();
-  const right = new MemoryWebSocket();
-  left.peer = right;
-  right.peer = left;
-  return [left, right];
+function ackLatestDataFrame(
+  relaySocket: MemoryWebSocket,
+  outboundFrames: readonly AcpRemoteFrame[],
+  connectionId: string,
+): void {
+  const dataFrames = outboundFrames.filter(
+    (frame): frame is AcpRemoteDataFrame =>
+      frame.frameType === AcpRemoteFrameType.Data,
+  );
+  const frame = dataFrames[dataFrames.length - 1];
+  if (!frame) {
+    throw new Error("No outbound data frame to acknowledge.");
+  }
+  relaySocket.send(
+    JSON.stringify({
+      ack: frame.seq,
+      channelId: "acp",
+      connectionId,
+      frameType: AcpRemoteFrameType.Ack,
+    }),
+  );
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function bindNativeRelaySockets(input: {
@@ -751,7 +975,7 @@ function bindNativeRelaySockets(input: {
           connectionId: input.connectionId,
           endpoint: AcpRemoteEndpointKind.Client,
           frameType: AcpRemoteFrameType.Hello,
-          hostId: input.ticket.payload.hostId,
+          daemonId: input.ticket.payload.daemonId,
           protocolVersion: ACP_REMOTE_PROTOCOL_VERSION,
           ticket: input.ticket,
         }),
@@ -778,11 +1002,18 @@ function bindNativeRelaySockets(input: {
   });
 }
 
-async function* createTurnEvents() {
+async function* createTurnEvents(textEventCount = 1) {
   yield {
     turnId: "turn-1",
     type: AcpRuntimeTurnEventType.Started,
   };
+  for (let index = 0; index < textEventCount; index += 1) {
+    yield {
+      text: `chunk ${index}`,
+      turnId: "turn-1",
+      type: AcpRuntimeTurnEventType.Text,
+    };
+  }
   yield {
     output: [{ text: "hello from runtime", type: "text" }],
     outputText: "hello from runtime",

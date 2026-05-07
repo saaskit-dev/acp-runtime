@@ -9,16 +9,30 @@ import {
   requireAcpRemoteScopes,
 } from "./validation.js";
 
-export const ACP_REMOTE_TICKET_ALGORITHM = "HS256" as const;
+type AcpRemoteTicketCryptoKey = Awaited<
+  ReturnType<typeof crypto.subtle.importKey>
+>;
+
+export const ACP_REMOTE_TICKET_ALGORITHM = "Ed25519" as const;
+export const ACP_REMOTE_LEGACY_TICKET_ALGORITHM = "HS256" as const;
 
 export type AcpRemoteTicketSigningKey = {
+  alg?: typeof ACP_REMOTE_TICKET_ALGORITHM | typeof ACP_REMOTE_LEGACY_TICKET_ALGORITHM;
   kid: string;
-  secret: string | Uint8Array;
+  privateKey?: AcpRemoteTicketCryptoKey | string;
+  secret?: string | Uint8Array;
+};
+
+export type AcpRemoteTicketVerificationKey = {
+  alg?: typeof ACP_REMOTE_TICKET_ALGORITHM | typeof ACP_REMOTE_LEGACY_TICKET_ALGORITHM;
+  kid: string;
+  publicKey?: AcpRemoteTicketCryptoKey | string;
+  secret?: string | Uint8Array;
 };
 
 export type AcpRemoteTicketVerificationOptions = {
   connectionId?: string;
-  hostId?: string;
+  daemonId?: string;
   now?: Date;
   policyVersion?: number;
   requiredScopes?: readonly AcpRemoteScope[];
@@ -33,6 +47,17 @@ export type CreateAcpRemoteConnectionTicketOptions = {
 };
 
 const DEFAULT_CONNECTION_TICKET_TTL_MS = 5 * 60 * 1000;
+
+export const ACP_REMOTE_DEFAULT_TICKET_PUBLIC_KEYS = [
+  {
+    alg: ACP_REMOTE_TICKET_ALGORITHM,
+    kid: "relay-production",
+    publicKey: "HEvsutPKGSF_zpCHyoAOo-IehsIcm8reYtr5z7lbt-E",
+  },
+] as const satisfies readonly [
+  AcpRemoteTicketVerificationKey,
+  ...AcpRemoteTicketVerificationKey[],
+];
 
 export function createAcpRemoteConnectionTicket(
   options: CreateAcpRemoteConnectionTicketOptions,
@@ -52,11 +77,14 @@ export async function signAcpRemoteConnectionTicket(
   ticket: AcpRemoteConnectionTicket,
   key: AcpRemoteTicketSigningKey,
 ): Promise<AcpRemoteSignedConnectionTicket> {
+  const alg = key.privateKey
+    ? ACP_REMOTE_TICKET_ALGORITHM
+    : (key.alg ?? ACP_REMOTE_LEGACY_TICKET_ALGORITHM);
   return {
-    alg: ACP_REMOTE_TICKET_ALGORITHM,
+    alg,
     kid: key.kid,
     payload: ticket,
-    signature: await signTicketPayload(ticket, key.secret),
+    signature: await signTicketPayload(ticket, key),
   };
 }
 
@@ -73,10 +101,15 @@ export async function createAcpRemoteSignedConnectionTicket(
 
 export async function verifyAcpRemoteSignedConnectionTicket(
   ticket: AcpRemoteSignedConnectionTicket,
-  keys: AcpRemoteTicketSigningKey | readonly AcpRemoteTicketSigningKey[],
+  keys:
+    | AcpRemoteTicketVerificationKey
+    | readonly AcpRemoteTicketVerificationKey[],
   options: AcpRemoteTicketVerificationOptions = {},
 ): Promise<AcpRemoteConnectionTicket> {
-  if (ticket.alg !== ACP_REMOTE_TICKET_ALGORITHM) {
+  if (
+    ticket.alg !== ACP_REMOTE_TICKET_ALGORITHM &&
+    ticket.alg !== ACP_REMOTE_LEGACY_TICKET_ALGORITHM
+  ) {
     throw new Error(`Unsupported ACP remote ticket algorithm: ${ticket.alg}`);
   }
 
@@ -87,8 +120,8 @@ export async function verifyAcpRemoteSignedConnectionTicket(
     throw new Error(`Unknown ACP remote ticket key: ${ticket.kid}`);
   }
 
-  const expectedSignature = await signTicketPayload(ticket.payload, key.secret);
-  if (!constantTimeEqual(ticket.signature, expectedSignature)) {
+  const signatureValid = await verifyTicketPayload(ticket, key);
+  if (!signatureValid) {
     throw new Error("Invalid ACP remote ticket signature.");
   }
 
@@ -101,7 +134,7 @@ export async function verifyAcpRemoteSignedConnectionTicket(
   ) {
     throw new Error("ACP remote ticket connection mismatch.");
   }
-  if (options.hostId !== undefined && ticket.payload.hostId !== options.hostId) {
+  if (options.daemonId !== undefined && ticket.payload.daemonId !== options.daemonId) {
     throw new Error("ACP remote ticket host mismatch.");
   }
   if (
@@ -123,10 +156,29 @@ function canonicalizeTicketPayload(ticket: AcpRemoteConnectionTicket): string {
 
 async function signTicketPayload(
   ticket: AcpRemoteConnectionTicket,
-  secret: string | Uint8Array,
+  key: AcpRemoteTicketSigningKey,
 ): Promise<string> {
+  if (key.privateKey) {
+    const cryptoKey =
+      typeof key.privateKey === "string"
+        ? await importEd25519PrivateKey(key.privateKey)
+        : key.privateKey;
+    const signature = await crypto.subtle.sign(
+      "Ed25519",
+      cryptoKey,
+      toArrayBuffer(
+        new TextEncoder().encode(canonicalizeTicketPayload(ticket)),
+      ),
+    );
+    return bytesToBase64Url(new Uint8Array(signature));
+  }
+  if (!key.secret) {
+    throw new Error("ACP remote ticket signing key is missing private material.");
+  }
   const secretBytes =
-    typeof secret === "string" ? new TextEncoder().encode(secret) : secret;
+    typeof key.secret === "string"
+      ? new TextEncoder().encode(key.secret)
+      : key.secret;
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
     toArrayBuffer(secretBytes),
@@ -143,6 +195,63 @@ async function signTicketPayload(
     toArrayBuffer(new TextEncoder().encode(canonicalizeTicketPayload(ticket))),
   );
   return bytesToBase64Url(new Uint8Array(signature));
+}
+
+async function verifyTicketPayload(
+  ticket: AcpRemoteSignedConnectionTicket,
+  key: AcpRemoteTicketVerificationKey,
+): Promise<boolean> {
+  if (ticket.alg === ACP_REMOTE_TICKET_ALGORITHM) {
+    if (!key.publicKey) {
+      return false;
+    }
+    const cryptoKey =
+      typeof key.publicKey === "string"
+        ? await importEd25519PublicKey(key.publicKey)
+        : key.publicKey;
+    return crypto.subtle.verify(
+      "Ed25519",
+      cryptoKey,
+      toArrayBuffer(base64UrlToBytes(ticket.signature)),
+      toArrayBuffer(
+        new TextEncoder().encode(canonicalizeTicketPayload(ticket.payload)),
+      ),
+    );
+  }
+
+  if (!key.secret) {
+    return false;
+  }
+  const expectedSignature = await signTicketPayload(ticket.payload, {
+    alg: ACP_REMOTE_LEGACY_TICKET_ALGORITHM,
+    kid: key.kid,
+    secret: key.secret,
+  });
+  return constantTimeEqual(ticket.signature, expectedSignature);
+}
+
+async function importEd25519PrivateKey(
+  privateKey: string,
+): Promise<AcpRemoteTicketCryptoKey> {
+  return crypto.subtle.importKey(
+    "pkcs8",
+    toArrayBuffer(base64UrlToBytes(privateKey)),
+    "Ed25519",
+    false,
+    ["sign"],
+  );
+}
+
+async function importEd25519PublicKey(
+  publicKey: string,
+): Promise<AcpRemoteTicketCryptoKey> {
+  return crypto.subtle.importKey(
+    "raw",
+    toArrayBuffer(base64UrlToBytes(publicKey)),
+    "Ed25519",
+    false,
+    ["verify"],
+  );
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -176,6 +285,19 @@ function bytesToBase64Url(bytes: Uint8Array): string {
     .replaceAll("+", "-")
     .replaceAll("/", "_")
     .replaceAll("=", "");
+}
+
+function base64UrlToBytes(value: string): Uint8Array {
+  const padded = value
+    .replaceAll("-", "+")
+    .replaceAll("_", "/")
+    .padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
 }
 
 function constantTimeEqual(left: string, right: string): boolean {

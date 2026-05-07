@@ -21,12 +21,13 @@
     {
       "binding": "ACP_RELAY_DB",
       "database_name": "acp-relay",
-      "database_id": "replace-with-d1-database-id"
+      "database_id": "2d8840b0-11b5-4f98-b006-a7c89636e489",
+      "migrations_dir": "migrations"
     }
   ],
   "vars": {
-    "ACP_RELAY_CLIENT_RECONNECT_GRACE_MS": "30000",
-    "ACP_RELAY_DAEMON_RECONNECT_GRACE_MS": "30000",
+    "ACP_RELAY_CLIENT_RECONNECT_GRACE_MS": "300000",
+    "ACP_RELAY_DAEMON_RECONNECT_GRACE_MS": "300000",
     "ACP_RELAY_HEARTBEAT_INTERVAL_MS": "30000",
     "ACP_RELAY_HEARTBEAT_TIMEOUT_MS": "45000",
     "ACP_RELAY_MAX_BUFFERED_FRAMES_PER_CONNECTION": "64",

@@ -19,7 +19,7 @@ export function isAcpRemoteFrame(value: unknown): value is AcpRemoteFrame {
         value.protocolVersion === ACP_REMOTE_PROTOCOL_VERSION &&
         isString(value.connectionId) &&
         isEndpointKind(value.endpoint) &&
-        optionalString(value.hostId) &&
+        optionalString(value.daemonId) &&
         optionalSignedTicket(value.ticket)
       );
     case AcpRemoteFrameType.Data:
@@ -47,6 +47,7 @@ export function isAcpRemoteFrame(value: unknown): value is AcpRemoteFrame {
         optionalString(value.code) &&
         optionalString(value.reason)
       );
+
     default:
       return false;
   }

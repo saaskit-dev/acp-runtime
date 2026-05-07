@@ -12,11 +12,11 @@ describe("ACP remote daemon relay client", () => {
     expect(
       createAcpRemoteDaemonRelayUrl({
         accountId: "acct-1",
-        hostId: "host-1",
+        daemonId: "host-1",
         relayUrl: "https://relay.example.com/acp?foo=bar",
       }),
     ).toBe(
-      "https://relay.example.com/daemon?foo=bar&accountId=acct-1&hostId=host-1",
+      "https://relay.example.com/daemon?foo=bar&accountId=acct-1&daemonId=host-1",
     );
   });
 
@@ -44,7 +44,12 @@ describe("ACP remote daemon relay client", () => {
     const connected = await connectAcpRemoteDaemonRelay({
       accountId: "acct-1",
       agent: "simulator",
-      hostId: "host-1",
+      daemonId: "host-1",
+      daemonMetadata: {
+        agentTypes: [{ id: "simulator-agent-acp-local", label: "Simulator" }],
+        machine: "dev-mac",
+        workspaceRoots: [{ path: "/Users/dev/acp-runtime" }],
+      },
       relayUrl: "https://relay.example.com/acp",
       runtime: {
         sessions: {
@@ -70,13 +75,19 @@ describe("ACP remote daemon relay client", () => {
       ],
       socketFactory(input) {
         expect(input.url).toBe(
-          "https://relay.example.com/daemon?accountId=acct-1&hostId=host-1",
+          "https://relay.example.com/daemon?accountId=acct-1&daemonId=host-1",
         );
         expect(input.headers["x-acp-account-id"]).toBe("acct-1");
-        expect(input.headers["x-acp-host-id"]).toBe("host-1");
+        expect(input.headers["x-acp-daemon-id"]).toBe("host-1");
         expect(typeof input.headers["x-acp-daemon-signature"]).toBe("string");
         expect(typeof input.headers["x-acp-daemon-nonce"]).toBe("string");
         expect(typeof input.headers["x-acp-daemon-timestamp"]).toBe("string");
+        expect(
+          JSON.parse(input.headers["x-acp-daemon-metadata"] ?? "{}"),
+        ).toMatchObject({
+          machine: "dev-mac",
+          workspaceRoots: [{ path: "/Users/dev/acp-runtime" }],
+        });
         return socket;
       },
     });

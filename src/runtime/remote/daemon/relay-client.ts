@@ -1,4 +1,10 @@
 import {
+  createAcpRemoteRelayUrl,
+  createAcpRemoteWebSocketFactory,
+  type AcpRemoteSocketFactory,
+  type AcpRemoteWebSocketConstructor,
+} from "../shared/index.js";
+import {
   createAcpRemoteDaemonConnection,
   type AcpRemoteDaemonConnectionHandle,
   type AcpRemoteDaemonConnectionOptions,
@@ -6,37 +12,43 @@ import {
 import {
   createAcpRemoteDaemonRegistrationHeaders,
   loadOrCreateAcpRemoteDaemonIdentity,
+  loadOrCreateDaemonMachineIdentity,
   type AcpRemoteDaemonIdentity,
 } from "./host-identity.js";
 import type { AcpWebSocketLike } from "../protocol/websocket-stream.js";
 
-export type AcpRemoteDaemonSocketFactory = (input: {
-  headers: Record<string, string>;
-  url: string;
-}) => AcpWebSocketLike;
+export type DaemonMetadata = {
+  agentTypes: readonly {
+    command?: string;
+    id?: string;
+    type?: string;
+    label: string;
+  }[];
+  machine?: string;
+  workspaceRoots: readonly { path: string; label?: string }[];
+};
 
-export type AcpRemoteDaemonWebSocketConstructor = new (
-  url: string,
-  protocols?: readonly string[] | string,
-  options?: {
-    headers?: Record<string, string>;
-  },
-) => AcpWebSocketLike;
+export type AcpRemoteDaemonSocketFactory = AcpRemoteSocketFactory;
+export type AcpRemoteDaemonWebSocketConstructor = AcpRemoteWebSocketConstructor;
 
 export type ConnectAcpRemoteDaemonRelayOptions = Omit<
   AcpRemoteDaemonConnectionOptions,
   "socket"
 > & {
-  accountId: string;
+  accountId?: string;
+  accountSession?: string;
+  daemonId?: string;
+  daemonMetadata?: DaemonMetadata;
   identity?: AcpRemoteDaemonIdentity;
   identityPath?: string;
   relayUrl: string | URL;
-  socketFactory: AcpRemoteDaemonSocketFactory;
+  socketFactory: AcpRemoteSocketFactory;
 };
 
 export type ConnectedAcpRemoteDaemonRelay =
   AcpRemoteDaemonConnectionHandle & {
     headers: Record<string, string>;
+    daemonId: string;
     identity: AcpRemoteDaemonIdentity;
     socket: AcpWebSocketLike;
     url: string;
@@ -45,57 +57,68 @@ export type ConnectedAcpRemoteDaemonRelay =
 export async function connectAcpRemoteDaemonRelay(
   options: ConnectAcpRemoteDaemonRelayOptions,
 ): Promise<ConnectedAcpRemoteDaemonRelay> {
+  const machine = await loadOrCreateDaemonMachineIdentity();
+  const daemonId = options.daemonId ?? machine.daemonId;
+  const accountId = options.accountId ?? "default";
+
   const identity =
     options.identity ??
-    (await loadOrCreateAcpRemoteDaemonIdentity({
-      accountId: options.accountId,
-      hostId: options.hostId,
-      path: options.identityPath,
-    }));
+    (options.identityPath
+      ? await loadOrCreateAcpRemoteDaemonIdentity({
+          accountId,
+          daemonId,
+          path: options.identityPath,
+        })
+      : machine.identity);
+
   const url = createAcpRemoteDaemonRelayUrl({
-    accountId: options.accountId,
-    hostId: options.hostId,
+    accountId,
+    daemonId,
     relayUrl: options.relayUrl,
   });
   const headers = await createAcpRemoteDaemonRegistrationHeaders({
-    accountId: options.accountId,
-    hostId: options.hostId,
+    accountId,
+    daemonId,
     identity,
   });
+  if (options.accountSession) {
+    headers["Authorization"] = `Bearer ${options.accountSession}`;
+  }
+  if (options.daemonMetadata) {
+    headers["x-acp-daemon-metadata"] = JSON.stringify(options.daemonMetadata);
+  }
   const socket = options.socketFactory({
     headers,
     url,
   });
   const handle = createAcpRemoteDaemonConnection({
     ...options,
+    daemonId,
     socket,
   });
   return {
     ...handle,
     headers,
+    daemonId,
     identity,
     socket,
     url,
   };
 }
 
-export function createAcpRemoteDaemonWebSocketFactory(
-  WebSocketConstructor: AcpRemoteDaemonWebSocketConstructor,
-): AcpRemoteDaemonSocketFactory {
-  return ({ headers, url }) =>
-    new WebSocketConstructor(url, undefined, {
-      headers,
-    });
-}
+export const createAcpRemoteDaemonWebSocketFactory = createAcpRemoteWebSocketFactory;
 
 export function createAcpRemoteDaemonRelayUrl(input: {
   accountId: string;
-  hostId: string;
+  daemonId: string;
   relayUrl: string | URL;
 }): string {
-  const relayUrl = new URL(input.relayUrl);
-  relayUrl.pathname = "/daemon";
-  relayUrl.searchParams.set("accountId", input.accountId);
-  relayUrl.searchParams.set("hostId", input.hostId);
-  return relayUrl.toString();
+  return createAcpRemoteRelayUrl({
+    endpointPath: "/daemon",
+    params: {
+      accountId: input.accountId,
+      daemonId: input.daemonId,
+    },
+    relayUrl: input.relayUrl,
+  });
 }

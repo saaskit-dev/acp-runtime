@@ -1,8 +1,10 @@
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { cwd, stdin as input, stdout as output } from "node:process";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
+import { fileURLToPath } from "node:url";
 import { SeverityNumber } from "@opentelemetry/api-logs";
 
 import {
@@ -30,6 +32,7 @@ import {
   type AcpRuntimeStateUpdate,
   type AcpRuntimeAuthorityHandlers,
   type AcpRuntimeAgentConfigOption,
+  type AcpRuntimeAgentInput,
   type AcpRuntimeConfigValue,
   type AcpRuntimeOperation,
   type AcpRuntimePermissionRequest,
@@ -63,6 +66,7 @@ type TurnRenderer = {
 };
 
 type RuntimeSmokeConfig = {
+  agent: AcpRuntimeAgentInput;
   agentId: string;
   cwd: string;
   cleanup(): Promise<void>;
@@ -144,10 +148,18 @@ const LOCAL_COMMANDS = [
 ] as const;
 
 const DEFAULT_LOG_FILE = resolveRuntimeHomePath("logs", "runtime.log");
+const REMOTE_RELAY_AGENT_ID = "remote";
+const ACP_RELAY_URL_ENV = "ACP_RELAY_URL";
+const ACP_DAEMON_ID_ENV = "ACP_DAEMON_ID";
+const ACP_CLIENT_ID_ENV = "ACP_CLIENT_ID";
+const ACP_ACCOUNT_SESSION_ENV = "ACP_ACCOUNT_SESSION";
 
 function resolveAgentId(inputAgent: string | undefined): string {
   if (!inputAgent) {
     return resolveRuntimeAgentId("simulator");
+  }
+  if (inputAgent === REMOTE_RELAY_AGENT_ID) {
+    return REMOTE_RELAY_AGENT_ID;
   }
   return resolveRuntimeAgentId(inputAgent);
 }
@@ -157,7 +169,11 @@ function isLocalSimulatorAgent(agentId: string): boolean {
 }
 
 function parseCliOptions(argv: string[]): DemoCliOptions {
-  const rawAgent = argv[2];
+  const cliArgs = argv.slice(2);
+  if (cliArgs[0] === "--") {
+    cliArgs.shift();
+  }
+  const rawAgent = cliArgs[0];
   const agentId = resolveAgentId(rawAgent);
   const promptTokens: string[] = [];
   const rawInitialConfig: {
@@ -175,7 +191,7 @@ function parseCliOptions(argv: string[]): DemoCliOptions {
   let systemPrompt: string | undefined;
   let systemPromptFile: string | undefined;
 
-  for (const token of argv.slice(rawAgent ? 3 : 2)) {
+  for (const token of cliArgs.slice(rawAgent ? 1 : 0)) {
     if (token === "--sessions") {
       listSessions = true;
       continue;
@@ -2341,8 +2357,19 @@ async function runRepl(
 async function createRuntimeSmokeConfig(
   agentId: string,
 ): Promise<RuntimeSmokeConfig> {
+  if (agentId === REMOTE_RELAY_AGENT_ID) {
+    return {
+      agent: createRemoteRelayBridgeAgent(),
+      agentId,
+      cleanup: async () => {},
+      cwd: cwd(),
+      label: "remote relay",
+    };
+  }
+
   if (!isLocalSimulatorAgent(agentId)) {
     return {
+      agent: agentId,
       agentId,
       cleanup: async () => {},
       cwd: cwd(),
@@ -2358,6 +2385,7 @@ async function createRuntimeSmokeConfig(
   await writeFile(readmePath, "hello from runtime stdio smoke\n", "utf8");
 
   return {
+    agent: agentId,
     agentId,
     cleanup: async () => {
       await rm(root, { force: true, recursive: true });
@@ -2370,17 +2398,70 @@ async function createRuntimeSmokeConfig(
   };
 }
 
+function createRemoteRelayBridgeAgent(): AcpRuntimeAgentInput {
+  const relayUrl = process.env[ACP_RELAY_URL_ENV];
+  if (!relayUrl) {
+    throw new Error(
+      `[runtime] ${ACP_RELAY_URL_ENV} is required when using agent "remote". Example: ${ACP_RELAY_URL_ENV}=ws://localhost:8787 pnpm run demo:runtime -- remote`,
+    );
+  }
+  const accountSession =
+    process.env[ACP_ACCOUNT_SESSION_ENV] ?? readCachedRelayAccountSession();
+  if (accountSession) {
+    process.env[ACP_ACCOUNT_SESSION_ENV] = accountSession;
+  }
+  const env: Record<string, string | undefined> = {
+    [ACP_RELAY_URL_ENV]: relayUrl,
+    [ACP_DAEMON_ID_ENV]: process.env[ACP_DAEMON_ID_ENV],
+    [ACP_CLIENT_ID_ENV]: process.env[ACP_CLIENT_ID_ENV],
+    [ACP_ACCOUNT_SESSION_ENV]: accountSession,
+  };
+  return {
+    args: [resolveBuiltRelayBridgePath()],
+    command: process.execPath,
+    env,
+    type: "acp-runtime-remote-relay",
+  };
+}
+
+function readCachedRelayAccountSession(): string | undefined {
+  try {
+    const raw = readFileSync(join(homedir(), ".acp", "relay-session.json"), "utf8");
+    const parsed = JSON.parse(raw) as { token?: unknown };
+    return typeof parsed.token === "string" ? parsed.token : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveBuiltRelayBridgePath(): string {
+  return join(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "runtime",
+    "remote",
+    "client",
+    "relay-bridge.js",
+  );
+}
+
 async function main(): Promise<void> {
   const options = parseCliOptions(process.argv);
   if (options.systemPromptFile) {
     options.systemPrompt = await readFile(options.systemPromptFile, "utf8");
   }
-  const logSink = await configureDemoLogSink(options.logFile);
+  const config = await createRuntimeSmokeConfig(options.agentId);
+  const logSink = await configureDemoLogSink(options.logFile, {
+    relayContext: {
+      "acp.agent.id": config.agentId,
+      "acp.runtime.cwd": config.cwd,
+    },
+    relaySource: "runtime-demo",
+  });
   const outputGate = createOutputGate({
     onLine: (line) => logSink.writeLine(line),
   });
   const renderer = createTimelineRenderer(outputGate);
-  const config = await createRuntimeSmokeConfig(options.agentId);
   const runtime = new AcpRuntime(createStdioAcpConnectionFactory(), {
     state: {
       sessionRegistryPath: resolveRuntimeHomePath(
@@ -2402,7 +2483,7 @@ async function main(): Promise<void> {
 
   if (options.listSessions) {
     const result = await runtime.sessions.list({
-      agent: config.agentId,
+      agent: config.agent,
       cwd: config.cwd,
       handlers: config.handlers,
       source: "remote",
@@ -2449,7 +2530,7 @@ async function main(): Promise<void> {
 
   if (options.resumeLast) {
     const latest = await runtime.sessions.list({
-      agent: config.agentId,
+      agent: config.agent,
       cwd: config.cwd,
       limit: 1,
       source: "local",
@@ -2471,7 +2552,7 @@ async function main(): Promise<void> {
     });
   } else if (options.resumeSessionId) {
     session = await runtime.sessions.resume({
-      agent: config.agentId,
+      agent: config.agent,
       cwd: config.cwd,
       handlers: {
         authentication: createAuthenticationHandler(),
@@ -2483,7 +2564,7 @@ async function main(): Promise<void> {
     });
   } else if (options.loadSessionId) {
     session = await runtime.sessions.load({
-      agent: config.agentId,
+      agent: config.agent,
       cwd: config.cwd,
       handlers: {
         authentication: createAuthenticationHandler(),
@@ -2495,7 +2576,7 @@ async function main(): Promise<void> {
     });
   } else {
     session = await runtime.sessions.start({
-      agent: config.agentId,
+      agent: config.agent,
       cwd: config.cwd,
       handlers: {
         authentication: createAuthenticationHandler(),
@@ -2584,7 +2665,17 @@ async function main(): Promise<void> {
   } finally {
     inputCoordinator.close();
     rl.close();
-    await session.close().catch(() => undefined);
+    if (session) {
+      try {
+        await session.close();
+      } catch (error) {
+        logSink.emit({
+          body: formatUnknownError(error),
+          eventName: "acp.demo.session.close.failed",
+          severityNumber: SeverityNumber.WARN,
+        });
+      }
+    }
     await config.cleanup();
     await logSink.close();
   }

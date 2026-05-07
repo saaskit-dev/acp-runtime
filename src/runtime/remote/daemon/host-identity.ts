@@ -1,6 +1,8 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { hostname } from "node:os";
 import { dirname } from "node:path";
 
+import { emitRuntimeSuppressedError } from "../../observability/logging.js";
 import { resolveRuntimeHomePath } from "../../paths.js";
 
 export const ACP_REMOTE_DAEMON_IDENTITY_VERSION = 1 as const;
@@ -14,6 +16,12 @@ export type AcpRemoteDaemonIdentity = {
   version: typeof ACP_REMOTE_DAEMON_IDENTITY_VERSION;
 };
 
+export type AcpRemoteDaemonMachineIdentity = {
+  daemonId: string;
+  identity: AcpRemoteDaemonIdentity;
+  machine: string;
+};
+
 export type AcpRemoteDaemonIdentityRecord = {
   previousPublicKey?: string;
   publicKey: string;
@@ -22,7 +30,7 @@ export type AcpRemoteDaemonIdentityRecord = {
 export type AcpRemoteDaemonHostRegistrationRecord =
   AcpRemoteDaemonIdentityRecord & {
     accountId: string;
-    hostId: string;
+    daemonId: string;
   };
 
 type AcpRemoteDaemonPrivateKey = Awaited<
@@ -72,11 +80,11 @@ export async function loadOrCreateAcpRemoteDaemonIdentity(input: {
   now?: Date;
   path?: string;
   accountId: string;
-  hostId: string;
+  daemonId: string;
 }): Promise<AcpRemoteDaemonIdentity> {
   const path =
     input.path ??
-    resolveAcpRemoteDaemonIdentityPath(input.accountId, input.hostId);
+    resolveAcpRemoteDaemonIdentityPath(input.accountId, input.daemonId);
   const existing = await loadAcpRemoteDaemonIdentity(path);
   if (existing) {
     return existing;
@@ -90,11 +98,11 @@ export async function rotateAcpRemoteDaemonIdentity(input: {
   now?: Date;
   path?: string;
   accountId: string;
-  hostId: string;
+  daemonId: string;
 }): Promise<AcpRemoteDaemonIdentity> {
   const path =
     input.path ??
-    resolveAcpRemoteDaemonIdentityPath(input.accountId, input.hostId);
+    resolveAcpRemoteDaemonIdentityPath(input.accountId, input.daemonId);
   const existing = await loadAcpRemoteDaemonIdentity(path);
   const next = await createAcpRemoteDaemonIdentity(input.now);
   const identity: AcpRemoteDaemonIdentity = {
@@ -114,6 +122,37 @@ export async function saveAcpRemoteDaemonIdentity(
   await writeFile(path, `${JSON.stringify(identity, null, 2)}\n`, "utf8");
 }
 
+export async function loadOrCreateDaemonMachineIdentity(): Promise<AcpRemoteDaemonMachineIdentity> {
+  const path = resolveRuntimeHomePath("daemon", "identity.json");
+  try {
+    const raw = await readFile(path, "utf8");
+    const data = JSON.parse(raw);
+    if (data.daemonId && data.machine === hostname()) {
+      const identity = parseAcpRemoteDaemonIdentity(data.identity);
+      return { daemonId: data.daemonId, identity, machine: data.machine };
+    }
+  } catch (error) {
+    if (!isMissingFileError(error)) {
+      emitRuntimeSuppressedError({
+        attributes: {
+          "acp.remote.daemon.identity_path": path,
+        },
+        body: "Daemon machine identity could not be loaded; creating a new identity.",
+        eventName: "acp.remote.daemon.identity.load.failed",
+        exception: error,
+      });
+    }
+  }
+
+  const daemonId = crypto.randomUUID();
+  const identity = await createAcpRemoteDaemonIdentity();
+  const machine = hostname();
+  const record: AcpRemoteDaemonMachineIdentity = { daemonId, identity, machine };
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  return record;
+}
+
 export function createAcpRemoteDaemonIdentityRecord(
   identity: AcpRemoteDaemonIdentity,
 ): AcpRemoteDaemonIdentityRecord {
@@ -125,25 +164,25 @@ export function createAcpRemoteDaemonIdentityRecord(
 
 export function createAcpRemoteDaemonHostRegistrationRecord(input: {
   accountId: string;
-  hostId: string;
+  daemonId: string;
   identity: AcpRemoteDaemonIdentity;
 }): AcpRemoteDaemonHostRegistrationRecord {
   return {
     accountId: input.accountId,
-    hostId: input.hostId,
+    daemonId: input.daemonId,
     ...createAcpRemoteDaemonIdentityRecord(input.identity),
   };
 }
 
 export function resolveAcpRemoteDaemonIdentityPath(
   accountId: string,
-  hostId: string,
+  daemonId: string,
 ): string {
   return resolveRuntimeHomePath(
     "remote",
     "hosts",
     encodeURIComponent(accountId),
-    `${encodeURIComponent(hostId)}.json`,
+    `${encodeURIComponent(daemonId)}.json`,
   );
 }
 
@@ -151,7 +190,7 @@ export async function createAcpRemoteDaemonRegistrationHeaders(input: {
   now?: Date;
   nonce?: string;
   accountId: string;
-  hostId: string;
+  daemonId: string;
   identity: AcpRemoteDaemonIdentity;
 }): Promise<Record<string, string>> {
   const timestamp = String(input.now?.getTime() ?? Date.now());
@@ -166,7 +205,7 @@ export async function createAcpRemoteDaemonRegistrationHeaders(input: {
       new TextEncoder().encode(
         daemonRegistrationPayload({
           accountId: input.accountId,
-          hostId: input.hostId,
+          daemonId: input.daemonId,
           nonce,
           timestamp,
         }),
@@ -175,10 +214,11 @@ export async function createAcpRemoteDaemonRegistrationHeaders(input: {
   );
   return {
     "x-acp-account-id": input.accountId,
+    "x-acp-daemon-public-key": input.identity.publicKey,
     "x-acp-daemon-nonce": nonce,
-    "x-acp-daemon-signature": bytesToHex(new Uint8Array(signature)),
+    "x-acp-daemon-signature": bytesToBase64Url(new Uint8Array(signature)),
     "x-acp-daemon-timestamp": timestamp,
-    "x-acp-host-id": input.hostId,
+    "x-acp-daemon-id": input.daemonId,
   };
 }
 
@@ -196,13 +236,13 @@ async function importAcpRemoteDaemonPrivateKey(
 
 function daemonRegistrationPayload(input: {
   accountId: string;
-  hostId: string;
+  daemonId: string;
   nonce: string;
   timestamp: string;
 }): string {
   return [
     input.accountId,
-    input.hostId,
+    input.daemonId,
     input.timestamp,
     input.nonce,
   ].join("\n");
@@ -255,12 +295,6 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   return copy.buffer;
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return [...bytes]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
 }
 
 function bytesToBase64Url(bytes: Uint8Array): string {

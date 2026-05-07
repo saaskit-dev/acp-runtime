@@ -7,6 +7,7 @@ import {
   createAcpRemoteSignedConnectionTicket,
   verifyAcpRemoteDeviceRenewalProof,
   type AcpRemoteAckFrame,
+  type AcpRemoteAgentGrant,
   type AcpRemoteDataFrame,
   type AcpRemoteGrant,
   type AcpRemoteScope,
@@ -18,8 +19,12 @@ import {
 } from "../../../src/runtime/remote/protocol/index.js";
 import {
   AcpRelayInMemoryControlPlaneStore,
-  type AcpRelayControlPlaneStore,
+  type AcpRelayWritableControlPlaneStore,
 } from "./control-plane-store.js";
+import {
+  readAcpRemoteTraceContextFromJsonRpcMessage,
+  type AcpRemoteTraceContext,
+} from "../../../src/runtime/remote/shared/trace-context.js";
 
 export type RelaySocket = {
   close(code?: number, reason?: string): void;
@@ -29,7 +34,7 @@ export type RelaySocket = {
 export type AcpRelayBrokerOptions = {
   authWaitMs?: number;
   clientReconnectGraceMs?: number;
-  controlPlaneStore?: AcpRelayControlPlaneStore;
+  controlPlaneStore?: AcpRelayWritableControlPlaneStore;
   daemonReconnectGraceMs?: number;
   defaultScopes?: readonly AcpRemoteScope[];
   heartbeatTimeoutMs?: number;
@@ -44,12 +49,24 @@ export type AcpRelayBrokerOptions = {
 
 export type AcpRelayClientTransport = "native-acp" | "remote-frame";
 
+export type DaemonMetadata = {
+  agentTypes: readonly {
+    command?: string;
+    id?: string;
+    type?: string;
+    label: string;
+  }[];
+  machine?: string;
+  workspaceRoots: readonly { path: string; label?: string }[];
+};
+
 export type AcpRelayClientRegistration = {
   accountId: string;
   authUrl: string;
-  clientDeviceId?: string;
+  clientId?: string;
   connectionId: string;
-  hostId?: string;
+  daemonId?: string;
+  nativeClientAck?: boolean;
   socket: RelaySocket;
   transport?: AcpRelayClientTransport;
 };
@@ -58,7 +75,7 @@ export type AcpRelayAuthorizationResult =
   | {
       ok: true;
       connectionId: string;
-      hostId: string;
+      daemonId: string;
       ticket: AcpRemoteSignedConnectionTicket;
     }
   | {
@@ -70,7 +87,7 @@ export type AcpRelayDeviceRenewalResult =
   | {
       ok: true;
       connectionId: string;
-      hostId: string;
+      daemonId: string;
       ticket: AcpRemoteSignedConnectionTicket;
     }
   | {
@@ -80,17 +97,21 @@ export type AcpRelayDeviceRenewalResult =
 
 const ACP_BOOTSTRAP_AUTH_METHOD_ID = "acp-runtime-browser";
 const ACP_REMOTE_CONNECTION_ID_META = "acp-runtime/remote/connectionId";
-const ACP_REMOTE_HOST_ID_META = "acp-runtime/remote/hostId";
+const ACP_REMOTE_DAEMON_ID_META = "acp-runtime/remote/daemonId";
 const ACP_REMOTE_AUTH_URL_META = "acp-runtime/remote/authUrl";
-const DEFAULT_CLIENT_DEVICE_ID = "native-acp-client";
+const ACP_REMOTE_SESSION_SELECTION_ID_META =
+  "acp-runtime/remote/sessionSelectionId";
+const DEFAULT_SESSION_SELECTION_ID = "__default__";
+const DEFAULT_CLIENT_ID = "native-acp-client";
 const DEFAULT_AUTH_WAIT_MS = 5 * 60 * 1000;
-const DEFAULT_CLIENT_RECONNECT_GRACE_MS = 30 * 1000;
-const DEFAULT_DAEMON_RECONNECT_GRACE_MS = 30 * 1000;
+const DEFAULT_CLIENT_RECONNECT_GRACE_MS = 5 * 60 * 1000;
+const DEFAULT_DAEMON_RECONNECT_GRACE_MS = 5 * 60 * 1000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 45 * 1000;
 const DEFAULT_MAX_BUFFERED_FRAMES_PER_CONNECTION = 64;
 const DEFAULT_MAX_CONNECTIONS_PER_ACCOUNT = 64;
 const DEFAULT_POLICY_VERSION = 1;
 const DEFAULT_TICKET_RENEW_BEFORE_MS = 60 * 1000;
+const NATIVE_CLIENT_ACK_METHOD = "acp-runtime/remote/client_ack";
 const DEFAULT_TICKET_SCOPES = [
   "acp:connect",
   "acp:session:create",
@@ -99,25 +120,34 @@ const DEFAULT_TICKET_SCOPES = [
   "acp:turn:send",
   "acp:turn:cancel",
 ] as const satisfies readonly AcpRemoteScope[];
+const DEFAULT_AGENT_ID = "codex-acp";
 
 type RelayClient = {
   accountId: string;
   authUrl: string;
   bootstrapComplete: boolean;
   bufferedClientPayloads: string[];
-  clientDeviceId: string;
+  clientId: string;
   clientPendingFrames: Map<number, AcpRemoteDataFrame>;
   daemonBootstrapRequestIds: Set<string>;
   daemonPendingFrames: Map<number, AcpRemoteDataFrame>;
   disconnectedAtMs?: number;
-  hostId?: string;
+  daemonId?: string;
   initializeParams?: unknown;
+  daemonRequests: Map<string | number, RelayJsonRpcRequest>;
   lastDaemonSeq?: number;
+  nativeClientAck: boolean;
   seq: number;
   socket?: RelaySocket;
   ticket?: AcpRemoteSignedConnectionTicket;
   transport: AcpRelayClientTransport;
-  waiters: Set<(hostId: string) => void>;
+  lastAuthorization?: RelayAuthorizationSelection;
+  pendingSessionSelections: Map<string, RelayAuthorizationSelection>;
+  sessionSelectionWaiters: Map<
+    string,
+    (selection: RelayAuthorizationSelection | undefined) => void
+  >;
+  waiters: Set<(daemonId: string | undefined) => void>;
 };
 
 type ConnectedRelayClient = RelayClient & {
@@ -139,6 +169,13 @@ type RelayJsonRpcNotification = {
 
 type RelayJsonRpcMessage = RelayJsonRpcNotification | RelayJsonRpcRequest;
 
+type RelayJsonRpcResponse = {
+  error?: unknown;
+  id: string | number | null;
+  jsonrpc: "2.0";
+  result?: unknown;
+};
+
 type DaemonHeartbeatState = {
   lastPongAt?: string;
   pendingNonce?: string;
@@ -149,15 +186,167 @@ type DaemonReconnectState = {
   disconnectedAtMs: number;
 };
 
+export type DaemonWorkspaceEntry = {
+  name: string;
+  path: string;
+  type: "directory";
+};
+
+export type DaemonWorkspaceListResult =
+  | {
+      ok: true;
+      path: string;
+      entries: readonly DaemonWorkspaceEntry[];
+    }
+  | {
+      ok: false;
+      reason: string;
+    };
+
+export type AcpRelayAuthorizableHostsResult =
+  | {
+      ok: true;
+      hosts: { daemonId: string; metadata?: DaemonMetadata }[];
+    }
+  | {
+      ok: false;
+      reason: string;
+    };
+
+type DaemonWorkspaceListRequestPayload = {
+  kind: "workspace/list";
+  path?: string;
+  requestId: string;
+  root: string;
+};
+
+type PendingDaemonWorkspaceListRequest = {
+  reject(error: Error): void;
+  resolve(result: DaemonWorkspaceListResult): void;
+  timeout: ReturnType<typeof setTimeout>;
+};
+
+const WORKSPACE_LIST_TIMEOUT_MS = 5 * 1000;
+const REMOTE_SESSION_AGENT_META = "acp-runtime/remote/sessionAgent";
+const REMOTE_SESSION_WORKSPACE_ROOTS_META =
+  "acp-runtime/remote/sessionWorkspaceRoots";
+
+type RelayAuthorizationSelection = {
+  agent?: AcpRemoteAgentGrant;
+  daemonId: string;
+  workspaceRoots?: readonly string[];
+};
+
+function hasSessionSelection(input: {
+  clientAgent?: AcpRemoteAgentGrant;
+  workspaceRoots?: readonly string[];
+}): boolean {
+  return Boolean(input.clientAgent || input.workspaceRoots?.length);
+}
+
+function validateAuthorizationSelection(input: {
+  agent?: AcpRemoteAgentGrant;
+  grant: AcpRemoteGrant;
+  metadata?: DaemonMetadata;
+  workspaceRoots?: readonly string[];
+}): { ok: true } | { ok: false; reason: string } {
+  if (input.agent && !isAdvertisedAgent(input.agent, input.metadata)) {
+    return {
+      ok: false,
+      reason: "Selected agent is not advertised by this daemon.",
+    };
+  }
+  if (input.workspaceRoots?.length) {
+    if (!input.metadata?.workspaceRoots.length) {
+      return {
+        ok: false,
+        reason: "Selected workspace is not advertised by this daemon.",
+      };
+    }
+    for (const workspaceRoot of input.workspaceRoots) {
+      if (!isWithinAnyPath(workspaceRoot, input.metadata.workspaceRoots.map((root) => root.path))) {
+        return {
+          ok: false,
+          reason: "Selected workspace is not advertised by this daemon.",
+        };
+      }
+      if (
+        input.grant.workspaceRoots?.length &&
+        !isWithinAnyPath(workspaceRoot, input.grant.workspaceRoots)
+      ) {
+        return {
+          ok: false,
+          reason: "Selected workspace is outside the granted workspace roots.",
+        };
+      }
+    }
+  }
+  return { ok: true };
+}
+
+function isAdvertisedAgent(
+  agent: AcpRemoteAgentGrant,
+  metadata: DaemonMetadata | undefined,
+): boolean {
+  if (!metadata?.agentTypes.length) {
+    return false;
+  }
+  return metadata.agentTypes.some((advertised) => {
+    if ("id" in agent) {
+      return advertised.id === agent.id;
+    }
+    return (
+      advertised.command === agent.command &&
+      (agent.type === undefined || advertised.type === agent.type)
+    );
+  });
+}
+
+function isWithinAnyPath(path: string, roots: readonly string[]): boolean {
+  return roots.some((root) => normalizedPathContains(root, path));
+}
+
+function normalizedPathContains(root: string, candidate: string): boolean {
+  const normalizedRoot = normalizePathForContainment(root);
+  const normalizedCandidate = normalizePathForContainment(candidate);
+  return (
+    normalizedCandidate === normalizedRoot ||
+    normalizedCandidate.startsWith(`${normalizedRoot}/`)
+  );
+}
+
+function normalizePathForContainment(path: string): string {
+  const absolute = path.startsWith("/");
+  const parts: string[] = [];
+  for (const part of path.split("/")) {
+    if (!part || part === ".") {
+      continue;
+    }
+    if (part === "..") {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  const normalized = `${absolute ? "/" : ""}${parts.join("/")}`;
+  return normalized.length > 1 && normalized.endsWith("/")
+    ? normalized.slice(0, -1)
+    : normalized;
+}
+
 export class AcpRelayBroker {
   private readonly authWaitMs: number;
   private readonly clientReconnectGraceMs: number;
+  private readonly clientBootstrapQueues = new Map<string, Promise<void>>();
   private readonly clients = new Map<string, RelayClient>();
-  private readonly controlPlaneStore: AcpRelayControlPlaneStore;
+  private readonly controlPlaneStore: AcpRelayWritableControlPlaneStore;
   private readonly daemonHeartbeats = new Map<string, DaemonHeartbeatState>();
   private readonly daemonReconnects = new Map<string, DaemonReconnectState>();
   private readonly daemons = new Map<string, RelaySocket>();
+  private readonly daemonMetadataMap = new Map<string, DaemonMetadata>();
   private readonly daemonReconnectGraceMs: number;
+  private readonly daemonWorkspaceListRequests =
+    new Map<string, PendingDaemonWorkspaceListRequest>();
   private readonly defaultScopes: readonly AcpRemoteScope[];
   private readonly heartbeatTimeoutMs: number;
   private readonly maxBufferedFramesPerConnection: number;
@@ -165,7 +354,7 @@ export class AcpRelayBroker {
   private readonly now: () => Date;
   private readonly policyVersion: number;
   private readonly ticketRenewBeforeMs: number;
-  private readonly ticketSigningKey: AcpRemoteTicketSigningKey | undefined;
+  readonly ticketSigningKey: AcpRemoteTicketSigningKey | undefined;
   private readonly ticketTtlMs: number | undefined;
 
   constructor(options: AcpRelayBrokerOptions = {}) {
@@ -192,19 +381,27 @@ export class AcpRelayBroker {
     this.ticketTtlMs = options.ticketTtlMs;
   }
 
-  registerDaemon(hostId: string, socket: RelaySocket): void {
-    const previousSocket = this.daemons.get(hostId);
-    this.daemons.set(hostId, socket);
-    this.daemonReconnects.delete(hostId);
-    this.daemonHeartbeats.set(hostId, {
+  registerDaemon(daemonId: string, socket: RelaySocket, metadata?: DaemonMetadata): void {
+    const previousSocket = this.daemons.get(daemonId);
+    this.daemons.set(daemonId, socket);
+    this.daemonReconnects.delete(daemonId);
+    if (metadata) {
+      this.daemonMetadataMap.set(daemonId, metadata);
+    }
+    this.daemonHeartbeats.set(daemonId, {
       lastPongAt: this.now().toISOString(),
     });
     previousSocket?.close(1012, "Daemon connection replaced.");
-    this.reopenClientRoutesForDaemon(hostId, socket);
+    this.logRelayLifecycle({
+      daemonId,
+      eventName: "acp.relay.daemon.connected",
+      replaced: previousSocket !== undefined,
+    });
+    this.reopenClientRoutesForDaemon(daemonId, socket);
   }
 
   registerClient(input: AcpRelayClientRegistration): void {
-    const clientDeviceId = input.clientDeviceId ?? DEFAULT_CLIENT_DEVICE_ID;
+    const clientId = input.clientId ?? DEFAULT_CLIENT_ID;
     const transport = input.transport ?? "native-acp";
     const existing = this.clients.get(input.connectionId);
 
@@ -224,14 +421,27 @@ export class AcpRelayBroker {
 
     if (
       existing &&
-      this.canResumeClient(input, existing, clientDeviceId, transport)
+      this.canResumeClient(input, existing, clientId, transport)
     ) {
       const previousSocket = existing.socket;
       existing.authUrl = input.authUrl;
       existing.disconnectedAtMs = undefined;
       existing.socket = input.socket;
+      this.logRelayLifecycle({
+        accountId: existing.accountId,
+        bufferedClientPayloads: existing.bufferedClientPayloads.length,
+        clientId: existing.clientId,
+        connectionId: input.connectionId,
+        daemonId: existing.daemonId,
+        eventName: "acp.relay.client.resumed",
+        nativeClientAck: existing.nativeClientAck,
+        pendingClientFrames: existing.clientPendingFrames.size,
+        pendingDaemonFrames: existing.daemonPendingFrames.size,
+        transport: existing.transport,
+      });
       if (isConnectedClient(existing)) {
-        this.flushBufferedClientPayloads(existing);
+        this.replayPendingClientFrames(existing);
+        this.flushBufferedClientPayloads(existing, input.connectionId);
       }
       previousSocket?.close(1012, "Client connection replaced.");
       return;
@@ -239,6 +449,9 @@ export class AcpRelayBroker {
 
     if (existing) {
       this.clients.delete(input.connectionId);
+      this.clientBootstrapQueues.delete(input.connectionId);
+      this.clearDaemonJsonRpcRequests(existing);
+      this.clearClientSelectionState(existing);
       this.sendDaemonClientClose(
         input.connectionId,
         existing,
@@ -248,34 +461,58 @@ export class AcpRelayBroker {
       existing.socket?.close(1012, "Client connection replaced.");
     }
 
-    const hostId = input.hostId;
+    const daemonId = input.daemonId;
     this.clients.set(input.connectionId, {
       accountId: input.accountId,
       authUrl: input.authUrl,
       bootstrapComplete: false,
       bufferedClientPayloads: [],
-      clientDeviceId,
+      clientId,
       clientPendingFrames: new Map(),
       daemonBootstrapRequestIds: new Set(),
       daemonPendingFrames: new Map(),
-      hostId,
+      daemonRequests: new Map(),
+      daemonId,
       lastDaemonSeq: undefined,
+      nativeClientAck: input.nativeClientAck ?? false,
       seq: 0,
       socket: input.socket,
+      pendingSessionSelections: new Map(),
+      sessionSelectionWaiters: new Map(),
       waiters: new Set(),
       transport,
     });
+    this.logRelayLifecycle({
+      accountId: input.accountId,
+      clientId,
+      connectionId: input.connectionId,
+      daemonId,
+      eventName: "acp.relay.client.connected",
+      nativeClientAck: input.nativeClientAck ?? false,
+      transport,
+    });
 
-    if (hostId && !this.daemons.has(hostId)) {
+    if (daemonId && !this.daemons.has(daemonId) && transport === "remote-frame") {
       input.socket.close(1013, "No daemon is online for this host.");
     }
   }
 
-  removeDaemon(hostId: string, socket: RelaySocket): void {
-    if (this.daemons.get(hostId) === socket) {
-      this.daemons.delete(hostId);
-      this.daemonHeartbeats.delete(hostId);
-      this.markDaemonDisconnected(hostId, "Host daemon disconnected.");
+  removeDaemon(daemonId: string, socket: RelaySocket): void {
+    if (this.daemons.get(daemonId) === socket) {
+      this.logRelayLifecycle({
+        daemonId,
+        eventName: "acp.relay.daemon.disconnected",
+        pendingReconnect: this.hasClientsForHost(daemonId),
+        severityText: "ERROR",
+      });
+      this.daemons.delete(daemonId);
+      this.daemonMetadataMap.delete(daemonId);
+      this.daemonHeartbeats.delete(daemonId);
+      this.rejectDaemonWorkspaceListRequests(
+        daemonId,
+        "Host daemon disconnected.",
+      );
+      this.markDaemonDisconnected(daemonId, "Host daemon disconnected.");
     }
   }
 
@@ -288,10 +525,33 @@ export class AcpRelayBroker {
     if (this.shouldKeepDisconnectedClient(client)) {
       client.disconnectedAtMs = this.now().getTime();
       client.socket = undefined;
+      this.logRelayLifecycle({
+        accountId: client.accountId,
+        bufferedClientPayloads: client.bufferedClientPayloads.length,
+        clientId: client.clientId,
+        connectionId,
+        daemonId: client.daemonId,
+        eventName: "acp.relay.client.disconnected",
+        nativeClientAck: client.nativeClientAck,
+        pendingClientFrames: client.clientPendingFrames.size,
+        pendingDaemonFrames: client.daemonPendingFrames.size,
+        transport: client.transport,
+      });
       return;
     }
 
+    this.logRelayLifecycle({
+      accountId: client.accountId,
+      clientId: client.clientId,
+      connectionId,
+      daemonId: client.daemonId,
+      eventName: "acp.relay.client.closed",
+      transport: client.transport,
+    });
     this.clients.delete(connectionId);
+    this.clientBootstrapQueues.delete(connectionId);
+    this.clearDaemonJsonRpcRequests(client);
+    this.clearClientSelectionState(client);
     this.sendDaemonClientClose(
       connectionId,
       client,
@@ -312,6 +572,9 @@ export class AcpRelayBroker {
       }
 
       this.clients.delete(connectionId);
+      this.clientBootstrapQueues.delete(connectionId);
+      this.clearDaemonJsonRpcRequests(client);
+      this.clearClientSelectionState(client);
       this.sendDaemonClientClose(
         connectionId,
         client,
@@ -324,35 +587,35 @@ export class AcpRelayBroker {
   }
 
   closeExpiredDisconnectedDaemons(): string[] {
-    const expiredHostIds: string[] = [];
+    const expiredDaemonIds: string[] = [];
     const nowMs = this.now().getTime();
-    for (const [hostId, reconnect] of this.daemonReconnects.entries()) {
+    for (const [daemonId, reconnect] of this.daemonReconnects.entries()) {
       if (nowMs - reconnect.disconnectedAtMs < this.daemonReconnectGraceMs) {
         continue;
       }
 
-      this.daemonReconnects.delete(hostId);
+      this.daemonReconnects.delete(daemonId);
       this.closeClientsForHost(
-        hostId,
+        daemonId,
         1013,
         "Host daemon reconnect grace expired.",
       );
-      expiredHostIds.push(hostId);
+      expiredDaemonIds.push(daemonId);
     }
-    return expiredHostIds.sort();
+    return expiredDaemonIds.sort();
   }
 
   async reconcileAuthorizedRoutes(): Promise<string[]> {
     const closedConnectionIds: string[] = [];
     for (const [connectionId, client] of this.clients.entries()) {
-      if (!client.bootstrapComplete || !client.hostId || !client.ticket) {
+      if (!client.bootstrapComplete || !client.daemonId || !client.ticket) {
         continue;
       }
 
       const decision = await this.controlPlaneStore.resolveGrant({
         accountId: client.accountId,
-        clientDeviceId: client.clientDeviceId,
-        hostId: client.hostId,
+        clientId: client.clientId,
+        daemonId: client.daemonId,
         requiredScopes: ["acp:connect"],
       });
       if (decision.ok) {
@@ -387,16 +650,103 @@ export class AcpRelayBroker {
     return [...this.daemons.keys()].sort();
   }
 
+  getDaemonMetadata(daemonId: string): DaemonMetadata | undefined {
+    return this.daemonMetadataMap.get(daemonId);
+  }
+
+  async listDaemonWorkspaceDirectory(input: {
+    connectionId: string;
+    daemonId: string;
+    path?: string;
+    root: string;
+  }): Promise<DaemonWorkspaceListResult> {
+    const daemon = this.daemons.get(input.daemonId);
+    if (!daemon) {
+      return { ok: false, reason: "Host daemon is not online." };
+    }
+    const hosts = await this.authorizableHosts(input.connectionId);
+    if (!hosts.ok || !hosts.hosts.some((host) => host.daemonId === input.daemonId)) {
+      return { ok: false, reason: "Host daemon is not authorized for this connection." };
+    }
+    const metadata = this.daemonMetadataMap.get(input.daemonId);
+    const allowedRoot = metadata?.workspaceRoots.some(
+      (workspaceRoot) => workspaceRoot.path === input.root,
+    );
+    if (!allowedRoot) {
+      return { ok: false, reason: "Workspace root is not available for this daemon." };
+    }
+
+    const requestId = crypto.randomUUID();
+    const connectionId = `workspace-list:${input.daemonId}:${requestId}`;
+    const payload: DaemonWorkspaceListRequestPayload = {
+      kind: "workspace/list",
+      path: input.path,
+      requestId,
+      root: input.root,
+    };
+
+    const result = new Promise<DaemonWorkspaceListResult>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.daemonWorkspaceListRequests.delete(connectionId);
+        resolve({ ok: false, reason: "Workspace directory listing timed out." });
+      }, WORKSPACE_LIST_TIMEOUT_MS);
+      this.daemonWorkspaceListRequests.set(connectionId, {
+        reject,
+        resolve,
+        timeout,
+      });
+    });
+
+    daemon.send(
+      JSON.stringify({
+        channelId: "workspace",
+        channelKind: AcpRemoteChannelKind.Filesystem,
+        connectionId,
+        frameType: AcpRemoteFrameType.Data,
+        payload,
+        seq: 1,
+      } satisfies AcpRemoteDataFrame),
+    );
+    return result;
+  }
+
+  async authorizableHosts(
+    connectionId: string,
+  ): Promise<AcpRelayAuthorizableHostsResult> {
+    const client = this.clients.get(connectionId);
+    if (!client) {
+      return {
+        ok: false,
+        reason: "Client connection is no longer active. Restart the remote session from the ACP client.",
+      };
+    }
+    const onlineHosts = new Set(this.onlineHostIds());
+    const hosts = await this.controlPlaneStore.listAuthorizableHosts({
+      accountId: client.accountId,
+      clientId: client.clientId,
+    });
+    return {
+      hosts: hosts
+        .filter((host) => onlineHosts.has(host.daemonId))
+        .map((host) => ({
+          daemonId: host.daemonId,
+          metadata: this.daemonMetadataMap.get(host.daemonId),
+        }))
+        .sort((a, b) => a.daemonId.localeCompare(b.daemonId)),
+      ok: true,
+    };
+  }
+
   pingDaemons(): void {
-    for (const [hostId, socket] of this.daemons.entries()) {
+    for (const [daemonId, socket] of this.daemons.entries()) {
       const nonce = crypto.randomUUID();
       const frame: AcpRemotePingFrame = {
-        connectionId: daemonHeartbeatConnectionId(hostId),
+        connectionId: daemonHeartbeatConnectionId(daemonId),
         frameType: AcpRemoteFrameType.Ping,
         nonce,
       };
-      this.daemonHeartbeats.set(hostId, {
-        lastPongAt: this.daemonHeartbeats.get(hostId)?.lastPongAt,
+      this.daemonHeartbeats.set(daemonId, {
+        lastPongAt: this.daemonHeartbeats.get(daemonId)?.lastPongAt,
         pendingNonce: nonce,
         pingedAtMs: this.now().getTime(),
       });
@@ -405,9 +755,9 @@ export class AcpRelayBroker {
   }
 
   closeUnresponsiveDaemons(): string[] {
-    const closedHostIds: string[] = [];
+    const closedDaemonIds: string[] = [];
     const nowMs = this.now().getTime();
-    for (const [hostId, heartbeat] of this.daemonHeartbeats.entries()) {
+    for (const [daemonId, heartbeat] of this.daemonHeartbeats.entries()) {
       if (
         heartbeat.pendingNonce === undefined ||
         heartbeat.pingedAtMs === undefined ||
@@ -416,84 +766,156 @@ export class AcpRelayBroker {
         continue;
       }
 
-      const daemon = this.daemons.get(hostId);
+      const daemon = this.daemons.get(daemonId);
       daemon?.close(1011, "Host daemon heartbeat timed out.");
-      this.daemons.delete(hostId);
-      this.daemonHeartbeats.delete(hostId);
-      this.markDaemonDisconnected(hostId, "Host daemon heartbeat timed out.");
-      closedHostIds.push(hostId);
+      this.daemons.delete(daemonId);
+      this.daemonHeartbeats.delete(daemonId);
+      this.markDaemonDisconnected(daemonId, "Host daemon heartbeat timed out.");
+      closedDaemonIds.push(daemonId);
     }
-    return closedHostIds;
+    return closedDaemonIds;
   }
 
-  daemonHeartbeatStatus(hostId: string): DaemonHeartbeatState | undefined {
-    const heartbeat = this.daemonHeartbeats.get(hostId);
+  daemonHeartbeatStatus(daemonId: string): DaemonHeartbeatState | undefined {
+    const heartbeat = this.daemonHeartbeats.get(daemonId);
     return heartbeat ? { ...heartbeat } : undefined;
   }
 
   async authorizableHostIds(connectionId: string): Promise<string[]> {
-    const client = this.clients.get(connectionId);
-    if (!client) {
+    const result = await this.authorizableHosts(connectionId);
+    if (!result.ok) {
       return [];
     }
+    return result.hosts.map((host) => host.daemonId);
+  }
 
-    const onlineHosts = new Set(this.onlineHostIds());
-    const hosts = await this.controlPlaneStore.listAuthorizableHosts({
-      accountId: client.accountId,
-      clientDeviceId: client.clientDeviceId,
-    });
-    return hosts
-      .map((host) => host.hostId)
-      .filter((hostId) => onlineHosts.has(hostId))
-      .sort();
+  private async ensureClientDeviceRegistered(client: RelayClient): Promise<void> {
+    const [account, device] = await Promise.all([
+      this.controlPlaneStore.getAccount(client.accountId),
+      this.controlPlaneStore.getClientDevice({
+        accountId: client.accountId,
+        clientId: client.clientId,
+      }),
+    ]);
+    if (!account) {
+      await this.controlPlaneStore.upsertAccount({ accountId: client.accountId });
+    }
+    if (!device) {
+      await this.controlPlaneStore.upsertClientDevice({
+        accountId: client.accountId,
+        clientId: client.clientId,
+      });
+    }
   }
 
   async authorizeClient(input: {
+    clientAgent?: AcpRemoteAgentGrant;
     connectionId: string;
-    hostId: string;
+    daemonId: string;
+    sessionSelectionId?: string;
+    workspaceRoots?: readonly string[];
   }): Promise<AcpRelayAuthorizationResult> {
     const client = this.clients.get(input.connectionId);
     if (!client) {
       return { ok: false, reason: "Unknown ACP connection." };
     }
-    if (!this.daemons.has(input.hostId)) {
+    if (!this.daemons.has(input.daemonId)) {
       return { ok: false, reason: "Host daemon is not online." };
     }
     if (!this.ticketSigningKey) {
       return { ok: false, reason: "Relay ticket signing key is not configured." };
     }
+    await this.ensureClientDeviceRegistered(client);
 
     const grantDecision = await this.controlPlaneStore.resolveGrant({
       accountId: client.accountId,
-      clientDeviceId: client.clientDeviceId,
-      hostId: input.hostId,
+      clientId: client.clientId,
+      daemonId: input.daemonId,
       requiredScopes: ["acp:connect"],
     });
     if (!grantDecision.ok) {
       return grantDecision;
     }
 
+    const selectionValidation = validateAuthorizationSelection({
+      agent: input.clientAgent,
+      grant: grantDecision.grant,
+      metadata: this.daemonMetadataMap.get(input.daemonId),
+      workspaceRoots: input.workspaceRoots,
+    });
+    if (!selectionValidation.ok) {
+      return selectionValidation;
+    }
+
+    const grant: AcpRemoteGrant = {
+      ...grantDecision.grant,
+      ...(input.clientAgent && { agent: input.clientAgent }),
+      ...(input.workspaceRoots && { workspaceRoots: input.workspaceRoots }),
+    };
     const ticket = await this.createSignedTicket(
       input.connectionId,
-      grantDecision.grant,
+      grant,
     );
-    client.hostId = input.hostId;
+    const wasBootstrapComplete = client.bootstrapComplete;
+    client.daemonId = input.daemonId;
+    client.lastAuthorization = {
+      agent: input.clientAgent,
+      daemonId: input.daemonId,
+      workspaceRoots: input.workspaceRoots,
+    };
     client.ticket = ticket;
     if (client.transport === "remote-frame") {
       client.bootstrapComplete = true;
     }
-    const daemon = this.daemons.get(input.hostId);
-    if (daemon) {
+    const daemon = this.daemons.get(input.daemonId);
+    if (daemon && !wasBootstrapComplete) {
       this.sendDaemonClientHello(input.connectionId, client, daemon);
       this.sendDaemonBootstrapInitialize(input.connectionId, client, daemon);
+    } else if (daemon) {
+      daemon.send(
+        JSON.stringify({
+          connectionId: input.connectionId,
+          frameType: AcpRemoteFrameType.Renew,
+          ticket,
+        }),
+      );
     }
     for (const waiter of client.waiters) {
-      waiter(input.hostId);
+      waiter(input.daemonId);
     }
     client.waiters.clear();
+    const sessionSelectionId = normalizeSessionSelectionId(
+      input.sessionSelectionId,
+    );
+    if (wasBootstrapComplete) {
+      const waiter =
+        client.sessionSelectionWaiters.get(sessionSelectionId) ??
+        (!input.sessionSelectionId && client.sessionSelectionWaiters.size === 1
+          ? client.sessionSelectionWaiters.values().next().value
+          : undefined);
+      if (waiter) {
+        for (const [waiterId, candidate] of client.sessionSelectionWaiters) {
+          if (candidate === waiter) {
+            client.sessionSelectionWaiters.delete(waiterId);
+            break;
+          }
+        }
+        waiter(client.lastAuthorization);
+      } else if (hasSessionSelection(input)) {
+        client.pendingSessionSelections.set(
+          sessionSelectionId,
+          client.lastAuthorization,
+        );
+      }
+    } else if (hasSessionSelection(input)) {
+      client.pendingSessionSelections.set(
+        sessionSelectionId,
+        client.lastAuthorization,
+      );
+    }
     return {
       connectionId: input.connectionId,
-      hostId: input.hostId,
+      daemonId: input.daemonId,
       ok: true,
       ticket,
     };
@@ -506,22 +928,22 @@ export class AcpRelayBroker {
     if (!client) {
       return { ok: false, reason: "Unknown ACP connection." };
     }
-    if (!client.hostId || !client.ticket) {
+    if (!client.daemonId || !client.ticket) {
       return { ok: false, reason: "ACP remote connection is not authorized." };
     }
     if (client.accountId !== proof.accountId) {
       return { ok: false, reason: "ACP remote account mismatch." };
     }
-    if (client.clientDeviceId !== proof.clientDeviceId) {
+    if (client.clientId !== proof.clientId) {
       return { ok: false, reason: "ACP remote client device mismatch." };
     }
-    if (client.hostId !== proof.hostId) {
+    if (client.daemonId !== proof.daemonId) {
       return { ok: false, reason: "ACP remote host mismatch." };
     }
     if (client.ticket.payload.jti !== proof.ticketJti) {
       return { ok: false, reason: "ACP remote ticket mismatch." };
     }
-    const daemon = this.daemons.get(client.hostId);
+    const daemon = this.daemons.get(client.daemonId);
     if (!daemon) {
       return { ok: false, reason: "Host daemon is not online." };
     }
@@ -531,7 +953,7 @@ export class AcpRelayBroker {
 
     const device = await this.controlPlaneStore.getClientDevice({
       accountId: client.accountId,
-      clientDeviceId: client.clientDeviceId,
+      clientId: client.clientId,
     });
     if (!device || device.disabled || !device.publicKey) {
       return { ok: false, reason: "Client device is not registered." };
@@ -548,8 +970,8 @@ export class AcpRelayBroker {
 
     const decision = await this.controlPlaneStore.resolveGrant({
       accountId: client.accountId,
-      clientDeviceId: client.clientDeviceId,
-      hostId: client.hostId,
+      clientId: client.clientId,
+      daemonId: client.daemonId,
       requiredScopes: ["acp:connect"],
     });
     if (!decision.ok) {
@@ -562,27 +984,73 @@ export class AcpRelayBroker {
       return decision;
     }
 
-    const ticket = await this.createSignedTicket(
+    const renewal = await this.renewBoundClientTicket(
       proof.connectionId,
+      client,
+      daemon,
       decision.grant,
     );
-    client.ticket = ticket;
-    daemon.send(
-      JSON.stringify({
-        connectionId: proof.connectionId,
-        frameType: AcpRemoteFrameType.Renew,
-        ticket,
-      }),
-    );
+    if (!renewal.ok) {
+      if (renewal.closeRoute) {
+        this.revokeClientRoute(
+          proof.connectionId,
+          client,
+          "authorization_revoked",
+          renewal.reason,
+        );
+      }
+      return { ok: false, reason: renewal.reason };
+    }
     return {
       connectionId: proof.connectionId,
-      hostId: client.hostId,
+      daemonId: client.daemonId,
       ok: true,
-      ticket,
+      ticket: renewal.ticket,
     };
   }
 
   async handleClientText(connectionId: string, text: string): Promise<void> {
+    const client = this.clients.get(connectionId);
+    if (!client || !isConnectedClient(client)) {
+      return;
+    }
+
+    const message = parseJsonRpcMessage(text);
+    if (message && isNativeClientAck(message)) {
+      this.handleNativeClientAck(client, message);
+      return;
+    }
+    if (
+      client.transport === "native-acp" &&
+      !client.bootstrapComplete &&
+      message &&
+      isSessionRestoreRequest(message)
+    ) {
+      const previous = this.clientBootstrapQueues.get(connectionId) ?? Promise.resolve();
+      const queued = previous
+        .catch((error) => {
+          this.recordSuppressedError({
+            connectionId,
+            error,
+            eventName: "acp.relay.client_bootstrap_queue_previous_failed",
+          });
+        })
+        .then(() => this.handleClientTextNow(connectionId, text));
+      this.clientBootstrapQueues.set(connectionId, queued);
+      try {
+        await queued;
+      } finally {
+        if (this.clientBootstrapQueues.get(connectionId) === queued) {
+          this.clientBootstrapQueues.delete(connectionId);
+        }
+      }
+      return;
+    }
+
+    await this.handleClientTextNow(connectionId, text);
+  }
+
+  private async handleClientTextNow(connectionId: string, text: string): Promise<void> {
     const client = this.clients.get(connectionId);
     if (!client || !isConnectedClient(client)) {
       return;
@@ -614,6 +1082,110 @@ export class AcpRelayBroker {
     }
 
     await this.forwardBoundClientMessage(connectionId, client, message);
+  }
+
+  private recordSuppressedError(input: {
+    connectionId: string;
+    error: unknown;
+    eventName: string;
+  }): void {
+    console.warn(
+      JSON.stringify({
+        connectionId: input.connectionId,
+        eventName: input.eventName,
+        reason: input.error instanceof Error ? input.error.message : String(input.error),
+      }),
+    );
+  }
+
+	  private logRelayTransportFrame(input: {
+    channelKind: AcpRemoteChannelKind;
+    client: RelayClient;
+    connectionId: string;
+    direction: "client_to_daemon" | "daemon_to_client";
+    payload: unknown;
+  }): void {
+    if (input.channelKind !== AcpRemoteChannelKind.Acp) {
+      return;
+    }
+    const details = readRelayTransportPayloadDetails(
+      input.payload,
+      input.client,
+    );
+    if (!details.traceContext) {
+      return;
+    }
+    console.log(
+      JSON.stringify({
+        accountId: input.client.accountId,
+        channelKind: input.channelKind,
+        clientId: input.client.clientId,
+        connectionId: input.connectionId,
+        daemonId: input.client.daemonId,
+        direction: input.direction,
+        eventName: "acp.relay.transport",
+        hasError: details.hasError,
+        jsonRpcId: details.id,
+        method: details.method,
+        sessionId: details.sessionId,
+        source: "relay",
+        spanId: details.traceContext.spanId,
+        traceId: details.traceContext.traceId,
+        traceparent: details.traceContext.traceparent,
+        transport: input.client.transport,
+      }),
+	    );
+	  }
+
+  private logRelayLifecycle(input: {
+    accountId?: string;
+    bufferedClientPayloads?: number;
+    clientId?: string;
+    code?: string;
+    connectionId?: string;
+    daemonId?: string;
+    eventName: string;
+    jsonRpcId?: string | number;
+    method?: string;
+    nativeClientAck?: boolean;
+    pendingClientFrames?: number;
+    pendingDaemonFrames?: number;
+    pendingReconnect?: boolean;
+    reason?: string;
+    replaced?: boolean;
+    seq?: number;
+    sessionId?: string;
+    severityText?: "ERROR" | "INFO";
+    traceContext?: AcpRemoteTraceContext;
+    transport?: AcpRelayClientTransport;
+  }): void {
+    console.log(
+      JSON.stringify({
+        accountId: input.accountId,
+        bufferedClientPayloads: input.bufferedClientPayloads,
+        clientId: input.clientId,
+        code: input.code,
+        connectionId: input.connectionId,
+        daemonId: input.daemonId,
+        eventName: input.eventName,
+        jsonRpcId: input.jsonRpcId,
+        method: input.method,
+        nativeClientAck: input.nativeClientAck,
+        pendingClientFrames: input.pendingClientFrames,
+        pendingDaemonFrames: input.pendingDaemonFrames,
+        pendingReconnect: input.pendingReconnect,
+        reason: input.reason,
+        replaced: input.replaced,
+        seq: input.seq,
+        sessionId: input.sessionId,
+        severityText: input.severityText ?? "INFO",
+        source: "relay",
+        spanId: input.traceContext?.spanId,
+        traceId: input.traceContext?.traceId,
+        traceparent: input.traceContext?.traceparent,
+        transport: input.transport,
+      }),
+    );
   }
 
   private async handleRemoteClientText(
@@ -666,10 +1238,13 @@ export class AcpRelayBroker {
       return;
     }
     if (frame?.frameType === AcpRemoteFrameType.Data) {
-      const client = this.clients.get(frame.connectionId);
-      if (client) {
-        this.sendDaemonAck(client, frame);
+      if (
+        frame.channelKind === AcpRemoteChannelKind.Filesystem &&
+        this.resolveDaemonWorkspaceListRequest(frame)
+      ) {
+        return;
       }
+      const client = this.clients.get(frame.connectionId);
       if (client && isReplayOrDuplicateDaemonFrame(client, frame)) {
         return;
       }
@@ -682,6 +1257,24 @@ export class AcpRelayBroker {
       }
       if (!client) {
         return;
+      }
+      const shouldDeferDaemonAck =
+        client.transport === "native-acp" &&
+        client.nativeClientAck &&
+        frame.channelKind === AcpRemoteChannelKind.Acp &&
+        isJsonRpcResponsePayload(frame.payload);
+      if (!shouldDeferDaemonAck) {
+        this.sendDaemonAck(client, frame);
+      }
+      if (frame.channelKind === AcpRemoteChannelKind.Acp) {
+        this.logRelayTransportFrame({
+          channelKind: frame.channelKind,
+          client,
+          connectionId: frame.connectionId,
+          direction: "daemon_to_client",
+          payload: frame.payload,
+        });
+        void this.persistSessionBindingFromDaemonResponse(client, frame.payload);
       }
 
       if (
@@ -705,6 +1298,37 @@ export class AcpRelayBroker {
         client.transport === "native-acp"
           ? JSON.stringify(frame.payload)
           : JSON.stringify(frame);
+      if (shouldDeferDaemonAck) {
+        client.clientPendingFrames.set(frame.seq, frame);
+        const details = readRelayTransportPayloadDetails(frame.payload, client);
+        this.logRelayLifecycle({
+          accountId: client.accountId,
+          clientId: client.clientId,
+          connectionId: frame.connectionId,
+          daemonId: client.daemonId,
+          eventName: "acp.relay.client_response.deferred",
+          jsonRpcId: details.id,
+          method: details.method,
+          nativeClientAck: client.nativeClientAck,
+          pendingClientFrames: client.clientPendingFrames.size,
+          seq: frame.seq,
+          sessionId: details.sessionId,
+          traceContext: details.traceContext,
+          transport: client.transport,
+        });
+        if (
+          client.clientPendingFrames.size >
+          this.maxBufferedFramesPerConnection
+        ) {
+          this.closeClientRoute(
+            frame.connectionId,
+            client,
+            "client_backpressure",
+            "Buffered client frame limit exceeded.",
+          );
+          return;
+        }
+      }
       if (client.socket) {
         if (client.transport === "remote-frame") {
           client.clientPendingFrames.set(frame.seq, frame);
@@ -727,6 +1351,25 @@ export class AcpRelayBroker {
       if (!this.shouldKeepDisconnectedClient(client)) {
         return;
       }
+      if (shouldDeferDaemonAck) {
+        const details = readRelayTransportPayloadDetails(frame.payload, client);
+        this.logRelayLifecycle({
+          accountId: client.accountId,
+          clientId: client.clientId,
+          connectionId: frame.connectionId,
+          daemonId: client.daemonId,
+          eventName: "acp.relay.client_response.waiting_for_reconnect",
+          jsonRpcId: details.id,
+          method: details.method,
+          nativeClientAck: client.nativeClientAck,
+          pendingClientFrames: client.clientPendingFrames.size,
+          seq: frame.seq,
+          sessionId: details.sessionId,
+          traceContext: details.traceContext,
+          transport: client.transport,
+        });
+        return;
+      }
       if (
         client.bufferedClientPayloads.length >=
         this.maxBufferedFramesPerConnection
@@ -743,11 +1386,49 @@ export class AcpRelayBroker {
       return;
     }
     if (frame?.frameType === AcpRemoteFrameType.Close) {
-      this.clients.get(frame.connectionId)?.socket?.close(
+      const client = this.clients.get(frame.connectionId);
+      client?.socket?.close(
         1000,
         frame.reason ?? "Remote ACP connection closed.",
       );
+      if (client) {
+        this.clearDaemonJsonRpcRequests(client);
+        this.clearClientSelectionState(client);
+      }
       this.clients.delete(frame.connectionId);
+      this.clientBootstrapQueues.delete(frame.connectionId);
+    }
+  }
+
+  private resolveDaemonWorkspaceListRequest(frame: AcpRemoteDataFrame): boolean {
+    const pending = this.daemonWorkspaceListRequests.get(frame.connectionId);
+    if (!pending) {
+      return false;
+    }
+    this.daemonWorkspaceListRequests.delete(frame.connectionId);
+    clearTimeout(pending.timeout);
+    const payload = asWorkspaceListResponse(frame.payload);
+    pending.resolve(
+      payload ?? {
+        ok: false,
+        reason: "Invalid workspace directory listing response.",
+      },
+    );
+    return true;
+  }
+
+  private rejectDaemonWorkspaceListRequests(
+    daemonId: string,
+    reason: string,
+  ): void {
+    const prefix = `workspace-list:${daemonId}:`;
+    for (const [connectionId, pending] of this.daemonWorkspaceListRequests) {
+      if (!connectionId.startsWith(prefix)) {
+        continue;
+      }
+      this.daemonWorkspaceListRequests.delete(connectionId);
+      clearTimeout(pending.timeout);
+      pending.resolve({ ok: false, reason });
     }
   }
 
@@ -765,7 +1446,12 @@ export class AcpRelayBroker {
       sendJsonRpcResult(client.socket, message, {
         agentCapabilities: {
           auth: {},
-          sessionCapabilities: {},
+          loadSession: true,
+          sessionCapabilities: {
+            close: {},
+            list: {},
+            resume: {},
+          },
         },
         agentInfo: {
           name: "acp-runtime-relay",
@@ -791,7 +1477,12 @@ export class AcpRelayBroker {
 
     if (message.method === "authenticate") {
       const methodId = readMethodId(message.params);
-      if (methodId !== ACP_BOOTSTRAP_AUTH_METHOD_ID) {
+      const preBoundHostId = client.daemonId;
+      if (
+        methodId !== undefined &&
+        methodId !== ACP_BOOTSTRAP_AUTH_METHOD_ID &&
+        !preBoundHostId
+      ) {
         sendJsonRpcError(client.socket, message, {
           code: -32602,
           data: { methodId },
@@ -800,32 +1491,26 @@ export class AcpRelayBroker {
         return;
       }
 
-      const hostId =
-        readMetaString(message.params, ACP_REMOTE_HOST_ID_META) ??
-        readMetaString(message.params, "hostId") ??
-        client.hostId;
-      if (hostId && !client.ticket) {
-        const result = await this.authorizeClient({ connectionId, hostId });
-        if (!result.ok) {
-          sendJsonRpcError(client.socket, message, {
-            code: -32000,
-            data: {
-              authUrl: client.authUrl,
-              connectionId,
-              onlineHosts: this.onlineHostIds(),
-            },
-            message: `Authentication required: ${result.reason}`,
-          });
+      const preboundDaemonId =
+        readMetaString(message.params, ACP_REMOTE_DAEMON_ID_META) ??
+        readMetaString(message.params, "daemonId") ??
+        client.daemonId;
+      if (preboundDaemonId && !client.ticket) {
+        client.daemonId = preboundDaemonId;
+      }
+      // Always wait for web /authorize to complete — user must select
+      // daemon, agent, and workspace interactively before a ticket is granted.
+      if (!client.ticket) {
+        const selectedHostId = await this.waitForClientHostSelection(client);
+        if (!isConnectedClient(client)) {
           return;
         }
-      } else if (!client.hostId) {
-        const selectedHostId = await this.waitForClientHostSelection(client);
         if (selectedHostId) {
-          client.hostId = selectedHostId;
+          client.daemonId = selectedHostId;
         }
       }
 
-      if (!client.hostId || !client.ticket) {
+      if (!client.daemonId || !client.ticket) {
         sendJsonRpcError(client.socket, message, {
           code: -32000,
           data: {
@@ -842,11 +1527,89 @@ export class AcpRelayBroker {
       sendJsonRpcResult(client.socket, message, {
         _meta: {
           [ACP_REMOTE_CONNECTION_ID_META]: connectionId,
-          [ACP_REMOTE_HOST_ID_META]: client.hostId,
+          [ACP_REMOTE_DAEMON_ID_META]: client.daemonId,
           "acp-runtime/remote/ticketKid": client.ticket.kid,
           "acp-runtime/remote/ticketExpiresAt": client.ticket.payload.expiresAt,
         },
       });
+      return;
+    }
+
+    if (isSessionOpenRequest(message)) {
+      if (!client.ticket) {
+        if (isSessionNewRequest(message)) {
+          const selectedHostId = await this.waitForClientHostSelection(client);
+          if (!isConnectedClient(client)) {
+            return;
+          }
+          if (selectedHostId) {
+            client.daemonId = selectedHostId;
+          }
+        } else {
+          const restore = await this.resolveSessionRestoreSelection(
+            client,
+            message,
+          );
+          if (!restore) {
+            sendJsonRpcError(client.socket, message, {
+              code: -32000,
+              data: {
+                authUrl: client.authUrl,
+                connectionId,
+                onlineHosts: this.onlineHostIds(),
+              },
+              message:
+                "Authentication required: historical remote session is missing binding metadata.",
+            });
+            return;
+          } else {
+            const skipDaemonBootstrapInitialize = !client.initializeParams;
+            if (skipDaemonBootstrapInitialize) {
+              client.bootstrapComplete = true;
+            }
+            const authorization = await this.authorizeClient({
+              clientAgent: restore.agent,
+              connectionId,
+              daemonId: restore.daemonId,
+              workspaceRoots: restore.workspaceRoots,
+            });
+            if (!isConnectedClient(client)) {
+              return;
+            }
+            if (!authorization.ok) {
+              if (skipDaemonBootstrapInitialize) {
+                client.bootstrapComplete = false;
+              }
+              sendJsonRpcError(client.socket, message, {
+                code: -32000,
+                data: {
+                  authUrl: client.authUrl,
+                  connectionId,
+                  daemonId: restore.daemonId,
+                  onlineHosts: this.onlineHostIds(),
+                },
+                message: `Authentication required: ${authorization.reason}`,
+              });
+              return;
+            }
+            client.daemonId = restore.daemonId;
+          }
+        }
+      }
+      if (!client.daemonId || !client.ticket) {
+        sendJsonRpcError(client.socket, message, {
+          code: -32000,
+          data: {
+            authUrl: client.authUrl,
+            connectionId,
+            onlineHosts: this.onlineHostIds(),
+          },
+          message: "Authentication required: host selection was not completed.",
+        });
+        return;
+      }
+      client.bootstrapComplete = true;
+      await this.forwardBoundClientMessage(connectionId, client, message);
       return;
     }
 
@@ -866,14 +1629,14 @@ export class AcpRelayBroker {
     client: ConnectedRelayClient,
     payload: RelayJsonRpcMessage,
   ): Promise<void> {
-    const hostId = client.hostId;
-    const daemon = hostId ? this.daemons.get(hostId) : undefined;
+    const daemonId = client.daemonId;
+    const daemon = daemonId ? this.daemons.get(daemonId) : undefined;
     if (!daemon) {
       if (isJsonRpcRequest(payload)) {
         sendJsonRpcError(client.socket, payload, {
           code: -32002,
-          data: { hostId },
-          message: this.daemonReconnects.has(hostId ?? "")
+          data: { daemonId },
+          message: this.daemonReconnects.has(daemonId ?? "")
             ? "Resource temporarily unavailable: host daemon is reconnecting."
             : "Resource not found: host daemon is not online.",
         });
@@ -881,15 +1644,90 @@ export class AcpRelayBroker {
       return;
     }
 
-    const authorization = await this.revalidateBoundClientMessage(
-      client,
-      payload,
-    );
-    if (!authorization.ok) {
-      this.rejectBoundClientMessage(connectionId, client, payload, authorization);
+    const payloadToForward = isSessionOpenRequest(payload)
+      ? await this.prepareSessionOpenMessage(connectionId, client, payload)
+      : payload;
+    if (!payloadToForward) {
       return;
     }
-    this.sendDaemonDataFrame(connectionId, client, daemon, payload);
+    const authorization = await this.revalidateBoundClientMessage(
+      connectionId,
+      client,
+      daemon,
+      payloadToForward,
+    );
+    if (!authorization.ok) {
+      this.rejectBoundClientMessage(
+        connectionId,
+        client,
+        payloadToForward,
+        authorization,
+      );
+      return;
+    }
+    this.sendDaemonDataFrame(connectionId, client, daemon, payloadToForward);
+  }
+
+  private async prepareSessionOpenMessage(
+    connectionId: string,
+    client: ConnectedRelayClient,
+    payload: RelayJsonRpcRequest,
+  ): Promise<RelayJsonRpcRequest | undefined> {
+    const sessionSelectionId = readSessionSelectionId(payload);
+    const selection = isSessionNewRequest(payload)
+      ? await this.waitForNextSessionSelection(client, sessionSelectionId)
+      : this.consumePendingSessionSelection(client, sessionSelectionId);
+    if (!selection && !isSessionNewRequest(payload)) {
+      return payload;
+    }
+    if (!selection) {
+      sendJsonRpcError(client.socket, payload, {
+        code: -32000,
+        data: {
+          authUrl: client.authUrl,
+          connectionId,
+          onlineHosts: this.onlineHostIds(),
+        },
+        message: "Authentication required: session selection was not completed.",
+      });
+      return undefined;
+    }
+    if (selection.daemonId !== client.daemonId) {
+      sendJsonRpcError(client.socket, payload, {
+        code: -32000,
+        data: { daemonId: selection.daemonId },
+        message: "Authentication required: selected host changed; start a new connection.",
+      });
+      return undefined;
+    }
+    return applySessionSelection(payload, selection);
+  }
+
+  private async resolveSessionRestoreSelection(
+    client: RelayClient,
+    request: RelayJsonRpcRequest,
+  ): Promise<RelayAuthorizationSelection | undefined> {
+    const explicitSelection = readSessionRestoreSelection(request);
+    if (explicitSelection) {
+      return explicitSelection;
+    }
+    const sessionId = readRequestSessionId(request);
+    if (!sessionId) {
+      return undefined;
+    }
+    const binding = await this.controlPlaneStore.getSessionBinding({
+      accountId: client.accountId,
+      clientId: client.clientId,
+      sessionId,
+    });
+    if (!binding) {
+      return undefined;
+    }
+    return {
+      agent: binding.agent,
+      daemonId: binding.daemonId,
+      workspaceRoots: binding.workspaceRoots,
+    };
   }
 
   private async forwardRemoteClientFrame(
@@ -897,19 +1735,24 @@ export class AcpRelayBroker {
     client: ConnectedRelayClient,
     frame: AcpRemoteDataFrame,
   ): Promise<void> {
-    const hostId = client.hostId;
-    const daemon = hostId ? this.daemons.get(hostId) : undefined;
+    const daemonId = client.daemonId;
+    const daemon = daemonId ? this.daemons.get(daemonId) : undefined;
     if (!daemon) {
       client.socket.close(
         1013,
-        this.daemonReconnects.has(hostId ?? "")
+        this.daemonReconnects.has(daemonId ?? "")
           ? "Host daemon is reconnecting."
           : "Host daemon is not online.",
       );
       return;
     }
 
-    const authorization = await this.revalidateBoundClientFrame(client, frame);
+    const authorization = await this.revalidateBoundClientFrame(
+      connectionId,
+      client,
+      daemon,
+      frame,
+    );
     if (!authorization.ok) {
       if (authorization.closeRoute) {
         this.revokeClientRoute(
@@ -942,12 +1785,12 @@ export class AcpRelayBroker {
     client: ConnectedRelayClient,
     request: RelayJsonRpcRequest,
   ): Promise<void> {
-    const hostId = client.hostId;
-    const daemon = hostId ? this.daemons.get(hostId) : undefined;
-    if (!hostId || !client.ticket || !daemon) {
+    const daemonId = client.daemonId;
+    const daemon = daemonId ? this.daemons.get(daemonId) : undefined;
+    if (!daemonId || !client.ticket || !daemon) {
       sendJsonRpcError(client.socket, request, {
         code: -32002,
-        data: { hostId },
+        data: { daemonId },
         message: "Resource not found: host daemon is not online.",
       });
       return;
@@ -965,8 +1808,8 @@ export class AcpRelayBroker {
 
     const decision = await this.controlPlaneStore.resolveGrant({
       accountId: client.accountId,
-      clientDeviceId: client.clientDeviceId,
-      hostId,
+      clientId: client.clientId,
+      daemonId,
       requiredScopes: ["acp:connect"],
     });
     if (!decision.ok) {
@@ -983,27 +1826,33 @@ export class AcpRelayBroker {
       return;
     }
 
-    const ticket = await this.createSignedTicket(connectionId, decision.grant);
-    client.ticket = ticket;
-    daemon.send(
-      JSON.stringify({
-        connectionId,
-        frameType: AcpRemoteFrameType.Renew,
-        ticket,
-      }),
+    const renewal = await this.renewBoundClientTicket(
+      connectionId,
+      client,
+      daemon,
+      decision.grant,
     );
+    if (!renewal.ok) {
+      sendJsonRpcError(client.socket, request, {
+        code: -32000,
+        message: `Authentication required: ${renewal.reason}`,
+      });
+      return;
+    }
     sendJsonRpcResult(client.socket, request, {
       _meta: {
         [ACP_REMOTE_CONNECTION_ID_META]: connectionId,
-        [ACP_REMOTE_HOST_ID_META]: hostId,
-        "acp-runtime/remote/ticketKid": ticket.kid,
-        "acp-runtime/remote/ticketExpiresAt": ticket.payload.expiresAt,
+        [ACP_REMOTE_DAEMON_ID_META]: daemonId,
+        "acp-runtime/remote/ticketKid": renewal.ticket.kid,
+        "acp-runtime/remote/ticketExpiresAt": renewal.ticket.payload.expiresAt,
       },
     });
   }
 
   private async revalidateBoundClientMessage(
+    connectionId: string,
     client: RelayClient,
+    daemon: RelaySocket,
     payload: RelayJsonRpcMessage,
   ): Promise<
     | {
@@ -1016,7 +1865,7 @@ export class AcpRelayBroker {
         requiredScope?: AcpRemoteScope;
       }
   > {
-    if (!client.hostId || !client.ticket) {
+    if (!client.daemonId || !client.ticket) {
       return {
         closeRoute: true,
         ok: false,
@@ -1026,8 +1875,8 @@ export class AcpRelayBroker {
 
     const connectDecision = await this.controlPlaneStore.resolveGrant({
       accountId: client.accountId,
-      clientDeviceId: client.clientDeviceId,
-      hostId: client.hostId,
+      clientId: client.clientId,
+      daemonId: client.daemonId,
       requiredScopes: ["acp:connect"],
     });
     if (!connectDecision.ok) {
@@ -1042,8 +1891,8 @@ export class AcpRelayBroker {
     const grantDecision = requiredScope
       ? await this.controlPlaneStore.resolveGrant({
           accountId: client.accountId,
-          clientDeviceId: client.clientDeviceId,
-          hostId: client.hostId,
+          clientId: client.clientId,
+          daemonId: client.daemonId,
           requiredScopes: ["acp:connect", requiredScope],
         })
       : connectDecision;
@@ -1057,17 +1906,20 @@ export class AcpRelayBroker {
     }
 
     if (this.shouldRenewTicket(client.ticket)) {
-      return {
-        closeRoute: false,
-        ok: false,
-        reason: "ACP remote ticket renewal required.",
-      };
+      return this.renewBoundClientTicket(
+        connectionId,
+        client,
+        daemon,
+        grantDecision.grant,
+      );
     }
     return { ok: true };
   }
 
   private async revalidateBoundClientFrame(
+    connectionId: string,
     client: RelayClient,
+    daemon: RelaySocket,
     frame: AcpRemoteDataFrame,
   ): Promise<
     | {
@@ -1080,7 +1932,7 @@ export class AcpRelayBroker {
         requiredScope?: AcpRemoteScope;
       }
   > {
-    if (!client.hostId || !client.ticket) {
+    if (!client.daemonId || !client.ticket) {
       return {
         closeRoute: true,
         ok: false,
@@ -1090,8 +1942,8 @@ export class AcpRelayBroker {
 
     const connectDecision = await this.controlPlaneStore.resolveGrant({
       accountId: client.accountId,
-      clientDeviceId: client.clientDeviceId,
-      hostId: client.hostId,
+      clientId: client.clientId,
+      daemonId: client.daemonId,
       requiredScopes: ["acp:connect"],
     });
     if (!connectDecision.ok) {
@@ -1106,8 +1958,8 @@ export class AcpRelayBroker {
     const grantDecision = requiredScope
       ? await this.controlPlaneStore.resolveGrant({
           accountId: client.accountId,
-          clientDeviceId: client.clientDeviceId,
-          hostId: client.hostId,
+          clientId: client.clientId,
+          daemonId: client.daemonId,
           requiredScopes: ["acp:connect", requiredScope],
         })
       : connectDecision;
@@ -1121,13 +1973,72 @@ export class AcpRelayBroker {
     }
 
     if (this.shouldRenewTicket(client.ticket)) {
-      return {
-        closeRoute: false,
-        ok: false,
-        reason: "ACP remote ticket renewal required.",
-      };
+      return this.renewBoundClientTicket(
+        connectionId,
+        client,
+        daemon,
+        grantDecision.grant,
+      );
     }
     return { ok: true };
+  }
+
+  private async renewBoundClientTicket(
+    connectionId: string,
+    client: RelayClient,
+    daemon: RelaySocket,
+    grant: AcpRemoteGrant,
+  ): Promise<
+    | {
+        ok: true;
+        ticket: AcpRemoteSignedConnectionTicket;
+      }
+    | {
+        closeRoute: boolean;
+        ok: false;
+        reason: string;
+      }
+  > {
+    if (!this.ticketSigningKey) {
+      return {
+        closeRoute: true,
+        ok: false,
+        reason: "Relay ticket signing key is not configured.",
+      };
+    }
+
+    const selectedAgent = client.ticket?.payload.agent;
+    const selectedWorkspaceRoots = client.ticket?.payload.workspaceRoots;
+    const validation = validateAuthorizationSelection({
+      agent: selectedAgent,
+      grant,
+      metadata: client.daemonId
+        ? this.daemonMetadataMap.get(client.daemonId)
+        : undefined,
+      workspaceRoots: selectedWorkspaceRoots,
+    });
+    if (!validation.ok) {
+      return {
+        closeRoute: true,
+        ok: false,
+        reason: validation.reason,
+      };
+    }
+
+    const ticket = await this.createSignedTicket(connectionId, {
+      ...grant,
+      ...(selectedAgent && { agent: selectedAgent }),
+      ...(selectedWorkspaceRoots && { workspaceRoots: selectedWorkspaceRoots }),
+    });
+    client.ticket = ticket;
+    daemon.send(
+      JSON.stringify({
+        connectionId,
+        frameType: AcpRemoteFrameType.Renew,
+        ticket,
+      }),
+    );
+    return { ok: true, ticket };
   }
 
   private rejectBoundClientMessage(
@@ -1166,9 +2077,24 @@ export class AcpRelayBroker {
     code: string,
     reason: string,
   ): void {
-    const hostId = client.hostId;
-    if (hostId) {
-      this.daemons.get(hostId)?.send(
+    const daemonId = client.daemonId;
+    this.logRelayLifecycle({
+      accountId: client.accountId,
+      bufferedClientPayloads: client.bufferedClientPayloads.length,
+      clientId: client.clientId,
+      code,
+      connectionId,
+      daemonId,
+      eventName: "acp.relay.client_route.closed",
+      nativeClientAck: client.nativeClientAck,
+      pendingClientFrames: client.clientPendingFrames.size,
+      pendingDaemonFrames: client.daemonPendingFrames.size,
+      reason,
+      severityText: "ERROR",
+      transport: client.transport,
+    });
+    if (daemonId) {
+      this.daemons.get(daemonId)?.send(
         JSON.stringify({
           code,
           connectionId,
@@ -1181,7 +2107,9 @@ export class AcpRelayBroker {
     client.bufferedClientPayloads = [];
     client.clientPendingFrames.clear();
     client.daemonPendingFrames.clear();
-    client.hostId = undefined;
+    this.clearDaemonJsonRpcRequests(client);
+    this.clearClientSelectionState(client);
+    client.daemonId = undefined;
     client.lastDaemonSeq = undefined;
     client.ticket = undefined;
   }
@@ -1195,48 +2123,57 @@ export class AcpRelayBroker {
     this.closeClientRoute(connectionId, client, code, reason);
     client.socket?.close(1008, reason);
     this.clients.delete(connectionId);
+    this.clientBootstrapQueues.delete(connectionId);
   }
 
   private closeClientsForHost(
-    hostId: string,
+    daemonId: string,
     code: number,
     reason: string,
   ): void {
     for (const [connectionId, client] of this.clients.entries()) {
-      if (client.hostId !== hostId) {
+      if (client.daemonId !== daemonId) {
         continue;
       }
       client.socket?.close(code, reason);
+      this.clearDaemonJsonRpcRequests(client);
+      this.clearClientSelectionState(client);
       this.clients.delete(connectionId);
+      this.clientBootstrapQueues.delete(connectionId);
     }
   }
 
-  private markDaemonDisconnected(hostId: string, reason: string): void {
-    if (this.daemonReconnectGraceMs > 0 && this.hasClientsForHost(hostId)) {
-      this.daemonReconnects.set(hostId, {
+	  private clearDaemonJsonRpcRequests(client: RelayClient): void {
+	    client.daemonRequests.clear();
+	  }
+
+  private markDaemonDisconnected(daemonId: string, reason: string): void {
+    if (this.daemonReconnectGraceMs > 0 && this.hasClientsForHost(daemonId)) {
+      this.daemonReconnects.set(daemonId, {
         disconnectedAtMs: this.now().getTime(),
       });
       return;
     }
 
-    this.closeClientsForHost(hostId, 1013, reason);
+    this.closeClientsForHost(daemonId, 1013, reason);
   }
 
-  private hasClientsForHost(hostId: string): boolean {
+  private hasClientsForHost(daemonId: string): boolean {
     for (const client of this.clients.values()) {
-      if (client.hostId === hostId) {
+      if (client.daemonId === daemonId) {
         return true;
       }
     }
     return false;
   }
 
-  private reopenClientRoutesForDaemon(hostId: string, socket: RelaySocket): void {
+  private reopenClientRoutesForDaemon(daemonId: string, socket: RelaySocket): void {
     for (const [connectionId, client] of this.clients.entries()) {
-      if (client.hostId !== hostId || !client.ticket) {
+      if (client.daemonId !== daemonId || !client.ticket) {
         continue;
       }
 
+      client.lastDaemonSeq = undefined;
       this.sendDaemonClientHello(connectionId, client, socket);
       this.sendDaemonBootstrapInitialize(connectionId, client, socket);
       this.replayPendingDaemonFrames(client, socket);
@@ -1248,20 +2185,19 @@ export class AcpRelayBroker {
     client: RelayClient,
     daemon: RelaySocket,
   ): void {
-    if (!client.hostId || !client.ticket) {
+    if (!client.daemonId || !client.ticket) {
       return;
     }
 
-    daemon.send(
-      JSON.stringify({
-        connectionId,
-        endpoint: AcpRemoteEndpointKind.Client,
-        frameType: AcpRemoteFrameType.Hello,
-        hostId: client.hostId,
-        protocolVersion: ACP_REMOTE_PROTOCOL_VERSION,
-        ticket: client.ticket,
-      }),
-    );
+    const frame = {
+      connectionId,
+      endpoint: AcpRemoteEndpointKind.Client,
+      frameType: AcpRemoteFrameType.Hello,
+      daemonId: client.daemonId,
+      protocolVersion: ACP_REMOTE_PROTOCOL_VERSION,
+      ticket: client.ticket,
+    };
+    daemon.send(JSON.stringify(frame));
   }
 
   private sendDaemonBootstrapInitialize(
@@ -1302,6 +2238,13 @@ export class AcpRelayBroker {
       seq,
     };
     client.daemonPendingFrames.set(seq, frame);
+    if (
+      client.transport === "native-acp" &&
+      isJsonRpcRequestPayload(payload) &&
+      isStoredJsonRpcId(payload.id)
+    ) {
+      this.trackDaemonJsonRpcRequest(connectionId, client, payload);
+    }
     if (client.daemonPendingFrames.size > this.maxBufferedFramesPerConnection) {
       this.closeClientRoute(
         connectionId,
@@ -1311,6 +2254,13 @@ export class AcpRelayBroker {
       );
       return;
     }
+    this.logRelayTransportFrame({
+      channelKind: frame.channelKind,
+      client,
+      connectionId,
+      direction: "client_to_daemon",
+      payload,
+    });
     daemon.send(JSON.stringify(frame));
   }
 
@@ -1329,6 +2279,65 @@ export class AcpRelayBroker {
     }
   }
 
+  private async persistSessionBindingFromDaemonResponse(
+    client: RelayClient,
+    payload: unknown,
+  ): Promise<void> {
+    const response = isJsonRpcResponsePayload(payload) ? payload : undefined;
+    if (!response) {
+      return;
+    }
+    if (!isStoredJsonRpcId(response.id)) {
+      return;
+	    }
+	    const request = client.daemonRequests.get(response.id);
+	    if (request) {
+	      client.daemonRequests.delete(response.id);
+	    }
+	    if (!request || !isSessionOpenRequest(request) || response.error) {
+	      return;
+	    }
+	    const sessionId =
+	      readResultSessionId(response.result) ?? readRequestSessionId(request);
+	    const daemonId =
+	      client.daemonId ?? readSessionRestoreSelection(request)?.daemonId;
+    if (!sessionId || !daemonId) {
+      return;
+    }
+    const resultBinding = readSessionBindingMetadata(response.result);
+	    const requestSelection = readSessionRestoreSelection(request);
+    try {
+      await this.controlPlaneStore.upsertSessionBinding({
+        accountId: client.accountId,
+        agent:
+          resultBinding?.agent ??
+          requestSelection?.agent ??
+          client.lastAuthorization?.agent,
+        clientId: client.clientId,
+        daemonId: resultBinding?.daemonId ?? daemonId,
+        sessionId,
+        workspaceRoots:
+          resultBinding?.workspaceRoots ??
+          requestSelection?.workspaceRoots ??
+          client.lastAuthorization?.workspaceRoots,
+      });
+    } catch (error) {
+      console.error("Failed to persist ACP remote session binding", error);
+    }
+  }
+
+	  private trackDaemonJsonRpcRequest(
+	    _connectionId: string,
+	    client: RelayClient,
+	    request: RelayJsonRpcRequest,
+	  ): void {
+	    if (!isStoredJsonRpcId(request.id)) {
+	      return;
+	    }
+	    const requestId = request.id;
+	    client.daemonRequests.set(requestId, request);
+	  }
+
   private handleClientAck(client: RelayClient, ack: number): void {
     for (const seq of [...client.clientPendingFrames.keys()].sort(
       (left, right) => left - right,
@@ -1340,12 +2349,49 @@ export class AcpRelayBroker {
     }
   }
 
-  private sendDaemonAck(client: RelayClient, frame: AcpRemoteDataFrame): void {
-    const hostId = client.hostId;
-    if (!hostId) {
+  private handleNativeClientAck(
+    client: RelayClient,
+    message: RelayJsonRpcNotification,
+  ): void {
+    const id = readNativeClientAckId(message);
+    if (id === undefined) {
       return;
     }
-    this.daemons.get(hostId)?.send(
+    for (const [seq, frame] of client.clientPendingFrames) {
+      const response = isJsonRpcResponsePayload(frame.payload)
+        ? frame.payload
+        : undefined;
+      if (response?.id !== id) {
+        continue;
+      }
+      client.clientPendingFrames.delete(seq);
+      const details = readRelayTransportPayloadDetails(frame.payload, client);
+      this.logRelayLifecycle({
+        accountId: client.accountId,
+        clientId: client.clientId,
+        connectionId: frame.connectionId,
+        daemonId: client.daemonId,
+        eventName: "acp.relay.client_ack.received",
+        jsonRpcId: details.id,
+        method: details.method,
+        nativeClientAck: client.nativeClientAck,
+        pendingClientFrames: client.clientPendingFrames.size,
+        seq: frame.seq,
+        sessionId: details.sessionId,
+        traceContext: details.traceContext,
+        transport: client.transport,
+      });
+      this.sendDaemonAck(client, frame);
+      return;
+    }
+  }
+
+  private sendDaemonAck(client: RelayClient, frame: AcpRemoteDataFrame): void {
+    const daemonId = client.daemonId;
+    if (!daemonId) {
+      return;
+    }
+    this.daemons.get(daemonId)?.send(
       JSON.stringify({
         ack: frame.seq,
         channelId: frame.channelId,
@@ -1355,10 +2401,22 @@ export class AcpRelayBroker {
     );
   }
 
-  private flushBufferedClientPayloads(client: ConnectedRelayClient): void {
+  private flushBufferedClientPayloads(
+    client: ConnectedRelayClient,
+    connectionId: string,
+  ): void {
     if (client.bufferedClientPayloads.length === 0) {
       return;
     }
+    this.logRelayLifecycle({
+      accountId: client.accountId,
+      bufferedClientPayloads: client.bufferedClientPayloads.length,
+      clientId: client.clientId,
+      connectionId,
+      daemonId: client.daemonId,
+      eventName: "acp.relay.client_buffer.flush",
+      transport: client.transport,
+    });
     for (const payload of client.bufferedClientPayloads) {
       if (client.transport === "remote-frame") {
         const frame = parseFrame(payload);
@@ -1371,6 +2429,32 @@ export class AcpRelayBroker {
     client.bufferedClientPayloads = [];
   }
 
+  private replayPendingClientFrames(client: ConnectedRelayClient): void {
+    for (const frame of [...client.clientPendingFrames.values()].sort(
+      (left, right) => left.seq - right.seq,
+    )) {
+      const details = readRelayTransportPayloadDetails(frame.payload, client);
+      this.logRelayLifecycle({
+        accountId: client.accountId,
+        clientId: client.clientId,
+        connectionId: frame.connectionId,
+        daemonId: client.daemonId,
+        eventName: "acp.relay.client_frame.replay",
+        jsonRpcId: details.id,
+        method: details.method,
+        nativeClientAck: client.nativeClientAck,
+        pendingClientFrames: client.clientPendingFrames.size,
+        seq: frame.seq,
+        sessionId: details.sessionId,
+        traceContext: details.traceContext,
+        transport: client.transport,
+      });
+      const payload =
+        client.transport === "native-acp" ? frame.payload : frame;
+      client.socket.send(JSON.stringify(payload));
+    }
+  }
+
   private replayPendingDaemonFrames(
     client: RelayClient,
     daemon: RelaySocket,
@@ -1378,6 +2462,16 @@ export class AcpRelayBroker {
     for (const frame of [...client.daemonPendingFrames.values()].sort(
       (left, right) => left.seq - right.seq,
     )) {
+      this.logRelayLifecycle({
+        accountId: client.accountId,
+        clientId: client.clientId,
+        connectionId: frame.connectionId,
+        daemonId: client.daemonId,
+        eventName: "acp.relay.daemon_frame.replay",
+        pendingDaemonFrames: client.daemonPendingFrames.size,
+        seq: frame.seq,
+        transport: client.transport,
+      });
       daemon.send(JSON.stringify(frame));
     }
   }
@@ -1385,21 +2479,22 @@ export class AcpRelayBroker {
   private canResumeClient(
     input: AcpRelayClientRegistration,
     existing: RelayClient,
-    clientDeviceId: string,
+    clientId: string,
     transport: AcpRelayClientTransport,
   ): boolean {
     if (
-      !existing.bootstrapComplete ||
-      !existing.hostId ||
-      !existing.ticket ||
       existing.accountId !== input.accountId ||
-      existing.clientDeviceId !== clientDeviceId ||
+      existing.clientId !== clientId ||
       existing.transport !== transport
     ) {
       return false;
     }
 
-    if (input.hostId && input.hostId !== existing.hostId) {
+    if (
+      input.daemonId &&
+      existing.daemonId &&
+      input.daemonId !== existing.daemonId
+    ) {
       return false;
     }
 
@@ -1417,10 +2512,10 @@ export class AcpRelayBroker {
   private shouldKeepDisconnectedClient(client: RelayClient): boolean {
     return (
       this.clientReconnectGraceMs > 0 &&
-      client.bootstrapComplete &&
-      client.hostId !== undefined &&
-      client.ticket !== undefined &&
-      this.daemons.has(client.hostId)
+      (!client.bootstrapComplete ||
+        (client.daemonId !== undefined &&
+          client.ticket !== undefined &&
+          this.daemons.has(client.daemonId)))
     );
   }
 
@@ -1430,12 +2525,12 @@ export class AcpRelayBroker {
     code: string,
     reason: string,
   ): void {
-    const hostId = client.hostId;
-    if (!hostId) {
+    const daemonId = client.daemonId;
+    if (!daemonId) {
       return;
     }
 
-    this.daemons.get(hostId)?.send(
+    this.daemons.get(daemonId)?.send(
       JSON.stringify({
         code,
         connectionId,
@@ -1446,23 +2541,23 @@ export class AcpRelayBroker {
   }
 
   private handleDaemonPong(connectionId: string, nonce: string): void {
-    const hostId = hostIdFromDaemonHeartbeatConnectionId(connectionId);
-    if (!hostId) {
+    const daemonId = daemonIdFromDaemonHeartbeatConnectionId(connectionId);
+    if (!daemonId) {
       return;
     }
-    const heartbeat = this.daemonHeartbeats.get(hostId);
+    const heartbeat = this.daemonHeartbeats.get(daemonId);
     if (!heartbeat || heartbeat.pendingNonce !== nonce) {
       return;
     }
 
-    this.daemonHeartbeats.set(hostId, {
+    this.daemonHeartbeats.set(daemonId, {
       lastPongAt: this.now().toISOString(),
     });
   }
 
   private handleDaemonPing(connectionId: string, nonce: string): void {
-    const hostId = hostIdFromDaemonHeartbeatConnectionId(connectionId);
-    const daemon = hostId ? this.daemons.get(hostId) : undefined;
+    const daemonId = daemonIdFromDaemonHeartbeatConnectionId(connectionId);
+    const daemon = daemonId ? this.daemons.get(daemonId) : undefined;
     daemon?.send(
       JSON.stringify({
         connectionId,
@@ -1504,8 +2599,8 @@ export class AcpRelayBroker {
   private waitForClientHostSelection(
     client: RelayClient,
   ): Promise<string | undefined> {
-    if (client.hostId) {
-      return Promise.resolve(client.hostId);
+    if (client.daemonId && client.ticket) {
+      return Promise.resolve(client.daemonId);
     }
 
     return new Promise((resolve) => {
@@ -1513,37 +2608,761 @@ export class AcpRelayBroker {
         client.waiters.delete(resolveSelection);
         resolve(undefined);
       }, this.authWaitMs);
-      const resolveSelection = (hostId: string) => {
+      const resolveSelection = (daemonId: string | undefined) => {
         clearTimeout(timeout);
-        resolve(hostId);
+        resolve(daemonId);
       };
       client.waiters.add(resolveSelection);
     });
+  }
+
+  private waitForNextSessionSelection(
+    client: RelayClient,
+    sessionSelectionId: string,
+  ): Promise<RelayAuthorizationSelection | undefined> {
+    const pendingSelection = this.consumePendingSessionSelection(
+      client,
+      sessionSelectionId,
+    );
+    if (pendingSelection) {
+      return Promise.resolve(pendingSelection);
+    }
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        client.sessionSelectionWaiters.delete(sessionSelectionId);
+        resolve(undefined);
+      }, this.authWaitMs);
+      const resolveSelection = (
+        selection: RelayAuthorizationSelection | undefined,
+      ) => {
+        clearTimeout(timeout);
+        resolve(selection);
+      };
+      client.sessionSelectionWaiters.set(sessionSelectionId, resolveSelection);
+    });
+  }
+
+  private consumePendingSessionSelection(
+    client: RelayClient,
+    sessionSelectionId: string,
+  ): RelayAuthorizationSelection | undefined {
+    if (client.pendingSessionSelections.has(sessionSelectionId)) {
+      const selection = client.pendingSessionSelections.get(sessionSelectionId);
+      client.pendingSessionSelections.delete(sessionSelectionId);
+      return selection;
+    }
+    return undefined;
+  }
+
+  private clearClientSelectionState(client: RelayClient): void {
+    for (const waiter of client.waiters) {
+      waiter(undefined);
+    }
+    client.waiters.clear();
+    for (const waiter of client.sessionSelectionWaiters.values()) {
+      waiter(undefined);
+    }
+    client.sessionSelectionWaiters.clear();
+    client.pendingSessionSelections.clear();
   }
 }
 
 export function createRelayAuthorizationPage(input: {
   accountId: string;
   connectionId: string;
-  hosts: readonly string[];
+  hosts: readonly { daemonId: string; metadata?: DaemonMetadata }[];
   requestUrl: string;
+  unavailableReason?: string;
 }): string {
-  const links = input.hosts
-    .map((hostId) => {
-      const url = new URL(input.requestUrl);
-      url.searchParams.set("accountId", input.accountId);
-      url.searchParams.set("connectionId", input.connectionId);
-      url.searchParams.set("hostId", hostId);
-      return `<li><a href="${escapeHtml(url.toString())}">${escapeHtml(hostId)}</a></li>`;
-    })
-    .join("");
+  const hostsJson = scriptJsonLiteral(input.hosts);
+  const requestUrlJson = scriptJsonLiteral(input.requestUrl);
+  const unavailableReasonJson = scriptJsonLiteral(input.unavailableReason ?? null);
   return `<!doctype html>
 <html lang="en">
-  <head><meta charset="utf-8"><title>ACP Runtime Relay</title></head>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ACP Runtime Relay — Authorize</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f4f1ea;
+        --surface: #fbfaf6;
+        --surface-2: #f0eee7;
+        --ink: #1f2520;
+        --muted: #687066;
+        --line: #d8d4c8;
+        --line-strong: #a9a393;
+        --accent: #176b56;
+        --accent-ink: #eef8f3;
+        --danger: #9f2f2a;
+        --focus: #d89b31;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--ink);
+        font: 14px/1.45 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      button, select { font: inherit; }
+      button { cursor: pointer; }
+      button:disabled { cursor: not-allowed; opacity: 0.55; }
+      .shell {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        min-height: 100vh;
+      }
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 18px clamp(18px, 4vw, 40px);
+        border-bottom: 1px solid var(--line);
+        background: color-mix(in oklch, var(--surface) 88%, var(--bg));
+      }
+      .title { display: grid; gap: 2px; min-width: 0; }
+      h1 { margin: 0; font-size: 1rem; font-weight: 650; letter-spacing: 0; }
+      .connection {
+        color: var(--muted);
+        font-size: 0.82rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: min(64vw, 720px);
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.78rem;
+      }
+      .status-pill {
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        color: var(--muted);
+        padding: 6px 10px;
+        white-space: nowrap;
+      }
+      .workspace {
+        display: grid;
+        grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+        min-height: 0;
+      }
+      .hosts {
+        border-right: 1px solid var(--line);
+        padding: 22px clamp(16px, 3vw, 28px);
+        background: var(--surface-2);
+      }
+      .main {
+        padding: 22px clamp(18px, 4vw, 44px) 30px;
+        min-width: 0;
+      }
+      .section-head {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 1rem;
+        margin-bottom: 12px;
+      }
+      h2 { margin: 0; font-size: 0.86rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
+      .count { color: var(--muted); font-size: 0.82rem; }
+      .host-list, .agent-list, .workspace-roots, .workspace-entries {
+        display: grid;
+        gap: 8px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+      .choice {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--surface);
+        color: var(--ink);
+        display: grid;
+        gap: 4px;
+        padding: 11px 12px;
+        text-align: left;
+        transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
+      }
+      .choice:hover { border-color: var(--line-strong); background: #fffdf8; transform: translateY(-1px); }
+      .choice.selected { border-color: var(--accent); background: #e8f1eb; }
+      .choice-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        font-weight: 650;
+        min-width: 0;
+      }
+      .choice-title span:first-child, .path { overflow-wrap: anywhere; }
+      .meta { color: var(--muted); font-size: 0.8rem; }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--accent);
+        flex: none;
+      }
+      .config-grid {
+        display: grid;
+        grid-template-columns: minmax(240px, 360px) minmax(0, 1fr);
+        gap: clamp(18px, 4vw, 34px);
+        align-items: start;
+      }
+      .panel {
+        display: grid;
+        gap: 12px;
+        min-width: 0;
+      }
+      .panel + .panel { margin-top: 24px; }
+      .field-label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        font-size: 0.82rem;
+        color: var(--muted);
+      }
+      select {
+        width: 100%;
+        min-height: 42px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--surface);
+        color: var(--ink);
+        padding: 0 10px;
+      }
+      .workspace-browser {
+        display: grid;
+        gap: 12px;
+        min-width: 0;
+      }
+      .workspace-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--surface);
+        min-height: 42px;
+        padding: 8px 10px;
+      }
+      .workspace-current { min-width: 0; }
+      .workspace-current .path { color: var(--ink); font-size: 0.82rem; }
+      .ghost {
+        border: 1px solid transparent;
+        background: transparent;
+        color: var(--accent);
+        border-radius: 6px;
+        padding: 6px 8px;
+        white-space: nowrap;
+      }
+      .ghost:hover { background: #e8f1eb; }
+      .tree {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--surface);
+        overflow: hidden;
+      }
+      .tree-head {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        min-height: 38px;
+        padding: 8px 10px;
+        border-bottom: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 0.82rem;
+      }
+      .workspace-entries { max-height: 330px; overflow: auto; gap: 0; }
+      .workspace-entries .choice {
+        border: 0;
+        border-radius: 0;
+        border-bottom: 1px solid var(--line);
+        background: transparent;
+        transform: none;
+      }
+      .workspace-entries .choice:last-child { border-bottom: 0; }
+      .empty, .error {
+        padding: 12px;
+        color: var(--muted);
+        font-size: 0.86rem;
+      }
+      .error { color: var(--danger); }
+      .notice {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--surface);
+        color: var(--muted);
+        padding: 12px;
+      }
+      .notice strong {
+        color: var(--ink);
+        display: block;
+        margin-bottom: 3px;
+      }
+      .footer {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: stretch;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 14px clamp(18px, 4vw, 40px);
+        border-top: 1px solid var(--line);
+        background: color-mix(in oklch, var(--surface) 92%, var(--bg));
+      }
+      .selection-strip {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+        gap: 10px;
+        min-width: 0;
+      }
+      .selection-card {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--surface);
+        min-width: 0;
+        padding: 8px 10px;
+      }
+      .selection-label {
+        color: var(--muted);
+        font-size: 0.74rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .selection-value {
+        color: var(--ink);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        margin-top: 2px;
+      }
+      .primary {
+        border: 0;
+        border-radius: 7px;
+        background: var(--accent);
+        color: var(--accent-ink);
+        min-height: 40px;
+        padding: 0 18px;
+        font-weight: 650;
+        white-space: nowrap;
+      }
+      .primary:hover { background: #0f604b; }
+      .result {
+        position: fixed;
+        inset: 0;
+        display: none;
+        place-items: center;
+        background: color-mix(in oklch, var(--bg) 82%, transparent);
+        padding: 20px;
+      }
+      .result.active { display: grid; }
+      .result-box {
+        width: min(440px, 100%);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface);
+        padding: 22px;
+      }
+      .result-box h2 {
+        color: var(--ink);
+        font-size: 1rem;
+        letter-spacing: 0;
+        text-transform: none;
+        margin-bottom: 8px;
+      }
+      @media (max-width: 780px) {
+        .workspace { grid-template-columns: 1fr; }
+        .hosts { border-right: 0; border-bottom: 1px solid var(--line); }
+        .config-grid { grid-template-columns: 1fr; }
+        .footer { grid-template-columns: 1fr; }
+        .selection-strip { grid-template-columns: 1fr; }
+        .selection-value { white-space: normal; }
+      }
+    </style>
+  </head>
   <body>
-    <h1>Select a host</h1>
-    <p>Connection: <code>${escapeHtml(input.connectionId)}</code></p>
-    <ul>${links}</ul>
+    <div class="shell">
+      <header class="topbar">
+        <div class="title">
+          <h1>ACP Relay Authorization</h1>
+          <div class="connection">Connection <code>${escapeHtml(input.connectionId)}</code></div>
+        </div>
+        <div class="status-pill" id="connectionState">Waiting for selection</div>
+      </header>
+
+      <main class="workspace">
+        <aside class="hosts">
+          <div class="section-head">
+            <h2>Daemon</h2>
+            <span class="count" id="hostCount"></span>
+          </div>
+          <ul class="host-list" id="hostList"></ul>
+        </aside>
+
+        <section class="main">
+          <div class="config-grid">
+            <div>
+              <div class="panel" id="agentSection">
+                <div class="section-head">
+                  <h2>Agent</h2>
+                </div>
+                <label class="field-label" for="agentSelect">
+                  <span>Runtime launch target</span>
+                </label>
+                <select id="agentSelect"></select>
+              </div>
+            </div>
+
+            <div class="panel" id="workspaceSection">
+              <div class="section-head">
+                <h2>Workspace</h2>
+                <span class="count" id="workspaceCount"></span>
+              </div>
+              <div class="workspace-browser">
+                <div id="workspaceRoots" class="workspace-roots"></div>
+                <div class="workspace-toolbar">
+                  <div class="workspace-current">
+                    <div class="meta">Selected path</div>
+                    <div id="workspaceCurrent" class="path">No workspace preference</div>
+                  </div>
+                  <button id="clearWorkspace" class="ghost" type="button">Clear</button>
+                </div>
+                <div class="tree">
+                  <div class="tree-head">
+                    <span id="treeLabel">Workspace tree</span>
+                  </div>
+                  <div id="workspaceEntries" class="workspace-entries">
+                    <div class="empty">Select a daemon to browse workspace roots.</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <div class="selection-strip" aria-label="Current selection">
+          <div class="selection-card">
+            <div class="selection-label">Machine / Agent</div>
+            <div class="selection-value" id="machineAgentSummary">No daemon selected</div>
+          </div>
+          <div class="selection-card">
+            <div class="selection-label">Workspace</div>
+            <div class="selection-value" id="workspaceSummary">No workspace selected</div>
+          </div>
+        </div>
+        <button id="submitAuth" class="primary" disabled>Authorize session</button>
+      </footer>
+    </div>
+
+    <div id="result" class="result" role="status" aria-live="polite">
+      <div class="result-box">
+        <h2 id="resultTitle"></h2>
+        <p id="resultMessage" class="meta"></p>
+      </div>
+    </div>
+
+    <script>
+    (function() {
+      const hosts = ${hostsJson};
+      const connectionId = ${scriptJsonLiteral(input.connectionId)};
+      const authorizeUrl = ${requestUrlJson};
+      const sessionSelectionId = new URL(authorizeUrl, window.location.href).searchParams.get("sessionSelectionId") || "";
+      const unavailableReason = ${unavailableReasonJson};
+      let selectedHost = null;
+      let selectedWorkspaceRoot = "";
+
+      const hostList = document.getElementById("hostList");
+      const submitBtn = document.getElementById("submitAuth");
+      const agentSelect = document.getElementById("agentSelect");
+      const connectionState = document.getElementById("connectionState");
+      const machineAgentSummary = document.getElementById("machineAgentSummary");
+      const workspaceSummary = document.getElementById("workspaceSummary");
+      document.getElementById("hostCount").textContent = hosts.length + (hosts.length === 1 ? " host" : " hosts");
+
+      if (unavailableReason) {
+        connectionState.textContent = "Client disconnected";
+        hostList.innerHTML = '<li class="notice"><strong>Remote session expired</strong>' + escapeHtml(unavailableReason) + '</li>';
+        document.getElementById("workspaceEntries").innerHTML = '<div class="empty">Restart the remote session in your ACP client to create a fresh connection.</div>';
+        machineAgentSummary.textContent = "No active client connection";
+        workspaceSummary.textContent = "No workspace selected";
+        return;
+      }
+
+      hosts.forEach(function(host) {
+        const li = document.createElement("li");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "choice";
+        let metaText = "No metadata";
+        const machineName = displayMachine(host);
+        if (host.metadata) {
+          var parts = [];
+          if (host.metadata.machine) parts.push(host.metadata.machine);
+          parts.push(host.metadata.agentTypes.length + (host.metadata.agentTypes.length === 1 ? " agent" : " agents"));
+          parts.push(host.metadata.workspaceRoots.length + (host.metadata.workspaceRoots.length === 1 ? " workspace root" : " workspace roots"));
+          metaText = parts.join(" · ");
+        }
+        button.innerHTML = '<div class="choice-title"><span>' + escapeHtml(machineName) + '</span><span class="dot" aria-hidden="true"></span></div><div class="meta">' + escapeHtml(metaText) + '</div>';
+        button.onclick = function() {
+          selectHost(host, button);
+        };
+        li.appendChild(button);
+        hostList.appendChild(li);
+      });
+
+      if (hosts.length === 1) {
+        var firstButton = hostList.querySelector("button");
+        selectHost(hosts[0], firstButton);
+      }
+
+      function selectHost(host, button) {
+        selectedHost = host;
+        selectedWorkspaceRoot = "";
+        hostList.querySelectorAll(".choice").forEach(function(el) { el.classList.remove("selected"); });
+        if (button) button.classList.add("selected");
+        connectionState.textContent = "Daemon selected";
+        submitBtn.disabled = false;
+        renderAgentOptions(host.metadata && host.metadata.agentTypes ? host.metadata.agentTypes : []);
+        renderWorkspace(host.metadata && host.metadata.workspaceRoots ? host.metadata.workspaceRoots : []);
+        updateSummary();
+      }
+
+      function renderAgentOptions(agentTypes) {
+        agentSelect.innerHTML = "";
+        agentTypes.forEach(function(a) {
+          var opt = document.createElement("option");
+          opt.value = JSON.stringify({
+            id: a.id,
+            command: a.command,
+            type: a.type,
+          });
+          opt.textContent = a.label || a.id || a.command || "Agent";
+          if (a.id) opt.textContent += " · " + a.id;
+          if (a.type) opt.textContent += " · " + a.type;
+          agentSelect.appendChild(opt);
+        });
+        var preferredIndex = Array.prototype.findIndex.call(agentSelect.options, function(opt) {
+          try {
+            var value = JSON.parse(opt.value);
+            return value && value.id === ${scriptJsonLiteral(DEFAULT_AGENT_ID)};
+          } catch (_) {
+            return false;
+          }
+        });
+        if (preferredIndex >= 0) {
+          agentSelect.selectedIndex = preferredIndex;
+        } else {
+          var fallback = document.createElement("option");
+          fallback.value = "";
+          fallback.textContent = "Default daemon agent";
+          agentSelect.insertBefore(fallback, agentSelect.firstChild);
+          agentSelect.selectedIndex = 0;
+        }
+      }
+
+      function renderWorkspace(roots) {
+        document.getElementById("workspaceCount").textContent = roots.length + (roots.length === 1 ? " root" : " roots");
+        document.getElementById("workspaceCurrent").textContent = "";
+        document.getElementById("workspaceEntries").innerHTML = "";
+        document.getElementById("workspaceRoots").innerHTML = "";
+        document.getElementById("treeLabel").textContent = "Workspace tree";
+        if (roots.length === 0) {
+          document.getElementById("workspaceCurrent").textContent = "No workspace preference";
+          document.getElementById("workspaceEntries").innerHTML = '<div class="empty">This daemon did not advertise workspace roots.</div>';
+          return;
+        }
+        renderWorkspaceRoots(roots);
+        selectWorkspacePath(roots[0].path);
+        var firstRootButton = document.querySelector("#workspaceRoots .choice");
+        if (firstRootButton) firstRootButton.classList.add("selected");
+        loadWorkspaceDirectory(roots[0].path, roots[0].path);
+      }
+
+      document.getElementById("clearWorkspace").onclick = function() {
+        selectedWorkspaceRoot = "";
+        document.getElementById("workspaceCurrent").textContent = "No workspace preference";
+        document.querySelectorAll(".choice").forEach(function(el) { el.classList.remove("selected"); });
+        if (selectedHost) {
+          var selectedHostButton = Array.prototype.find.call(hostList.querySelectorAll(".choice"), function(el) {
+            return el.textContent.indexOf(displayMachine(selectedHost)) >= 0;
+          });
+          if (selectedHostButton) selectedHostButton.classList.add("selected");
+        }
+        updateSummary();
+      };
+      agentSelect.onchange = updateSummary;
+
+      submitBtn.onclick = function() {
+        if (!selectedHost) return;
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Authorizing...";
+        connectionState.textContent = "Authorizing";
+
+        var agentVal = agentSelect.value;
+        var agentId = undefined;
+        var agentCommand = undefined;
+        var agentType = undefined;
+        if (agentVal) {
+          var selectedAgent = JSON.parse(agentVal);
+          agentId = selectedAgent.id;
+          agentCommand = selectedAgent.command;
+          agentType = selectedAgent.type;
+        }
+        var workspaceRoots = selectedWorkspaceRoot ? [selectedWorkspaceRoot] : undefined;
+
+        var body = { daemonId: selectedHost.daemonId };
+        if (agentId) body.agentId = agentId;
+        if (agentCommand) body.agentCommand = agentCommand;
+        if (agentType) body.agentType = agentType;
+        if (sessionSelectionId) body.sessionSelectionId = sessionSelectionId;
+        if (workspaceRoots) body.workspaceRoots = workspaceRoots;
+
+        fetch(authorizeUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data.ok) {
+            document.getElementById("resultTitle").textContent = "Authorized";
+            document.getElementById("resultMessage").textContent = "Returning to the client.";
+            document.getElementById("result").classList.add("active");
+            closeAuthorizationWindow();
+          } else {
+            showError(data.reason || "Authorization failed.");
+            submitBtn.disabled = false;
+            submitBtn.textContent = "Authorize session";
+            connectionState.textContent = "Authorization failed";
+          }
+        })
+        .catch(function(err) {
+          showError("Network error: " + err.message);
+          submitBtn.disabled = false;
+          submitBtn.textContent = "Authorize session";
+          connectionState.textContent = "Network error";
+        });
+      };
+
+      function renderWorkspaceRoots(roots) {
+        var rootsEl = document.getElementById("workspaceRoots");
+        rootsEl.innerHTML = "";
+        roots.forEach(function(root) {
+          var button = document.createElement("button");
+          button.type = "button";
+          button.className = "choice";
+          button.innerHTML = '<div class="choice-title"><span>' + escapeHtml(root.label || root.path) + '</span></div><div class="meta path">' + escapeHtml(root.path) + '</div>';
+          button.onclick = function() {
+            selectWorkspacePath(root.path);
+            button.classList.add("selected");
+            loadWorkspaceDirectory(root.path, root.path);
+          };
+          rootsEl.appendChild(button);
+        });
+      }
+
+      function selectWorkspacePath(path) {
+        selectedWorkspaceRoot = path;
+        document.getElementById("workspaceCurrent").textContent = path;
+        document.querySelectorAll("#workspaceRoots .choice, #workspaceEntries .choice").forEach(function(el) { el.classList.remove("selected"); });
+        updateSummary();
+      }
+
+      function loadWorkspaceDirectory(root, path) {
+        var entriesEl = document.getElementById("workspaceEntries");
+        document.getElementById("treeLabel").textContent = path;
+        entriesEl.innerHTML = '<div class="empty">Loading...</div>';
+        var url = new URL("/api/daemons/" + encodeURIComponent(selectedHost.daemonId) + "/workspaces", window.location.href);
+        url.searchParams.set("connectionId", connectionId);
+        url.searchParams.set("root", root);
+        url.searchParams.set("path", path);
+        fetch(url.toString())
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            if (!data.ok) {
+              entriesEl.innerHTML = '<div class="error">' + escapeHtml(data.reason || "Unable to load workspace tree.") + '</div>';
+              return;
+            }
+            if (!data.entries.length) {
+              entriesEl.innerHTML = '<div class="empty">No subdirectories.</div>';
+              return;
+            }
+            entriesEl.innerHTML = "";
+            data.entries.forEach(function(entry) {
+              var button = document.createElement("button");
+              button.type = "button";
+              button.className = "choice";
+              button.innerHTML = '<div class="choice-title"><span>' + escapeHtml(entry.name) + '</span><span class="meta">Open</span></div><div class="meta path">' + escapeHtml(entry.path) + '</div>';
+              button.onclick = function() {
+                selectWorkspacePath(entry.path);
+                button.classList.add("selected");
+                loadWorkspaceDirectory(root, entry.path);
+              };
+              entriesEl.appendChild(button);
+            });
+          })
+          .catch(function(err) {
+            entriesEl.innerHTML = '<div class="error">Network error: ' + escapeHtml(err.message) + '</div>';
+          });
+      }
+
+      function updateSummary() {
+        if (!selectedHost) {
+          machineAgentSummary.textContent = "No daemon selected";
+          workspaceSummary.textContent = "No workspace selected";
+          return;
+        }
+        var agentLabel = agentSelect.options[agentSelect.selectedIndex] ? agentSelect.options[agentSelect.selectedIndex].textContent : "Default agent";
+        machineAgentSummary.textContent = displayMachine(selectedHost) + " · " + agentLabel;
+        workspaceSummary.textContent = selectedWorkspaceRoot || "No workspace preference";
+      }
+
+      function displayMachine(host) {
+        return host && host.metadata && host.metadata.machine
+          ? host.metadata.machine
+          : host.daemonId;
+      }
+
+      function showError(message) {
+        document.getElementById("resultTitle").textContent = "Authorization failed";
+        document.getElementById("resultMessage").textContent = message;
+        document.getElementById("result").classList.add("active");
+        window.setTimeout(function() {
+          document.getElementById("result").classList.remove("active");
+        }, 2600);
+      }
+
+      function closeAuthorizationWindow() {
+        var closeAttempts = 0;
+        var tryClose = function() {
+          closeAttempts += 1;
+          window.close();
+          window.open("", "_self");
+          window.close();
+          if (closeAttempts < 3) {
+            window.setTimeout(tryClose, 180);
+          }
+        };
+        tryClose();
+        window.setTimeout(function() {
+          document.getElementById("resultMessage").textContent = "Authorized. You can close this window.";
+        }, 900);
+      }
+
+      function escapeHtml(s) {
+        var d = document.createElement("div");
+        d.textContent = s;
+        return d.innerHTML;
+      }
+    })();
+    </script>
   </body>
 </html>`;
 }
@@ -1554,10 +3373,58 @@ export function createRelayAuthorizationResultPage(
   if (result.ok) {
     return `<!doctype html>
 <html lang="en">
-  <head><meta charset="utf-8"><title>ACP Runtime Relay</title></head>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ACP Runtime Relay</title>
+    <style>
+      body {
+        display: grid;
+        min-height: 100vh;
+        margin: 0;
+        place-items: center;
+        background: #f4f1ea;
+        color: #1f2520;
+        font: 14px/1.45 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      main {
+        width: min(420px, calc(100vw - 32px));
+        border: 1px solid #d8d4c8;
+        border-radius: 8px;
+        background: #fbfaf6;
+        padding: 22px;
+      }
+      h1 { margin: 0 0 8px; font-size: 1rem; }
+      p { margin: 0; color: #687066; }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.78rem;
+      }
+    </style>
+    <script>
+      function closeAuthorizationWindow() {
+        var attempts = 0;
+        var tryClose = function() {
+          attempts += 1;
+          window.close();
+          window.open("", "_self");
+          window.close();
+          if (attempts < 3) window.setTimeout(tryClose, 180);
+        };
+        tryClose();
+        window.setTimeout(function() {
+          var message = document.getElementById("message");
+          if (message) message.textContent = "Authorized. You can close this window.";
+        }, 900);
+      }
+      window.addEventListener("load", closeAuthorizationWindow);
+    </script>
+  </head>
   <body>
-    <h1>Authorized</h1>
-    <p>Connection <code>${escapeHtml(result.connectionId)}</code> is bound to host <code>${escapeHtml(result.hostId)}</code>.</p>
+    <main>
+      <h1>Authorized</h1>
+      <p id="message">Returning to the client.</p>
+    </main>
   </body>
 </html>`;
   }
@@ -1783,6 +3650,69 @@ function isRelayJsonRpcMessage(value: unknown): value is RelayJsonRpcMessage {
   );
 }
 
+function readRelayTransportPayloadDetails(
+  payload: unknown,
+  client: RelayClient,
+): {
+  hasError: boolean;
+  id?: string | number;
+  method?: string;
+  sessionId?: string;
+  traceContext?: AcpRemoteTraceContext;
+} {
+  if (!isRecord(payload)) {
+    return {
+      hasError: false,
+    };
+  }
+  const response = isJsonRpcResponsePayload(payload) ? payload : undefined;
+	  const pendingRequest =
+	    response && isStoredJsonRpcId(response.id)
+	      ? client.daemonRequests.get(response.id)
+	      : undefined;
+  const traceContext =
+    readAcpRemoteTraceContextFromJsonRpcMessage(payload) ??
+    (pendingRequest
+      ? readAcpRemoteTraceContextFromJsonRpcMessage(pendingRequest)
+      : undefined);
+  const method =
+    typeof payload.method === "string" ? payload.method : pendingRequest?.method;
+  const sessionId =
+    readPayloadSessionId(payload) ??
+    (pendingRequest ? readRequestSessionId(pendingRequest) : undefined);
+  return {
+    hasError: Object.prototype.hasOwnProperty.call(payload, "error"),
+    id: isStoredJsonRpcId(payload.id) ? payload.id : undefined,
+    method,
+    sessionId,
+    traceContext,
+  };
+}
+
+function readPayloadSessionId(payload: Record<string, unknown>): string | undefined {
+  const params = isRecord(payload.params) ? payload.params : undefined;
+  const result = isRecord(payload.result) ? payload.result : undefined;
+  return readString(params?.sessionId) ?? readString(result?.sessionId);
+}
+
+function isJsonRpcRequestPayload(value: unknown): value is RelayJsonRpcRequest {
+  return isRelayJsonRpcMessage(value) && isJsonRpcRequest(value);
+}
+
+function isJsonRpcResponsePayload(value: unknown): value is RelayJsonRpcResponse {
+  return (
+    isRecord(value) &&
+    value.jsonrpc === "2.0" &&
+    (typeof value.id === "string" || typeof value.id === "number") &&
+    (Object.prototype.hasOwnProperty.call(value, "result") ||
+      Object.prototype.hasOwnProperty.call(value, "error"))
+  );
+}
+
+function isStoredJsonRpcId(id: unknown): id is string | number {
+  return typeof id === "string" || typeof id === "number";
+}
+
 function readOperation(payload: unknown): string | undefined {
   if (!isRecord(payload)) {
     return undefined;
@@ -1812,11 +3742,152 @@ function readScope<T extends Record<string, AcpRemoteScope>>(
     : undefined;
 }
 
-function daemonHeartbeatConnectionId(hostId: string): string {
-  return `daemon:${hostId}`;
+function isSessionOpenRequest(
+  message: RelayJsonRpcMessage,
+): message is RelayJsonRpcRequest {
+  return (
+    isJsonRpcRequest(message) &&
+    (message.method === "session/new" ||
+      message.method === "session/load" ||
+      message.method === "session/resume")
+  );
 }
 
-function hostIdFromDaemonHeartbeatConnectionId(
+function isSessionRestoreRequest(message: RelayJsonRpcMessage): boolean {
+  return (
+    isJsonRpcRequest(message) &&
+    (message.method === "session/load" || message.method === "session/resume")
+  );
+}
+
+function isNativeClientAck(
+  message: RelayJsonRpcMessage,
+): message is RelayJsonRpcNotification {
+  return !isJsonRpcRequest(message) && message.method === NATIVE_CLIENT_ACK_METHOD;
+}
+
+function readNativeClientAckId(
+  message: RelayJsonRpcNotification,
+): string | number | undefined {
+  const params = isRecord(message.params) ? message.params : undefined;
+  const id = params?.id;
+  return typeof id === "string" || typeof id === "number" ? id : undefined;
+}
+
+function isSessionNewRequest(
+  message: RelayJsonRpcRequest,
+): boolean {
+  return message.method === "session/new";
+}
+
+function readSessionSelectionId(request: RelayJsonRpcRequest): string {
+  const params = isRecord(request.params) ? request.params : undefined;
+  const meta = isRecord(params?._meta) ? params._meta : undefined;
+  return normalizeSessionSelectionId(
+    readString(meta?.[ACP_REMOTE_SESSION_SELECTION_ID_META]),
+  );
+}
+
+function readRequestSessionId(request: RelayJsonRpcRequest): string | undefined {
+  const params = isRecord(request.params) ? request.params : undefined;
+  return readString(params?.sessionId);
+}
+
+function readResultSessionId(result: unknown): string | undefined {
+  return isRecord(result) ? readString(result.sessionId) : undefined;
+}
+
+function readSessionBindingMetadata(
+  result: unknown,
+): RelayAuthorizationSelection | undefined {
+  const meta = isRecord(result) && isRecord(result._meta) ? result._meta : undefined;
+  if (!meta) {
+    return undefined;
+  }
+  const daemonId = readString(meta[ACP_REMOTE_DAEMON_ID_META]);
+  if (!daemonId) {
+    return undefined;
+  }
+  return {
+    agent: readSessionAgent(meta[REMOTE_SESSION_AGENT_META]),
+    daemonId,
+    workspaceRoots: readStringArray(meta[REMOTE_SESSION_WORKSPACE_ROOTS_META]),
+  };
+}
+
+function normalizeSessionSelectionId(value: string | undefined): string {
+  return value && value.trim() ? value : DEFAULT_SESSION_SELECTION_ID;
+}
+
+function readSessionRestoreSelection(
+  request: RelayJsonRpcRequest,
+): RelayAuthorizationSelection | undefined {
+  const params = isRecord(request.params) ? request.params : undefined;
+  const meta = isRecord(params?._meta) ? params._meta : undefined;
+  if (!meta) {
+    return undefined;
+  }
+  const daemonId = readString(meta[ACP_REMOTE_DAEMON_ID_META]);
+  if (!daemonId) {
+    return undefined;
+  }
+  return {
+    agent: readSessionAgent(meta[REMOTE_SESSION_AGENT_META]),
+    daemonId,
+    workspaceRoots: readStringArray(meta[REMOTE_SESSION_WORKSPACE_ROOTS_META]),
+  };
+}
+
+function readSessionAgent(value: unknown): AcpRemoteAgentGrant | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const id = readString(value.id);
+  if (id) {
+    return { id };
+  }
+  const command = readString(value.command);
+  if (!command) {
+    return undefined;
+  }
+  const args = readStringArray(value.args);
+  const env = readOptionalStringRecord(value.env);
+  const type = readString(value.type);
+  return {
+    command,
+    ...(args && { args }),
+    ...(env && { env }),
+    ...(type && { type }),
+  };
+}
+
+function applySessionSelection(
+  request: RelayJsonRpcRequest,
+  selection: RelayAuthorizationSelection,
+): RelayJsonRpcRequest {
+  const params = isRecord(request.params) ? { ...request.params } : {};
+  const meta = isRecord(params._meta) ? { ...params._meta } : {};
+  if (selection.agent) {
+    meta[REMOTE_SESSION_AGENT_META] = selection.agent;
+  }
+  if (selection.workspaceRoots?.length) {
+    meta[REMOTE_SESSION_WORKSPACE_ROOTS_META] = selection.workspaceRoots;
+    params.cwd = selection.workspaceRoots[0];
+  }
+  return {
+    ...request,
+    params: {
+      ...params,
+      _meta: meta,
+    },
+  };
+}
+
+function daemonHeartbeatConnectionId(daemonId: string): string {
+  return `daemon:${daemonId}`;
+}
+
+function daemonIdFromDaemonHeartbeatConnectionId(
   connectionId: string,
 ): string | undefined {
   const prefix = "daemon:";
@@ -1829,10 +3900,76 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function readStringArray(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const strings = value.filter(
+    (entry): entry is string => typeof entry === "string" && entry.trim() !== "",
+  );
+  return strings.length ? strings : undefined;
+}
+
+function readOptionalStringRecord(
+  value: unknown,
+): Record<string, string | undefined> | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const entries = Object.entries(value).filter(
+    (entry): entry is [string, string | undefined] =>
+      typeof entry[1] === "string" || entry[1] === undefined,
+  );
+  return entries.length === Object.keys(value).length
+    ? Object.fromEntries(entries)
+    : undefined;
+}
+
+function asWorkspaceListResponse(
+  value: unknown,
+): DaemonWorkspaceListResult | undefined {
+  if (!isRecord(value) || value.kind !== "workspace/list/result") {
+    return undefined;
+  }
+  if (value.ok === false && typeof value.reason === "string") {
+    return { ok: false, reason: value.reason };
+  }
+  if (value.ok !== true || typeof value.path !== "string") {
+    return undefined;
+  }
+  const entries = Array.isArray(value.entries)
+    ? value.entries.filter(
+        (entry): entry is DaemonWorkspaceEntry =>
+          isRecord(entry) &&
+          entry.type === "directory" &&
+          typeof entry.name === "string" &&
+          typeof entry.path === "string",
+      )
+    : [];
+  return {
+    entries,
+    ok: true,
+    path: value.path,
+  };
+}
+
 function escapeHtml(value: string): string {
   return value
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function scriptJsonLiteral(value: unknown): string {
+  return JSON.stringify(value)
+    .replaceAll("<", "\\u003C")
+    .replaceAll(">", "\\u003E")
+    .replaceAll("&", "\\u0026")
+    .replaceAll("\u2028", "\\u2028")
+    .replaceAll("\u2029", "\\u2029");
 }

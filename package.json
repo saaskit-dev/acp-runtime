@@ -19,7 +19,7 @@
     "LICENSE"
   ],
   "bin": {
-    "acp-runtime-daemon": "dist/runtime/remote/daemon/bin.js"
+    "acp-runtime": "dist/runtime/remote/bin.js"
   },
   "publishConfig": {
     "access": "public"
@@ -43,6 +43,7 @@
     "demo:runtime": "node dist/examples/runtime-sdk-demo.js",
     "test": "pnpm --filter @saaskit-dev/simulator-agent-acp test && vitest run",
     "test:watch": "vitest",
+    "remote:prod-smoke": "node scripts/remote-prod-smoke.mjs",
     "lint": "tsc --noEmit -p tsconfig.json && pnpm run build:lib && tsc --noEmit -p tsconfig.examples.json && tsc --noEmit -p tsconfig.harness.json",
     "prepublishOnly": "npm run build && npm test"
   },
@@ -64,8 +65,6 @@
     "node": ">=18.0.0"
   },
   "devDependencies": {
-    "@opentelemetry/sdk-logs": "0.215.0",
-    "@opentelemetry/sdk-trace-base": "^1.9.1",
     "@types/node": "^22.15.3",
     "@types/tar": "^7.0.87",
     "@types/unzipper": "^0.10.11",
@@ -77,6 +76,8 @@
     "@agentclientprotocol/sdk": "^0.20.0",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/api-logs": "0.215.0",
+    "@opentelemetry/sdk-logs": "0.215.0",
+    "@opentelemetry/sdk-trace-base": "^1.9.1",
     "tar": "^7.5.13",
     "unzipper": "^0.12.3",
     "ws": "^8.18.0"

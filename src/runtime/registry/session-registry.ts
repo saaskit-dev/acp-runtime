@@ -27,10 +27,19 @@ export type AcpRuntimeSessionRegistryStore = {
   ): Promise<void>;
 };
 
+type PersistBatch = {
+  deletedSessionIds: Set<string>;
+  promise: Promise<void>;
+  reject(error: unknown): void;
+  resolve(): void;
+};
+
 export class AcpRuntimeSessionRegistry {
   private hydrated = false;
   private hydratePromise: Promise<void> | undefined;
-  private persistQueue: Promise<void> = Promise.resolve();
+  private persistInFlight: Promise<void> | undefined;
+  private nextPersistBatch: PersistBatch | undefined;
+  private readonly retainedDeletedSessionIds = new Set<string>();
   private readonly sessions = new Map<string, AcpRuntimeSessionRegistryEntry>();
   private readonly watchers = new Set<AcpRuntimeStoredSessionWatcher>();
   private lastUpdatedAtMs = 0;
@@ -223,22 +232,81 @@ export class AcpRuntimeSessionRegistry {
   private persist(options?: {
     deletedSessionIds?: readonly string[];
   }): Promise<void> {
-    if (!this.options.store) {
+    const store = this.options.store;
+    if (!store) {
       return Promise.resolve();
     }
 
-    this.persistQueue = this.persistQueue
-      .catch(() => {})
-      .then(
-        () =>
-          this.options.store?.save({
-            sessions: [...this.sessions.values()].map((entry) =>
-              this.cloneEntry(entry),
-            ),
-            version: 1,
-          }, options) ?? Promise.resolve(),
+    const batch = this.persistInFlight
+      ? this.nextPersistBatch ?? (this.nextPersistBatch = createPersistBatch())
+      : createPersistBatch();
+    this.mergeRetainedDeletedSessionIds(batch);
+    for (const sessionId of options?.deletedSessionIds ?? []) {
+      batch.deletedSessionIds.add(sessionId);
+    }
+
+    if (!this.persistInFlight) {
+      this.startPersistBatch(store, batch);
+    }
+
+    return batch.promise;
+  }
+
+  private mergeRetainedDeletedSessionIds(batch: PersistBatch): void {
+    if (this.retainedDeletedSessionIds.size === 0) {
+      return;
+    }
+    for (const sessionId of this.retainedDeletedSessionIds) {
+      batch.deletedSessionIds.add(sessionId);
+    }
+    this.retainedDeletedSessionIds.clear();
+  }
+
+  private startPersistBatch(
+    store: AcpRuntimeSessionRegistryStore,
+    batch: PersistBatch,
+  ): void {
+    this.persistInFlight = this.runPersistBatch(store, batch);
+  }
+
+  private async runPersistBatch(
+    store: AcpRuntimeSessionRegistryStore,
+    batch: PersistBatch,
+  ): Promise<void> {
+    try {
+      await store.save(
+        {
+          sessions: [...this.sessions.values()].map((entry) =>
+            this.cloneEntry(entry),
+          ),
+          version: 1,
+        },
+        batch.deletedSessionIds.size > 0
+          ? { deletedSessionIds: [...batch.deletedSessionIds] }
+          : undefined,
       );
-    return this.persistQueue;
+      batch.resolve();
+    } catch (error) {
+      this.retainDeletedSessionIdsForRetry(batch.deletedSessionIds);
+      batch.reject(error);
+    } finally {
+      const next = this.nextPersistBatch;
+      this.nextPersistBatch = undefined;
+      if (next) {
+        this.mergeRetainedDeletedSessionIds(next);
+        this.startPersistBatch(store, next);
+      } else {
+        this.persistInFlight = undefined;
+      }
+    }
+  }
+
+  private retainDeletedSessionIdsForRetry(
+    deletedSessionIds: Iterable<string>,
+  ): void {
+    for (const sessionId of deletedSessionIds) {
+      this.retainedDeletedSessionIds.add(sessionId);
+    }
   }
 
   private toSessionReference(
@@ -258,4 +326,19 @@ export class AcpRuntimeSessionRegistry {
       watcher(update);
     }
   }
+}
+
+function createPersistBatch(): PersistBatch {
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return {
+    deletedSessionIds: new Set<string>(),
+    promise,
+    reject,
+    resolve,
+  };
 }

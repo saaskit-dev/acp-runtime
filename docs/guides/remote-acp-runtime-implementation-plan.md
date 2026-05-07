@@ -6,10 +6,15 @@ Language:
 
 This plan turns [RFC-0006](../rfcs/0006-remote-acp-runtime-relay.md) into an
 implementation sequence. The first implementation priority is the native ACP
-client path:
+client path. Native ACP includes both clients that can connect to WebSocket ACP
+directly and clients that can only spawn a local stdio ACP command:
 
 ```text
 Native ACP Client
+  -> Relay /acp
+  OR
+Native ACP Client
+  -> generic stdio ACP bridge
   -> Relay /acp
   -> bootstrap auth and host selection
   -> Host Daemon
@@ -23,14 +28,51 @@ works end to end.
 
 ## Phase 0: Design and Boundaries
 
+- Product priority: user experience is first, while security must not degrade.
+  Do not make repeated browser authorization, manual IDs, stale tabs, or user
+  retries compensate for missing runtime state. Safe flows should restore
+  automatically from signed, auditable metadata; unsafe or ambiguous flows
+  should fail clearly with an actionable recovery path.
 - Keep RFC-0006 as the source of truth for account, host, client device, grant,
   ticket, relay, and daemon boundaries.
 - Keep local-first runtime behavior intact; existing `AcpRuntime` use must not
   depend on any relay.
 - Keep native ACP client compatibility focused on standard ACP
   `initialize/authenticate/session/*` methods.
-- Do not build `src/runtime/remote/client` in the first implementation phase.
+- Treat the authenticated remote path as a transparent ACP transport. Relay and
+  daemon may add auth, grant checks, routing, ticket renewal, workspace policy,
+  and observability, but they must not consume ACP data-plane semantics and
+  reconstruct them from runtime read models.
+- Allow a generic stdio ACP bridge in the first implementation phase for clients
+  that cannot open a WebSocket ACP endpoint directly. Keep it editor-agnostic
+  and limited to transport adaptation.
 - Do not build `examples/remote` in the first implementation phase.
+
+### Current UX Debt To Remove
+
+- Persist remote binding metadata for historical sessions. `session/load` and
+  `session/resume` should restore from recorded daemon, agent, workspace, grant,
+  and ticket context instead of reopening `/authorize` or guessing from online
+  daemons.
+- Keep `session/update` history replay transparent. Historical updates should
+  come from the selected ACP agent through the daemon proxy, not from daemon-side
+  runtime history reconstruction.
+- Make `/authorize` a deliberate selection surface for new sessions and explicit
+  reauthorization only. It should not appear just because a client process was
+  restarted.
+- Replace silent loading with bounded waits and specific ACP errors. The bridge,
+  relay, and daemon should never leave the ACP client waiting indefinitely for a
+  browser action that was not surfaced.
+- Treat old authorization tabs as expired views with a clear restart/reopen
+  action; never let stale pages look like the primary path.
+- Keep ticket renewal invisible during normal use. Only grant revocation,
+  missing metadata, daemon offline, or account/session expiry should interrupt
+  the user.
+- Surface current machine, agent, workspace, and recovery state consistently in
+  ACP config/options so the client UI can show what is actually bound.
+- Avoid defaulting by guesswork. When restoring, use persisted signed metadata;
+  when starting a new session, use explicit defaults such as Codex and allow the
+  user to change them.
 
 ## Phase 1: Native ACP Remote MVP
 
@@ -40,6 +82,9 @@ works end to end.
 - Support both native ACP client side and daemon side full-duplex JSON-RPC.
 - Preserve ACP message schema; remote routing metadata stays outside ACP payloads.
 - Add tests with SDK `ClientSideConnection` and `AgentSideConnection`.
+- Implement a generic stdio bridge that reads and writes ACP JSON-RPC over
+  local stdio while forwarding the same messages to the relay `/acp` WebSocket.
+  The bridge must not contain editor-specific behavior or runtime semantics.
 
 ### 1.2 Relay Bootstrap Facade
 
@@ -48,6 +93,8 @@ works end to end.
 - Handle bootstrap `authenticate` by creating a pending authorization.
 - Bind the ACP connection to a selected host after browser authorization.
 - Reject runtime methods such as `session/new` until the connection is bound.
+- The relay bootstrap behavior must be identical whether the ACP client connects
+  directly over WebSocket or through the stdio bridge.
 
 ### 1.3 Daemon Connection
 
@@ -86,6 +133,8 @@ works end to end.
 ### 1.7 MVP Validation
 
 - Use an SDK-backed ACP client smoke path against the relay endpoint.
+- Use a stdio-bridge smoke path for clients that only support launching a local
+  ACP command.
 - Use simulator agent as the local daemon-side runtime agent.
 - Validate prompt text, event streaming, cancellation, and permission flow.
 - Keep focused tests deterministic and independent of Cloudflare account state.
@@ -154,10 +203,13 @@ works end to end.
 - Support client short reconnects for the same `connectionId`.
 - Keep bound client routes in Durable Object memory for
   `ACP_RELAY_CLIENT_RECONNECT_GRACE_MS` while the daemon stays online.
+  Production defaults to 5 minutes; 30 seconds is too short for normal editor
+  restarts, laptop sleep wake, or network switching.
 - Expire disconnected client routes from the shard alarm and notify the daemon.
 - Support daemon short reconnects for the same `hostId`.
 - Keep bound clients open for `ACP_RELAY_DAEMON_RECONNECT_GRACE_MS`, then replay
-  route `Hello` frames when the daemon reconnects.
+  route `Hello` frames when the daemon reconnects. Production defaults to 5
+  minutes.
 - Expire daemon reconnect grace from the shard alarm and close affected clients.
 - Resume pending authorization where possible.
 
@@ -248,6 +300,7 @@ works end to end.
 
 - Add SDK in-memory ACP client tests.
 - Add WebSocket ACP client tests.
+- Add generic stdio bridge tests.
 - Add simulator-backed daemon tests.
 - Add permission/file/terminal smoke cases.
 
@@ -431,7 +484,7 @@ works end to end.
 
 - Keep `@saaskit-dev/acp-runtime` as the core local runtime package.
 - Extract `@saaskit-dev/acp-remote-protocol`.
-- Extract `@saaskit-dev/acp-runtime-daemon`.
+- Keep daemon and bridge entrypoints under the unified `acp-runtime` CLI.
 - Keep `@saaskit-dev/acp-relay-worker` as the Cloudflare worker package.
 - Add `@saaskit-dev/acp-remote-client` after first-party client APIs stabilize.
 
@@ -452,9 +505,10 @@ works end to end.
 
 ## Current Implementation Checkpoint
 
-- Active implementation scope is locked to the native ACP client path. Do not
-  implement first-party IDE clients, `src/runtime/remote/client`,
-  `examples/remote`, or remote IDE channel UI in this slice.
+- Active implementation scope is locked to the native ACP client path. This
+  includes direct WebSocket ACP and generic stdio bridge compatibility. Do not
+  implement first-party IDE clients, `examples/remote`, or remote IDE channel UI
+  in this slice.
 - `src/runtime/remote/protocol` defines versioned remote frames and a WebSocket
   JSON-RPC stream adapter.
 - `packages/relay-worker` exposes `/acp`, `/client`, `/daemon`, `/authorize`,
@@ -463,6 +517,9 @@ works end to end.
   scripts, and a D1 migration under `packages/relay-worker/migrations`.
 - The relay uses an account-level routing shard, not a user-facing room.
 - Unbound native ACP clients receive a bootstrap ACP auth method from `/acp`.
+- Stdio-only ACP clients are supported through a generic bridge that exposes a
+  local stdio ACP command and forwards to `/acp`. This is not a product-specific
+  editor integration and must remain a transport adapter.
 - `packages/relay-worker` has a lightweight control-plane store interface and an
   in-memory implementation for accounts, client devices, hosts, and grants.
 - `packages/relay-worker` also has a writable D1-backed control-plane store
@@ -483,6 +540,10 @@ works end to end.
 - `/authorize` can bind `connectionId -> hostId` only when an active grant allows
   the account/client device to access that host, and the relay signs a short-lived
   connection ticket for the daemon.
+- Daemon metadata advertises ACP registry ids as the primary agent choices.
+  Relay tickets can carry `agent.id`, and the daemon passes that id to
+  `AcpRuntime` so registry resolution, launch args, env, and cache behavior stay
+  inside the runtime.
 - When binding a native ACP route, the relay sends a remote `Hello` plus an
   internal daemon-side `initialize` request. The internal response is swallowed so
   native ACP clients do not see relay bootstrap implementation details.
@@ -514,8 +575,9 @@ works end to end.
   hands URL plus headers to an injected WebSocket factory.
 - The daemon connector also has a CLI/env config parser for `--account-id`,
   `--host-id`, `--relay-url`, and `--identity-path`, so product CLIs can wire the
-  real WebSocket implementation into the same connector path without adding a
-  local proxy.
+  real WebSocket implementation into the same connector path. This is separate
+  from the client-side stdio bridge, which adapts stdio-only ACP clients to
+  relay `/acp`.
 - Host-key registration is the only daemon registration path.
 - `src/runtime/remote/daemon` creates `AgentSideConnection` instances from relay
   ACP frames after validating the connection ticket. Ticket verification keys are
@@ -554,7 +616,8 @@ works end to end.
   `ACP_RELAY_HEARTBEAT_TIMEOUT_MS`.
 - The current Worker smoke covers native ACP client JSON-RPC through Worker
   routing, Durable Object routing, daemon connection, and simulator-backed local
-  runtime.
+  runtime. A separate stdio-bridge smoke should cover the local stdio command
+  compatibility path.
 
 ## Immediate Next Work
 
@@ -562,11 +625,13 @@ The active 1-4 native ACP implementation slice is now represented in code:
 
 1. WebSocket ACP stream adapter.
 2. Relay `/acp` accepts native ACP JSON-RPC.
-3. Daemon `/daemon` receives relay frames and creates `AgentSideConnection`.
-4. Worker/Durable Object smoke drives native ACP `initialize`, `authenticate`,
+3. Generic stdio ACP bridge adapts stdio-only clients to relay `/acp`.
+4. Daemon `/daemon` receives relay frames and creates `AgentSideConnection`.
+5. Worker/Durable Object smoke drives native ACP `initialize`, `authenticate`,
    `session/new`, and `session/prompt` against the simulator agent.
 
 Next implementation work should stay native ACP only until this path is
 deployment-ready: real login-provider integration for `/authorize`, daemon CLI
-packaging, Cloudflare staging deployment, and native ACP compatibility smoke.
-First-party IDE client work remains explicitly paused.
+packaging, Cloudflare staging deployment, WebSocket ACP smoke, and generic
+stdio-bridge compatibility smoke. First-party IDE client work remains explicitly
+paused.

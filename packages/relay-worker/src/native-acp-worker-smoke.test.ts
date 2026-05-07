@@ -9,6 +9,8 @@ import {
 } from "@agentclientprotocol/sdk";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { MemoryWebSocket, createMemoryWebSocketPair } from "../../../src/runtime/remote/shared/test-helpers.js";
+
 import {
   createAcpRemoteDaemonIdentity,
   createAcpRemoteDaemonRegistrationHeaders,
@@ -100,19 +102,24 @@ describe("native ACP Worker relay smoke", () => {
         },
       ],
     });
-    const env = createSmokeEnv(database);
+    const ticketKeys = await createSmokeTicketKeys();
+    const env = createSmokeEnv(database, ticketKeys);
 
     const daemonHeaders = await createAcpRemoteDaemonRegistrationHeaders({
       accountId: "acct-smoke",
-      hostId: "host-smoke",
+      daemonId: "host-smoke",
       identity,
       nonce: "daemon-nonce",
     });
     const daemonResponse = await worker.fetch(
-      new Request("https://relay.test/daemon?accountId=acct-smoke&hostId=host-smoke", {
+      new Request("https://relay.test/daemon?accountId=acct-smoke&daemonId=host-smoke", {
         headers: {
           ...daemonHeaders,
           Upgrade: "websocket",
+          "x-acp-daemon-metadata": JSON.stringify({
+            agentTypes: [],
+            workspaceRoots: [{ path: projectDir }],
+          }),
         },
       }),
       env,
@@ -126,13 +133,14 @@ describe("native ACP Worker relay smoke", () => {
         command: process.execPath,
         type: SIMULATOR_AGENT_ACP_REGISTRY_ID,
       },
-      hostId: "host-smoke",
+      daemonId: "host-smoke",
       runtime,
       socket: daemonSocket,
       ticketVerificationKeys: [
         {
-          kid: "test-key",
-          secret: "relay-ticket-secret",
+          alg: "Ed25519",
+          kid: ticketKeys.kid,
+          publicKey: ticketKeys.publicKey,
         },
       ],
     });
@@ -190,7 +198,7 @@ describe("native ACP Worker relay smoke", () => {
     });
     const authorizeResponse = await worker.fetch(
       new Request(
-        `https://relay.test/authorize?accountId=acct-smoke&connectionId=${connectionId}&hostId=host-smoke`,
+        `https://relay.test/authorize?accountId=acct-smoke&connectionId=${connectionId}&daemonId=host-smoke`,
         {
           headers: {
             authorization: `Bearer ${accountSession}`,
@@ -202,15 +210,34 @@ describe("native ACP Worker relay smoke", () => {
     expect(authorizeResponse.status).toBe(200);
     await expect(authentication).resolves.toMatchObject({
       _meta: {
-        "acp-runtime/remote/hostId": "host-smoke",
-        "acp-runtime/remote/ticketKid": "test-key",
+        "acp-runtime/remote/daemonId": "host-smoke",
+        "acp-runtime/remote/ticketKid": ticketKeys.kid,
       },
     });
 
-    const session = await clientConnection.newSession({
+    const sessionCreate = clientConnection.newSession({
       cwd: projectDir,
       mcpServers: [],
     });
+    const sessionAuthorizeResponse = await worker.fetch(
+      new Request(
+        `https://relay.test/authorize?accountId=acct-smoke&connectionId=${connectionId}`,
+        {
+          body: JSON.stringify({
+            daemonId: "host-smoke",
+            workspaceRoots: [projectDir],
+          }),
+          headers: {
+            authorization: `Bearer ${accountSession}`,
+            "content-type": "application/json",
+          },
+          method: "POST",
+        },
+      ),
+      env,
+    );
+    expect(sessionAuthorizeResponse.status).toBe(200);
+    const session = await sessionCreate;
     expect(session.sessionId).toBeTruthy();
 
     const response = await clientConnection.prompt({
@@ -232,14 +259,46 @@ describe("native ACP Worker relay smoke", () => {
   });
 });
 
-function createSmokeEnv(database: FakeD1Database): Env {
+async function createSmokeTicketKeys(): Promise<{
+  kid: string;
+  privateKey: string;
+  publicKey: string;
+}> {
+  const keyPair = (await crypto.subtle.generateKey(
+    "Ed25519",
+    true,
+    ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const [privateKey, publicKey] = await Promise.all([
+    crypto.subtle.exportKey("pkcs8", keyPair.privateKey),
+    crypto.subtle.exportKey("raw", keyPair.publicKey),
+  ]);
+  return {
+    kid: "relay-smoke-test",
+    privateKey: bytesToBase64Url(new Uint8Array(privateKey)),
+    publicKey: bytesToBase64Url(new Uint8Array(publicKey)),
+  };
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  return Buffer.from(bytes)
+    .toString("base64")
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
+
+function createSmokeEnv(
+  database: FakeD1Database,
+  ticketKeys: { kid: string; privateKey: string },
+): Env {
   const env = {
     ACP_RELAY_ACCOUNT_SESSION_SECRET: "account-session-secret",
     ACP_RELAY_CONTROL_PLANE_SECRET: "control-plane-secret",
     ACP_RELAY_DB: database as unknown as D1Database,
     ACP_RELAY_SHARDS: undefined as unknown as DurableObjectNamespace,
-    ACP_RELAY_TICKET_KID: "test-key",
-    ACP_RELAY_TICKET_SECRET: "relay-ticket-secret",
+    ACP_RELAY_TICKET_KID: ticketKeys.kid,
+    ACP_RELAY_TICKET_PRIVATE_KEY: ticketKeys.privateKey,
   } satisfies Env;
   const shard = new AcpRelayShard(
     {
@@ -336,83 +395,6 @@ class FakeWebSocketPair {
     this[0] = client;
     this[1] = server;
   }
-}
-
-class MemoryWebSocket {
-  private readonly closeListeners = new Set<() => void>();
-  private readonly errorListeners = new Set<() => void>();
-  private readonly messageListeners = new Set<(event: { data: unknown }) => void>();
-  private closed = false;
-  peer?: MemoryWebSocket;
-
-  accept(): void {}
-
-  addEventListener(type: "close" | "error", listener: () => void): void;
-  addEventListener(type: "message", listener: (event: { data: unknown }) => void): void;
-  addEventListener(
-    type: "close" | "error" | "message",
-    listener: (() => void) | ((event: { data: unknown }) => void),
-  ): void {
-    if (type === "message") {
-      this.messageListeners.add(listener as (event: { data: unknown }) => void);
-    } else if (type === "close") {
-      this.closeListeners.add(listener as () => void);
-    } else {
-      this.errorListeners.add(listener as () => void);
-    }
-  }
-
-  close(): void {
-    if (this.closed) {
-      return;
-    }
-    this.closed = true;
-    for (const listener of this.closeListeners) {
-      listener();
-    }
-    this.peer?.close();
-  }
-
-  removeEventListener(type: "close" | "error", listener: () => void): void;
-  removeEventListener(type: "message", listener: (event: { data: unknown }) => void): void;
-  removeEventListener(
-    type: "close" | "error" | "message",
-    listener: (() => void) | ((event: { data: unknown }) => void),
-  ): void {
-    if (type === "message") {
-      this.messageListeners.delete(listener as (event: { data: unknown }) => void);
-    } else if (type === "close") {
-      this.closeListeners.delete(listener as () => void);
-    } else {
-      this.errorListeners.delete(listener as () => void);
-    }
-  }
-
-  send(data: string): void {
-    if (this.closed) {
-      return;
-    }
-    queueMicrotask(() => {
-      this.peer?.receive(data);
-    });
-  }
-
-  private receive(data: string): void {
-    if (this.closed) {
-      return;
-    }
-    for (const listener of this.messageListeners) {
-      listener({ data });
-    }
-  }
-}
-
-function createMemoryWebSocketPair(): [MemoryWebSocket, MemoryWebSocket] {
-  const left = new MemoryWebSocket();
-  const right = new MemoryWebSocket();
-  left.peer = right;
-  right.peer = left;
-  return [left, right];
 }
 
 function isAcpTextNotification(value: unknown): value is {

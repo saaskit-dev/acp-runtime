@@ -1,4 +1,4 @@
-import { isAbsolute, relative, resolve } from "node:path";
+import { basename, isAbsolute, relative, resolve } from "node:path";
 import { realpath } from "node:fs/promises";
 
 import type {
@@ -27,6 +27,7 @@ import type {
   SetSessionConfigOptionResponse,
   SetSessionModeRequest,
   SetSessionModeResponse,
+  SessionConfigOption,
 } from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
 
@@ -45,21 +46,28 @@ import {
   mapAcpPromptToRuntimePrompt,
   mapRemotePermissionRequestToAcp,
   mapRuntimeConfigOptionsToAcp,
+  mapRuntimeHistoryEntryToAcpNotifications,
   mapRuntimeSessionListToAcp,
   mapRuntimeSessionToAcpResponse,
   mapRuntimeTurnCompletionToAcp,
   mapRuntimeTurnEventToAcpNotifications,
   createRemoteInitializeResponse,
 } from "./mappers.js";
+import { traceContextFromMeta } from "../../observability/tracing.js";
 
 type RemoteRuntimeSessions = {
-  list(options?: AcpRuntimeListSessionsOptions): Promise<AcpRuntimeSessionList>;
+  list(
+    options?: AcpRuntimeListSessionsOptions & {
+      _traceContext?: import("@opentelemetry/api").Context;
+    },
+  ): Promise<AcpRuntimeSessionList>;
   load(options: {
     agent?: AcpRuntimeAgentInput;
     cwd?: string;
     handlers?: AcpRuntimeAuthorityHandlers;
     mcpServers?: ReturnType<typeof mapAcpMcpServersToRuntime>;
     sessionId: string;
+    _traceContext?: import("@opentelemetry/api").Context;
   }): Promise<AcpRuntimeSession>;
   resume(options: {
     agent?: AcpRuntimeAgentInput;
@@ -67,29 +75,53 @@ type RemoteRuntimeSessions = {
     handlers?: AcpRuntimeAuthorityHandlers;
     mcpServers?: ReturnType<typeof mapAcpMcpServersToRuntime>;
     sessionId: string;
+    _traceContext?: import("@opentelemetry/api").Context;
   }): Promise<AcpRuntimeSession>;
-  start(options: AcpRuntimeStartSessionOptions): Promise<AcpRuntimeSession>;
+  start(
+    options: AcpRuntimeStartSessionOptions & {
+      _traceContext?: import("@opentelemetry/api").Context;
+    },
+  ): Promise<AcpRuntimeSession>;
 };
 
 export type AcpRemoteRuntimeAgentOptions = {
-  agent: AcpRuntimeAgentInput;
+  agent?: AcpRuntimeAgentInput;
   agentCapabilities?: AgentCapabilities;
   agentInfo?: InitializeResponse["agentInfo"];
+  remoteDaemonId?: string;
+  remoteMachineName?: string;
   runtime: {
     sessions: RemoteRuntimeSessions;
   };
+  sessionAgent?: AcpRuntimeAgentInput;
   workspaceRoots?: readonly string[];
 };
 
 type ActiveRemoteSession = {
+  remoteConfigOptions: SessionConfigOption[];
   session: AcpRuntimeSession;
   terminalHandles: Map<string, Awaited<ReturnType<AgentSideConnection["createTerminal"]>>>;
   turnId?: string;
 };
 
+type SessionScopedParams = {
+  _meta?: Record<string, unknown> | null;
+  sessionId: string;
+};
+
+const REMOTE_SESSION_AGENT_META = "acp-runtime/remote/sessionAgent";
+const REMOTE_SESSION_WORKSPACE_ROOTS_META =
+  "acp-runtime/remote/sessionWorkspaceRoots";
+const REMOTE_DAEMON_ID_META = "acp-runtime/remote/daemonId";
+const REMOTE_CONFIG_OPTION_PREFIX = "acp-runtime.remote.";
+
 export class AcpRemoteRuntimeAgent implements Agent {
   private clientCapabilities: ClientCapabilities = {};
   private readonly sessions = new Map<string, ActiveRemoteSession>();
+  private readonly sessionRestorePromises = new Map<
+    string,
+    Promise<ActiveRemoteSession>
+  >();
 
   constructor(
     private readonly connection: AgentSideConnection,
@@ -111,77 +143,150 @@ export class AcpRemoteRuntimeAgent implements Agent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
-    const cwd = await this.authorizeRequiredWorkspaceCwd(params.cwd, "session/new");
+    const traceContext = traceContextFromParams(params);
+    const selection = readSessionSelection(params);
+    const workspaceRoots = selection.workspaceRoots ?? this.options.workspaceRoots;
+    const cwdInput = selection.workspaceRoots?.[0] ?? params.cwd;
+    const cwd = await this.authorizeRequiredWorkspaceCwd(
+      cwdInput,
+      "session/new",
+      workspaceRoots,
+    );
     const session = await this.options.runtime.sessions.start({
-      agent: this.options.agent,
+      agent: selection.agent ?? this.requireAgent(),
       cwd,
       handlers: this.createAuthorityHandlers(),
       mcpServers: mapAcpMcpServersToRuntime(params.mcpServers),
+      _traceContext: traceContext,
     });
-    this.sessions.set(session.metadata.id, {
-      session,
-      terminalHandles: new Map(),
+    const remoteConfigOptions = createRemoteConfigOptions({
+      agent: selection.agent ?? this.options.agent,
+      machine: this.options.remoteMachineName,
+      workspace: selection.workspaceRoots?.[0] ?? cwd,
     });
-    return mapRuntimeSessionToAcpResponse(session.metadata);
+    this.storeActiveSession(session, remoteConfigOptions);
+    return addRemoteSessionMetadata(
+      addRemoteConfigOptions(
+        mapRuntimeSessionToAcpResponse(session.metadata),
+        remoteConfigOptions,
+      ),
+      this.createRemoteSessionMetadata(selection, cwd),
+    );
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    const cwd = await this.authorizeWorkspaceCwd(params.cwd, "session/load");
-    const session = await this.options.runtime.sessions.load({
-      agent: this.options.agent,
+    const traceContext = traceContextFromParams(params);
+    const selection = readSessionSelection(params);
+    const workspaceRoots = selection.workspaceRoots ?? this.options.workspaceRoots;
+    const cwdInput = selection.workspaceRoots?.[0] ?? params.cwd;
+    const cwd = await this.authorizeRequiredWorkspaceCwd(
+      cwdInput,
+      "session/load",
+      workspaceRoots,
+    );
+    const agent = selection.agent ?? this.requireAgent();
+    const mcpServers = mapAcpMcpServersToRuntime(params.mcpServers ?? []);
+    const session = await this.loadOrResumeRuntimeSession({
+      agent,
       cwd,
-      handlers: this.createAuthorityHandlers(),
-      mcpServers: mapAcpMcpServersToRuntime(params.mcpServers ?? []),
+      mcpServers,
+      preferred: "load",
+      method: "session/load",
       sessionId: params.sessionId,
+      traceContext,
     });
-    this.sessions.set(session.metadata.id, {
-      session,
-      terminalHandles: new Map(),
+    const remoteConfigOptions = createRemoteConfigOptions({
+      agent,
+      machine: this.options.remoteMachineName,
+      workspace: cwd,
     });
-    return mapRuntimeSessionToAcpResponse(session.metadata);
+    this.storeActiveSession(session, remoteConfigOptions, [params.sessionId]);
+    await this.replayHistory(params.sessionId, session);
+    return addRemoteSessionMetadata(
+      addRemoteConfigOptions(
+        mapRuntimeSessionToAcpResponse(session.metadata),
+        remoteConfigOptions,
+      ),
+      this.createRemoteSessionMetadata({ agent }, cwd),
+    );
   }
 
   async resumeSession(
     params: ResumeSessionRequest,
   ): Promise<ResumeSessionResponse> {
-    const cwd = await this.authorizeWorkspaceCwd(params.cwd, "session/resume");
-    const session = await this.options.runtime.sessions.resume({
-      agent: this.options.agent,
+    const traceContext = traceContextFromParams(params);
+    const selection = readSessionSelection(params);
+    const workspaceRoots = selection.workspaceRoots ?? this.options.workspaceRoots;
+    const cwdInput = selection.workspaceRoots?.[0] ?? params.cwd;
+    const cwd = await this.authorizeRequiredWorkspaceCwd(
+      cwdInput,
+      "session/resume",
+      workspaceRoots,
+    );
+    const agent = selection.agent ?? this.requireAgent();
+    const mcpServers = mapAcpMcpServersToRuntime(params.mcpServers ?? []);
+    const session = await this.loadOrResumeRuntimeSession({
+      agent,
       cwd,
-      handlers: this.createAuthorityHandlers(),
-      mcpServers: mapAcpMcpServersToRuntime(params.mcpServers ?? []),
+      mcpServers,
+      preferred: "resume",
+      method: "session/resume",
       sessionId: params.sessionId,
+      traceContext,
     });
-    this.sessions.set(session.metadata.id, {
-      session,
-      terminalHandles: new Map(),
+    const remoteConfigOptions = createRemoteConfigOptions({
+      agent,
+      machine: this.options.remoteMachineName,
+      workspace: cwd,
     });
-    return mapRuntimeSessionToAcpResponse(session.metadata);
+    this.storeActiveSession(session, remoteConfigOptions, [params.sessionId]);
+    await this.replayHistory(params.sessionId, session);
+    return addRemoteSessionMetadata(
+      addRemoteConfigOptions(
+        mapRuntimeSessionToAcpResponse(session.metadata),
+        remoteConfigOptions,
+      ),
+      this.createRemoteSessionMetadata({ agent }, cwd),
+    );
   }
 
   async listSessions(
     params: ListSessionsRequest,
   ): Promise<ListSessionsResponse> {
+    const traceContext = traceContextFromParams(params);
     const cwd = await this.authorizeWorkspaceCwd(
       params.cwd ?? undefined,
       "session/list",
     );
-    return mapRuntimeSessionListToAcp(
+    const list = mapRuntimeSessionListToAcp(
       await this.options.runtime.sessions.list({
-        agent: this.options.agent,
+        agent: this.requireAgent(),
         cursor: params.cursor ?? undefined,
         cwd,
         source: "all",
+        _traceContext: traceContext,
       }),
     );
+    return {
+      ...list,
+      sessions: list.sessions.map((session) =>
+        addRemoteSessionMetadata(
+          session,
+          this.createRemoteSessionMetadata(
+            { agent: this.options.sessionAgent ?? this.options.agent },
+            session.cwd,
+          ),
+        ),
+      ),
+    };
   }
 
   async closeSession(
     params: CloseSessionRequest,
   ): Promise<CloseSessionResponse | void> {
-    const active = this.requireSession(params.sessionId);
+    const active = await this.getOrRestoreSession(params, "session/close");
     await active.session.close();
-    this.sessions.delete(params.sessionId);
+    this.deleteSessionAliases(active);
     active.terminalHandles.clear();
     return {};
   }
@@ -189,7 +294,7 @@ export class AcpRemoteRuntimeAgent implements Agent {
   async setSessionMode(
     params: SetSessionModeRequest,
   ): Promise<SetSessionModeResponse | void> {
-    const active = this.requireSession(params.sessionId);
+    const active = await this.getOrRestoreSession(params, "session/set_mode");
     await active.session.agent.setMode(params.modeId);
     return {};
   }
@@ -197,19 +302,41 @@ export class AcpRemoteRuntimeAgent implements Agent {
   async setSessionConfigOption(
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
-    const active = this.requireSession(params.sessionId);
+    const active = await this.getOrRestoreSession(
+      params,
+      "session/set_config_option",
+    );
+    if (params.configId.startsWith(REMOTE_CONFIG_OPTION_PREFIX)) {
+      return {
+        configOptions: addRemoteConfigOptions(
+          {
+            configOptions:
+              mapRuntimeConfigOptionsToAcp(
+                active.session.metadata.agentConfigOptions,
+              ) ?? [],
+          },
+          active.remoteConfigOptions,
+        ).configOptions ?? [],
+      };
+    }
     const value: AcpRuntimeConfigValue =
       "type" in params && params.type === "boolean" ? params.value : params.value;
     await active.session.agent.setConfigOption(params.configId, value);
     return {
-      configOptions:
-        mapRuntimeConfigOptionsToAcp(active.session.metadata.agentConfigOptions) ??
-        [],
+      configOptions: addRemoteConfigOptions(
+        {
+          configOptions:
+            mapRuntimeConfigOptionsToAcp(
+              active.session.metadata.agentConfigOptions,
+            ) ?? [],
+        },
+        active.remoteConfigOptions,
+      ).configOptions ?? [],
     };
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
-    const active = this.requireSession(params.sessionId);
+    const active = await this.getOrRestoreSession(params, "session/prompt");
     const turn = active.session.turn.start(
       mapAcpPromptToRuntimePrompt(params.prompt),
     );
@@ -240,7 +367,7 @@ export class AcpRemoteRuntimeAgent implements Agent {
         } else if (event.type === "failed") {
           throw RequestError.internalError(
             { sessionId: params.sessionId, turnId: event.turnId },
-            event.error.message,
+            formatError(event.error),
           );
         }
       }
@@ -263,28 +390,202 @@ export class AcpRemoteRuntimeAgent implements Agent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
-    const active = this.requireSession(params.sessionId);
+    const active = await this.getOrRestoreSession(params, "session/cancel");
     if (active.turnId) {
       await active.session.turn.cancel(active.turnId);
     }
   }
 
-  private requireSession(sessionId: string): ActiveRemoteSession {
-    const active = this.sessions.get(sessionId);
-    if (!active) {
+  private requireAgent(): AcpRuntimeAgentInput {
+    if (!this.options.agent) {
       throw RequestError.invalidParams(
-        { sessionId },
-        `Unknown remote runtime session: ${sessionId}`,
+        {},
+        "No agent configured. Select an agent during authorization.",
       );
     }
+    return this.options.agent;
+  }
+
+  private createRemoteSessionMetadata(
+    selection: {
+      agent?: AcpRuntimeAgentInput;
+      workspaceRoots?: readonly string[];
+    },
+    cwd: string,
+  ): Record<string, unknown> {
+    return createRemoteSessionMetadata({
+      agent:
+        selection.agent ??
+        this.options.sessionAgent ??
+        this.options.agent,
+      daemonId: this.options.remoteDaemonId,
+      workspaceRoots:
+        selection.workspaceRoots ??
+        this.options.workspaceRoots ??
+      (cwd ? [cwd] : undefined),
+    });
+  }
+
+  private async getOrRestoreSession(
+    params: SessionScopedParams,
+    method: string,
+  ): Promise<ActiveRemoteSession> {
+    const active = this.sessions.get(params.sessionId);
+    if (active) {
+      return active;
+    }
+
+    const existingRestore = this.sessionRestorePromises.get(params.sessionId);
+    if (existingRestore) {
+      return existingRestore;
+    }
+
+    const restore = this.restoreSession(params, method);
+    this.sessionRestorePromises.set(params.sessionId, restore);
+    try {
+      return await restore;
+    } finally {
+      this.sessionRestorePromises.delete(params.sessionId);
+    }
+  }
+
+  private async restoreSession(
+    params: SessionScopedParams,
+    method: string,
+  ): Promise<ActiveRemoteSession> {
+    const traceContext = traceContextFromParams(params);
+    const selection = readSessionSelection(params);
+    const workspaceRoots = selection.workspaceRoots ?? this.options.workspaceRoots;
+    const cwdInput = selection.workspaceRoots?.[0] ?? workspaceRoots?.[0];
+    if (!cwdInput) {
+      throw RequestError.invalidParams(
+        { method, sessionId: params.sessionId },
+        `Unknown remote runtime session: ${params.sessionId}`,
+      );
+    }
+    const cwd = await this.authorizeRequiredWorkspaceCwd(
+      cwdInput,
+      method,
+      workspaceRoots,
+    );
+    const agent =
+      selection.agent ?? this.options.sessionAgent ?? this.requireAgent();
+    const session = await this.loadOrResumeRuntimeSession({
+      agent,
+      cwd,
+      method,
+      sessionId: params.sessionId,
+      traceContext,
+    });
+    const remoteConfigOptions = createRemoteConfigOptions({
+      agent,
+      machine: this.options.remoteMachineName,
+      workspace: cwd,
+    });
+    const active = this.storeActiveSession(session, remoteConfigOptions, [
+      params.sessionId,
+    ]);
+    await this.replayHistory(params.sessionId, session);
     return active;
+  }
+
+  private async loadOrResumeRuntimeSession(input: {
+    agent: AcpRuntimeAgentInput;
+    cwd: string;
+    mcpServers?: ReturnType<typeof mapAcpMcpServersToRuntime>;
+    preferred?: "load" | "resume";
+    method: string;
+    sessionId: string;
+    traceContext?: import("@opentelemetry/api").Context;
+  }): Promise<AcpRuntimeSession> {
+    const attempts =
+      input.preferred === "resume"
+        ? [
+            this.options.runtime.sessions.resume.bind(this.options.runtime.sessions),
+            this.options.runtime.sessions.load.bind(this.options.runtime.sessions),
+          ]
+        : [
+            this.options.runtime.sessions.load.bind(this.options.runtime.sessions),
+            this.options.runtime.sessions.resume.bind(this.options.runtime.sessions),
+          ];
+    let firstError: unknown;
+    let secondError: unknown;
+    for (const attempt of attempts) {
+      try {
+        return await attempt({
+          agent: input.agent,
+          cwd: input.cwd,
+          handlers: this.createAuthorityHandlers(),
+          mcpServers: input.mcpServers ?? [],
+          sessionId: input.sessionId,
+          _traceContext: input.traceContext,
+        } as Parameters<typeof attempt>[0]);
+      } catch (error) {
+        if (firstError === undefined) {
+          firstError = error;
+        } else {
+          secondError = error;
+        }
+      }
+    }
+    throw RequestError.invalidParams(
+      {
+        firstError: formatError(firstError),
+        method: input.method,
+        secondError: formatError(secondError),
+        sessionId: input.sessionId,
+      },
+      `Remote runtime session could not be restored: ${input.sessionId}`,
+    );
+  }
+
+  private storeActiveSession(
+    session: AcpRuntimeSession,
+    remoteConfigOptions: SessionConfigOption[],
+    aliases: readonly string[] = [],
+  ): ActiveRemoteSession {
+    const active: ActiveRemoteSession = {
+      remoteConfigOptions,
+      session,
+      terminalHandles: new Map(),
+    };
+    this.sessions.set(session.metadata.id, active);
+    for (const alias of aliases) {
+      if (alias !== session.metadata.id) {
+        this.sessions.set(alias, active);
+      }
+    }
+    return active;
+  }
+
+  private async replayHistory(
+    sessionId: string,
+    session: AcpRuntimeSession,
+  ): Promise<void> {
+    const history = session.state.history.drain();
+    for (const entry of history) {
+      for (const notification of mapRuntimeHistoryEntryToAcpNotifications(
+        sessionId,
+        entry,
+      )) {
+        await this.connection.sessionUpdate(notification);
+      }
+    }
+  }
+
+  private deleteSessionAliases(active: ActiveRemoteSession): void {
+    for (const [sessionId, candidate] of this.sessions.entries()) {
+      if (candidate === active || candidate.session === active.session) {
+        this.sessions.delete(sessionId);
+      }
+    }
   }
 
   private async authorizeWorkspaceCwd(
     cwd: string | null | undefined,
     method: string,
+    workspaceRoots = this.options.workspaceRoots,
   ): Promise<string | undefined> {
-    const workspaceRoots = this.options.workspaceRoots;
     if (!workspaceRoots?.length) {
       return cwd ?? undefined;
     }
@@ -311,8 +612,9 @@ export class AcpRemoteRuntimeAgent implements Agent {
   private authorizeRequiredWorkspaceCwd(
     cwd: string,
     method: string,
+    workspaceRoots = this.options.workspaceRoots,
   ): Promise<string> {
-    return this.authorizeWorkspaceCwd(cwd, method).then((r) => r ?? cwd);
+    return this.authorizeWorkspaceCwd(cwd, method, workspaceRoots).then((r) => r ?? cwd);
   }
 
   private createAuthorityHandlers(): AcpRuntimeAuthorityHandlers {
@@ -455,6 +757,217 @@ async function safeRealpath(path: string): Promise<string> {
   } catch {
     return path;
   }
+}
+
+function readSessionSelection(params: unknown): {
+  agent?: AcpRuntimeAgentInput;
+  workspaceRoots?: readonly string[];
+} {
+  if (!isRecord(params) || !isRecord(params._meta)) {
+    return {};
+  }
+  return {
+    agent: readSessionAgent(params._meta[REMOTE_SESSION_AGENT_META]),
+    workspaceRoots: readStringArray(
+      params._meta[REMOTE_SESSION_WORKSPACE_ROOTS_META],
+    ),
+  };
+}
+
+function traceContextFromParams(
+  params: { _meta?: Record<string, unknown> | null },
+): import("@opentelemetry/api").Context | undefined {
+  return traceContextFromMeta(params._meta);
+}
+
+function readSessionAgent(value: unknown): AcpRuntimeAgentInput | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  if (typeof value.id === "string" && value.id.trim()) {
+    return value.id;
+  }
+  if (typeof value.command !== "string" || !value.command.trim()) {
+    return undefined;
+  }
+  return {
+    args: Array.isArray(value.args)
+      ? value.args.filter((arg): arg is string => typeof arg === "string")
+      : undefined,
+    command: value.command,
+    env: isStringRecord(value.env) ? value.env : undefined,
+    type: typeof value.type === "string" ? value.type : undefined,
+  };
+}
+
+function readStringArray(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const strings = value.filter(
+    (entry): entry is string => typeof entry === "string" && entry.trim() !== "",
+  );
+  return strings.length ? strings : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return (
+    isRecord(value) &&
+    Object.values(value).every((entry) => typeof entry === "string")
+  );
+}
+
+function addRemoteSessionMetadata<T extends object>(
+  response: T,
+  metadata: Record<string, unknown>,
+): T & { _meta: Record<string, unknown> } {
+  const existingMeta =
+    "_meta" in response && isRecord(response._meta) ? response._meta : {};
+  return {
+    ...response,
+    _meta: {
+      ...existingMeta,
+      ...metadata,
+    },
+  };
+}
+
+function createRemoteSessionMetadata(input: {
+  agent?: AcpRuntimeAgentInput;
+  daemonId?: string;
+  workspaceRoots?: readonly string[];
+}): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {};
+  if (input.daemonId) {
+    metadata[REMOTE_DAEMON_ID_META] = input.daemonId;
+  }
+  const agent = serializeSessionAgent(input.agent);
+  if (agent) {
+    metadata[REMOTE_SESSION_AGENT_META] = agent;
+  }
+  if (input.workspaceRoots?.length) {
+    metadata[REMOTE_SESSION_WORKSPACE_ROOTS_META] = input.workspaceRoots;
+  }
+  return metadata;
+}
+
+function serializeSessionAgent(
+  agent: AcpRuntimeAgentInput | undefined,
+): Record<string, unknown> | undefined {
+  if (!agent) {
+    return undefined;
+  }
+  if (typeof agent === "string") {
+    return { id: agent };
+  }
+  const serialized: Record<string, unknown> = {
+    command: agent.command,
+  };
+  if (agent.args?.length) {
+    serialized.args = agent.args;
+  }
+  if (agent.env && Object.keys(agent.env).length) {
+    serialized.env = agent.env;
+  }
+  if (agent.type) {
+    serialized.type = agent.type;
+  }
+  return serialized;
+}
+
+function addRemoteConfigOptions<
+  T extends { configOptions?: SessionConfigOption[] | null },
+>(
+  response: T,
+  remoteConfigOptions: readonly SessionConfigOption[],
+): T & { configOptions: SessionConfigOption[] } {
+  return {
+    ...response,
+    configOptions: [
+      ...(response.configOptions ?? []),
+      ...remoteConfigOptions,
+    ],
+  };
+}
+
+function createRemoteConfigOptions(input: {
+  agent?: AcpRuntimeAgentInput;
+  machine?: string;
+  workspace?: string;
+}): SessionConfigOption[] {
+  return [
+    createReadonlyRemoteOption(
+      "machine",
+      "Remote Machine",
+      input.machine ?? "Unknown machine",
+      "Machine selected in ACP relay authorization.",
+    ),
+    createReadonlyRemoteOption(
+      "agent",
+      "Remote Agent",
+      formatAgent(input.agent),
+      "Agent selected in ACP relay authorization.",
+    ),
+    createReadonlyRemoteOption(
+      "workspace",
+      "Remote Workspace",
+      input.workspace ?? "No workspace preference",
+      "Workspace selected in ACP relay authorization.",
+    ),
+  ];
+}
+
+function createReadonlyRemoteOption(
+  key: string,
+  name: string,
+  value: string,
+  description: string,
+): SessionConfigOption {
+  return {
+    category: "remote",
+    currentValue: value,
+    description,
+    id: `${REMOTE_CONFIG_OPTION_PREFIX}${key}`,
+    name,
+    options: [{ name: value, value }],
+    type: "select",
+  };
+}
+
+function formatAgent(agent: AcpRuntimeAgentInput | undefined): string {
+  if (!agent) {
+    return "Default daemon agent";
+  }
+  if (typeof agent === "string") {
+    return agent;
+  }
+  if (agent.type) {
+    return agent.type;
+  }
+  return basename(agent.command);
+}
+
+function formatError(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+  const message = error.message;
+  const cause = readErrorCause(error);
+  if (!cause) {
+    return message;
+  }
+  return `${message} Caused by: ${formatError(cause)}`;
+}
+
+function readErrorCause(error: Error): unknown {
+  if ("cause" in error) {
+    return error.cause;
+  }
+  return undefined;
 }
 
 export function createAcpRemoteRuntimeAgent(input: {

@@ -1,6 +1,6 @@
 export type AcpRelayAccountSession = {
   accountId: string;
-  clientDeviceId?: string;
+  clientId?: string;
   expiresAt: string;
   sessionId: string;
 };
@@ -84,8 +84,8 @@ function isAccountSession(value: unknown): value is AcpRelayAccountSession {
     isNonEmptyString(value.accountId) &&
     isNonEmptyString(value.expiresAt) &&
     isNonEmptyString(value.sessionId) &&
-    (value.clientDeviceId === undefined ||
-      isNonEmptyString(value.clientDeviceId))
+    (value.clientId === undefined ||
+      isNonEmptyString(value.clientId))
   );
 }
 
@@ -108,7 +108,7 @@ async function signAccountSessionPayload(
     cryptoKey,
     toArrayBuffer(new TextEncoder().encode(payload)),
   );
-  return bytesToHex(new Uint8Array(signature));
+  return base64UrlEncode(new Uint8Array(signature));
 }
 
 function stableStringify(value: unknown): string {
@@ -129,12 +129,6 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   return copy.buffer;
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return [...bytes]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
 }
 
 function base64UrlEncode(bytes: Uint8Array): string {

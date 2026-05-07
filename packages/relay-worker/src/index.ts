@@ -7,6 +7,7 @@ import {
 } from "../../../src/runtime/remote/protocol/index.js";
 import {
   verifyAcpRelayAccountSessionToken,
+  createAcpRelayAccountSessionToken,
   type AcpRelayAccountSession,
 } from "./account-session.js";
 import {
@@ -18,9 +19,17 @@ import {
 } from "./control-plane-store.js";
 import { verifyDaemonRegistrationProof } from "./daemon-auth.js";
 import {
+  D1GitHubAccountStore,
+  createGitHubAuthorizationUrl,
+  exchangeGitHubCodeForAccessToken,
+  fetchGitHubUser,
+  resolveOrCreateGithubAccount,
+} from "./github-auth.js";
+import {
   AcpRelayBroker,
   createRelayAuthorizationPage,
   createRelayAuthorizationResultPage,
+  type DaemonMetadata,
 } from "./relay-core.js";
 
 export type Env = {
@@ -29,6 +38,8 @@ export type Env = {
   ACP_RELAY_CLIENT_RECONNECT_GRACE_MS?: string;
   ACP_RELAY_DAEMON_RECONNECT_GRACE_MS?: string;
   ACP_RELAY_DB?: D1Database;
+  ACP_RELAY_GITHUB_CLIENT_ID?: string;
+  ACP_RELAY_GITHUB_CLIENT_SECRET?: string;
   ACP_RELAY_HEARTBEAT_INTERVAL_MS?: string;
   ACP_RELAY_HEARTBEAT_TIMEOUT_MS?: string;
   ACP_RELAY_LOGIN_URL?: string;
@@ -36,16 +47,31 @@ export type Env = {
   ACP_RELAY_MAX_CONNECTIONS_PER_ACCOUNT?: string;
   ACP_RELAY_SHARDS: DurableObjectNamespace;
   ACP_RELAY_TICKET_KID?: string;
+  ACP_RELAY_TICKET_PRIVATE_KEY?: string;
   ACP_RELAY_TICKET_SECRET?: string;
 };
 
 const UPGRADE_REQUIRED = "Expected WebSocket upgrade.";
+const MAX_LOG_UPLOAD_RECORDS = 100;
+const MAX_LOG_UPLOAD_BYTES = 512 * 1024;
+const DEFAULT_AUTOMATIC_GRANT_SCOPES = [
+  "acp:connect",
+  "acp:session:create",
+  "acp:session:list",
+  "acp:session:resume",
+  "acp:turn:send",
+  "acp:turn:cancel",
+] as const satisfies readonly AcpRemoteScope[];
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/health") {
       return json({ ok: true });
+    }
+
+    if (url.pathname === "/login" || url.pathname === "/login/callback") {
+      return handleGitHubAuthRequest(request, env, url);
     }
 
     if (url.pathname.startsWith("/control-plane/")) {
@@ -58,11 +84,69 @@ export default {
 
     if (
       url.pathname !== "/acp" &&
+      url.pathname !== "/api/daemons" &&
+      url.pathname !== "/api/logs" &&
+      url.pathname !== "/api/session" &&
       url.pathname !== "/client" &&
       url.pathname !== "/daemon" &&
+      !url.pathname.startsWith("/api/daemons/") &&
       url.pathname !== "/authorize"
     ) {
       return new Response("Not found.", { status: 404 });
+    }
+
+    // OAuth and API endpoints that persist data require D1
+    if (url.pathname.startsWith("/login") && !env.ACP_RELAY_DB) {
+      return new Response("GitHub OAuth requires a database (D1).", { status: 503 });
+    }
+    if (url.pathname === "/api/logs") {
+      return handleRelayLogUploadRequest(request, env);
+    }
+    if (url.pathname.startsWith("/api/") && !env.ACP_RELAY_DB) {
+      return new Response("API endpoints require a database (D1).", { status: 503 });
+    }
+
+    if (url.pathname === "/api/session") {
+      const accountSession = await verifyAccountSessionRequest({
+        env,
+        request,
+      });
+      if (!accountSession.ok) {
+        return json({ error: accountSession.reason }, {
+          status: accountSession.status,
+        });
+      }
+      const secret = env.ACP_RELAY_ACCOUNT_SESSION_SECRET;
+      if (!secret) {
+        return json({ error: "Session secret not configured." }, { status: 503 });
+      }
+      const token = await createAcpRelayAccountSessionToken({
+        secret,
+        session: accountSession.session,
+      });
+      return json({
+        accountId: accountSession.session.accountId,
+        token,
+      });
+    }
+
+    if (url.pathname === "/api/daemons" || url.pathname.startsWith("/api/daemons/")) {
+      const accountSession = await verifyAccountSessionRequest({
+        env,
+        request,
+        requestedAccountId: resolveRequestedAccountId(request, url),
+      });
+      if (!accountSession.ok) {
+        return new Response(accountSession.reason, {
+          status: accountSession.status,
+        });
+      }
+      const shardId = env.ACP_RELAY_SHARDS.idFromName(
+        `account:${accountSession.session.accountId}`,
+      );
+      return env.ACP_RELAY_SHARDS
+        .get(shardId)
+        .fetch(withVerifiedAccountSession(request, accountSession.session));
     }
 
     if (url.pathname === "/authorize") {
@@ -99,23 +183,23 @@ export default {
           status: accountSession.status,
         });
       }
-      const clientDeviceId =
-        resolveClientDeviceId(request, url) ??
-        accountSession.session.clientDeviceId;
-      if (!clientDeviceId) {
-        return new Response("Missing client device id.", { status: 400 });
+      const clientId =
+        resolveClientId(request, url) ??
+        accountSession.session.clientId;
+      if (!clientId) {
+        return new Response("Missing client id.", { status: 400 });
       }
       if (
-        accountSession.session.clientDeviceId &&
-        accountSession.session.clientDeviceId !== clientDeviceId
+        accountSession.session.clientId &&
+        accountSession.session.clientId !== clientId
       ) {
         return new Response(
           "ACP relay account session does not match requested client device.",
           { status: 403 },
         );
       }
-      if (!resolveHostId(request, url)) {
-        return new Response("Missing host id.", { status: 400 });
+      if (!resolveDaemonId(request, url)) {
+        return new Response("Missing daemon id.", { status: 400 });
       }
 
       const shardId = env.ACP_RELAY_SHARDS.idFromName(
@@ -130,20 +214,20 @@ export default {
       return new Response(UPGRADE_REQUIRED, { status: 426 });
     }
 
-    if (url.pathname === "/daemon" && !resolveHostId(request, url)) {
-      return new Response("Missing host id.", { status: 400 });
+    if (url.pathname === "/daemon" && !resolveDaemonId(request, url)) {
+      return new Response("Missing daemon id.", { status: 400 });
     }
 
-    const accountId = resolveAccountId(request, url);
+    const accountId = await resolveAuthenticatedAccountId(request, url, env);
     if (url.pathname === "/daemon") {
-      const hostId = resolveHostId(request, url);
-      if (!hostId) {
-        return new Response("Missing host id.", { status: 400 });
+      const daemonId = resolveDaemonId(request, url);
+      if (!daemonId) {
+        return new Response("Missing daemon id.", { status: 400 });
       }
       const proof = await verifyDaemonRegistrationRequest({
         accountId,
         env,
-        hostId,
+        daemonId,
         request,
       });
       if (!proof.ok) {
@@ -162,34 +246,39 @@ export class AcpRelayShard {
 
   constructor(
     private readonly state: DurableObjectState,
-    env: Env,
+    private readonly env: Env,
   ) {
     this.heartbeatIntervalMs = readOptionalPositiveInteger(
-      env.ACP_RELAY_HEARTBEAT_INTERVAL_MS,
+      this.env.ACP_RELAY_HEARTBEAT_INTERVAL_MS,
     );
     this.broker = new AcpRelayBroker({
-      controlPlaneStore: env.ACP_RELAY_DB
-        ? new AcpRelayD1ControlPlaneStore(env.ACP_RELAY_DB)
+      controlPlaneStore: this.env.ACP_RELAY_DB
+        ? new AcpRelayD1ControlPlaneStore(this.env.ACP_RELAY_DB)
         : undefined,
       clientReconnectGraceMs: readOptionalPositiveInteger(
-        env.ACP_RELAY_CLIENT_RECONNECT_GRACE_MS,
+        this.env.ACP_RELAY_CLIENT_RECONNECT_GRACE_MS,
       ),
       daemonReconnectGraceMs: readOptionalPositiveInteger(
-        env.ACP_RELAY_DAEMON_RECONNECT_GRACE_MS,
+        this.env.ACP_RELAY_DAEMON_RECONNECT_GRACE_MS,
       ),
       heartbeatTimeoutMs: readOptionalPositiveInteger(
-        env.ACP_RELAY_HEARTBEAT_TIMEOUT_MS,
+        this.env.ACP_RELAY_HEARTBEAT_TIMEOUT_MS,
       ),
       maxBufferedFramesPerConnection: readOptionalPositiveInteger(
-        env.ACP_RELAY_MAX_BUFFERED_FRAMES_PER_CONNECTION,
+        this.env.ACP_RELAY_MAX_BUFFERED_FRAMES_PER_CONNECTION,
       ),
       maxConnectionsPerAccount: readOptionalPositiveInteger(
-        env.ACP_RELAY_MAX_CONNECTIONS_PER_ACCOUNT,
+        this.env.ACP_RELAY_MAX_CONNECTIONS_PER_ACCOUNT,
       ),
-      ticketSigningKey: env.ACP_RELAY_TICKET_SECRET
+      ticketSigningKey: this.env.ACP_RELAY_TICKET_PRIVATE_KEY
         ? {
-            kid: env.ACP_RELAY_TICKET_KID ?? "relay-local",
-            secret: env.ACP_RELAY_TICKET_SECRET,
+            kid: this.env.ACP_RELAY_TICKET_KID ?? "relay-production",
+            privateKey: this.env.ACP_RELAY_TICKET_PRIVATE_KEY,
+          }
+        : this.env.ACP_RELAY_TICKET_SECRET
+        ? {
+            kid: this.env.ACP_RELAY_TICKET_KID ?? "relay-local",
+            secret: this.env.ACP_RELAY_TICKET_SECRET,
           }
         : undefined,
     });
@@ -215,6 +304,10 @@ export class AcpRelayShard {
       return this.authorize(request, url);
     }
 
+    if (url.pathname === "/api/daemons" || url.pathname.startsWith("/api/daemons/")) {
+      return this.handleDaemonApi(request, url);
+    }
+
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response(UPGRADE_REQUIRED, { status: 426 });
     }
@@ -227,40 +320,51 @@ export class AcpRelayShard {
       url.pathname === "/client" ? "remote-frame" : "native-acp";
     const connectionId =
       url.searchParams.get("connectionId") ?? crypto.randomUUID();
-    const hostId = resolveHostId(request, url);
+    const daemonId = resolveDaemonId(request, url);
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
     server.accept();
 
     if (endpoint === AcpRemoteEndpointKind.Daemon) {
-      if (!hostId) {
-        server.close(1008, "Missing host id.");
+      if (!daemonId) {
+        server.close(1008, "Missing daemon id.");
       } else {
-        this.broker.registerDaemon(hostId, server);
+        const daemonMetadata = parseDaemonMetadataHeaders(request);
+        this.broker.registerDaemon(daemonId, server, daemonMetadata);
         void this.scheduleHeartbeat();
       }
     } else {
+      const agentCommand = url.searchParams.get("agentCommand");
+      const agentId = url.searchParams.get("agentId");
+      const agentType = url.searchParams.get("agentType");
       const accountId =
         clientTransport === "remote-frame"
           ? (resolveVerifiedAccountId(request) ?? resolveAccountId(request, url))
-          : resolveAccountId(request, url);
+          : await resolveAuthenticatedAccountId(request, url, this.env);
       this.broker.registerClient({
         accountId,
         authUrl: createAuthorizationUrl(request, connectionId).toString(),
-        clientDeviceId: resolveClientDeviceId(request, url),
+        clientId: resolveClientId(request, url),
         connectionId,
-        hostId,
+        daemonId,
+        nativeClientAck: url.searchParams.get("nativeClientAck") === "1",
         socket: server,
         transport: clientTransport,
       });
       if (clientTransport === "remote-frame") {
-        if (!hostId) {
-          server.close(1008, "Missing host id.");
+        if (!daemonId) {
+          server.close(1008, "Missing daemon id.");
         } else {
+          const clientAgent = agentCommand
+            ? { command: agentCommand, type: agentType ?? undefined }
+            : agentId
+              ? { id: agentId }
+            : undefined;
           const result = await this.broker.authorizeClient({
+            clientAgent,
             connectionId,
-            hostId,
+            daemonId,
           });
           if (!result.ok) {
             server.close(1008, result.reason);
@@ -270,7 +374,7 @@ export class AcpRelayShard {
                 connectionId,
                 endpoint: AcpRemoteEndpointKind.Daemon,
                 frameType: AcpRemoteFrameType.Hello,
-                hostId,
+                daemonId,
                 protocolVersion: ACP_REMOTE_PROTOCOL_VERSION,
                 ticket: result.ticket,
               }),
@@ -292,10 +396,10 @@ export class AcpRelayShard {
       }
     });
     server.addEventListener("close", () => {
-      this.removeSocket(endpoint, connectionId, hostId, server);
+      this.removeSocket(endpoint, connectionId, daemonId, server);
     });
     server.addEventListener("error", () => {
-      this.removeSocket(endpoint, connectionId, hostId, server);
+      this.removeSocket(endpoint, connectionId, daemonId, server);
     });
 
     return new Response(null, {
@@ -316,22 +420,104 @@ export class AcpRelayShard {
       return new Response("Missing connection id.", { status: 400 });
     }
 
-    const hostId = resolveHostId(request, url);
-    if (!hostId) {
+    if (request.method === "POST") {
+      const body = await readJsonBody(request);
+      if (!body.ok) {
+        return json({ error: body.reason }, { status: 400 });
+      }
+      const record = asRecord(body.value);
+      if (!record) {
+        return json({ error: "Request body must be an object." }, { status: 400 });
+      }
+      const daemonIdResult = readRequiredString(record, "daemonId");
+      if (!daemonIdResult.ok) {
+        return json({ error: daemonIdResult.reason }, { status: 400 });
+      }
+      const daemonId = daemonIdResult.value;
+      const agentCommandResult = readOptionalString(record, "agentCommand");
+      const agentIdResult = readOptionalString(record, "agentId");
+      const agentTypeResult = readOptionalString(record, "agentType");
+      const sessionSelectionIdResult = readOptionalString(
+        record,
+        "sessionSelectionId",
+      );
+      const workspaceRootsResult = readOptionalStringArray(record, "workspaceRoots");
+      const agentCommand = agentCommandResult.ok ? agentCommandResult.value : undefined;
+      const agentId = agentIdResult.ok ? agentIdResult.value : undefined;
+      const agentType = agentTypeResult.ok ? agentTypeResult.value : undefined;
+      const sessionSelectionId =
+        (sessionSelectionIdResult.ok ? sessionSelectionIdResult.value : undefined) ??
+        url.searchParams.get("sessionSelectionId") ??
+        undefined;
+      const workspaceRoots = workspaceRootsResult.ok ? workspaceRootsResult.value : undefined;
+      const clientAgent = agentCommand
+        ? { command: agentCommand, type: agentType ?? undefined }
+        : agentId
+          ? { id: agentId }
+        : undefined;
+      const result = await this.broker.authorizeClient({
+        clientAgent,
+        connectionId,
+        daemonId,
+        sessionSelectionId,
+        workspaceRoots,
+      });
+      return json(result, { status: result.ok ? 200 : 404 });
+    }
+
+    const daemonId = resolveDaemonId(request, url);
+    if (!daemonId) {
+      const hostsResult = await this.broker.authorizableHosts(connectionId);
       return html(
         createRelayAuthorizationPage({
           accountId,
           connectionId,
-          hosts: await this.broker.authorizableHostIds(connectionId),
+          hosts: hostsResult.ok ? hostsResult.hosts : [],
           requestUrl: request.url,
+          unavailableReason: hostsResult.ok ? undefined : hostsResult.reason,
         }),
+        { status: hostsResult.ok ? 200 : 410 },
       );
     }
 
-    const result = await this.broker.authorizeClient({ connectionId, hostId });
+    const result = await this.broker.authorizeClient({ connectionId, daemonId });
     return html(createRelayAuthorizationResultPage(result), {
       status: result.ok ? 200 : 404,
     });
+  }
+
+  private async handleDaemonApi(_request: Request, url: URL): Promise<Response> {
+    const workspaceMatch = url.pathname.match(/^\/api\/daemons\/([^/]+)\/workspaces$/);
+    if (workspaceMatch) {
+      const connectionId = url.searchParams.get("connectionId");
+      const root = url.searchParams.get("root");
+      if (!connectionId || !root) {
+        return json({ ok: false, reason: "Missing connectionId or root." }, { status: 400 });
+      }
+      const result = await this.broker.listDaemonWorkspaceDirectory({
+        connectionId,
+        daemonId: decodeURIComponent(workspaceMatch[1]),
+        path: url.searchParams.get("path") ?? undefined,
+        root,
+      });
+      return json(result, { status: result.ok ? 200 : 404 });
+    }
+
+    const match = url.pathname.match(/^\/api\/daemons\/(.+)$/);
+    if (!match) {
+      return json({
+        daemons: this.broker.onlineHostIds().map((daemonId) => ({
+          daemonId,
+          metadata: this.broker.getDaemonMetadata(daemonId),
+        })),
+      });
+    }
+    const daemonId = decodeURIComponent(match[1]);
+    const metadata = this.broker.getDaemonMetadata(daemonId);
+    if (!metadata) {
+      return json({ error: "Daemon not found or has no metadata." }, { status: 404 });
+    }
+    return json(metadata);
   }
 
   private async renew(request: Request): Promise<Response> {
@@ -361,12 +547,12 @@ export class AcpRelayShard {
   private removeSocket(
     endpoint: AcpRemoteEndpointKind,
     connectionId: string,
-    hostId: string | undefined,
+    daemonId: string | undefined,
     socket: WebSocket,
   ): void {
     if (endpoint === AcpRemoteEndpointKind.Daemon) {
-      if (hostId) {
-        this.broker.removeDaemon(hostId, socket);
+      if (daemonId) {
+        this.broker.removeDaemon(daemonId, socket);
       }
       return;
     }
@@ -403,22 +589,22 @@ export class AcpRelayShard {
   }
 }
 
-function resolveHostId(request: Request, url: URL): string | undefined {
+function resolveDaemonId(request: Request, url: URL): string | undefined {
   return (
-    url.searchParams.get("hostId") ??
-    request.headers.get("x-acp-host-id") ??
+    url.searchParams.get("daemonId") ??
+    request.headers.get("x-acp-daemon-id") ??
     undefined
   );
 }
 
-function resolveClientDeviceId(
+function resolveClientId(
   request: Request,
   url: URL,
 ): string | undefined {
   return (
-    url.searchParams.get("clientDeviceId") ??
-    request.headers.get("x-acp-client-device-id") ??
-    request.headers.get("x-acp-verified-client-device-id") ??
+    url.searchParams.get("clientId") ??
+    request.headers.get("x-acp-client-id") ??
+    request.headers.get("x-acp-verified-client-id") ??
     undefined
   );
 }
@@ -429,6 +615,26 @@ function resolveAccountId(request: Request, url: URL): string {
     request.headers.get("x-acp-account-id") ??
     "default"
   );
+}
+
+async function resolveAuthenticatedAccountId(
+  request: Request,
+  url: URL,
+  env: Env,
+): Promise<string> {
+  const verifiedAccountId = resolveVerifiedAccountId(request);
+  if (verifiedAccountId) {
+    return verifiedAccountId;
+  }
+  const secret = env.ACP_RELAY_ACCOUNT_SESSION_SECRET;
+  const token = readAccountSessionToken(request);
+  if (secret && token) {
+    const verification = await verifyAcpRelayAccountSessionToken({ secret, token });
+    if (verification.ok) {
+      return verification.session.accountId;
+    }
+  }
+  return resolveAccountId(request, url);
 }
 
 function resolveRequestedAccountId(
@@ -446,6 +652,48 @@ function resolveVerifiedAccountId(request: Request): string | undefined {
   return request.headers.get("x-acp-verified-account-id") ?? undefined;
 }
 
+function parseDaemonMetadataHeaders(request: Request): DaemonMetadata | undefined {
+  const raw = request.headers.get("x-acp-daemon-metadata");
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const value = JSON.parse(raw);
+    if (!asRecord(value)) {
+      return undefined;
+    }
+    const agentTypes = Array.isArray(value.agentTypes)
+      ? value.agentTypes.filter(
+          (a: unknown) =>
+            asRecord(a) &&
+            (typeof (a as Record<string, unknown>).command === "string" ||
+              typeof (a as Record<string, unknown>).id === "string") &&
+            typeof (a as Record<string, unknown>).label === "string",
+        )
+      : [];
+    const workspaceRoots = Array.isArray(value.workspaceRoots)
+      ? value.workspaceRoots.filter(
+          (w: unknown) =>
+            asRecord(w) && typeof (w as Record<string, unknown>).path === "string",
+        )
+      : [];
+    const machine =
+      typeof value.machine === "string" && value.machine.trim()
+        ? value.machine
+        : undefined;
+    if (agentTypes.length === 0 && workspaceRoots.length === 0) {
+      return undefined;
+    }
+    return {
+      agentTypes,
+      ...(machine ? { machine } : {}),
+      workspaceRoots,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 function withVerifiedAccountSession(
   request: Request,
   session: AcpRelayAccountSession,
@@ -453,8 +701,8 @@ function withVerifiedAccountSession(
   const headers = new Headers(request.headers);
   headers.set("x-acp-verified-account-id", session.accountId);
   headers.set("x-acp-account-session-id", session.sessionId);
-  if (session.clientDeviceId) {
-    headers.set("x-acp-verified-client-device-id", session.clientDeviceId);
+  if (session.clientId) {
+    headers.set("x-acp-verified-client-id", session.clientId);
   }
   return new Request(request, {
     headers,
@@ -521,6 +769,12 @@ function createAuthorizationSessionFailureResponse(input: {
   request: Request;
   url: URL;
 }): Response {
+  if (input.failure.status === 401 && input.env.ACP_RELAY_GITHUB_CLIENT_ID) {
+    const loginUrl = new URL("/login", input.request.url);
+    loginUrl.searchParams.set("returnTo", input.request.url);
+    return Response.redirect(loginUrl.toString(), 302);
+  }
+
   if (input.failure.status === 401 && input.env.ACP_RELAY_LOGIN_URL) {
     const loginUrl = new URL(input.env.ACP_RELAY_LOGIN_URL);
     loginUrl.searchParams.set("returnTo", input.request.url);
@@ -566,6 +820,152 @@ function createLoginUrl(loginUrl: string, returnTo: string): string {
   return url.toString();
 }
 
+const SESSION_COOKIE_NAME = "acp_relay_session";
+const SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
+
+async function handleGitHubAuthRequest(
+  request: Request,
+  env: Env,
+  url: URL,
+): Promise<Response> {
+  const clientId = env.ACP_RELAY_GITHUB_CLIENT_ID;
+  const clientSecret = env.ACP_RELAY_GITHUB_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    return new Response("GitHub OAuth is not configured.", { status: 503 });
+  }
+  const secret = env.ACP_RELAY_ACCOUNT_SESSION_SECRET;
+  if (!secret) {
+    return new Response("Account session secret is not configured.", {
+      status: 503,
+    });
+  }
+  const db = env.ACP_RELAY_DB;
+  if (!db) {
+    return new Response("GitHub OAuth requires a database (D1).", {
+      status: 503,
+    });
+  }
+
+  if (url.pathname === "/login/callback") {
+    const code = url.searchParams.get("code");
+    const state = url.searchParams.get("state");
+    if (!code || !state) {
+      return new Response("Missing code or state parameter.", { status: 400 });
+    }
+
+    const returnTo = await getOAuthStateReturnTo(state, env);
+    if (returnTo === undefined) {
+      return new Response("Invalid or expired OAuth state.", { status: 400 });
+    }
+
+    let user;
+    try {
+      const accessToken = await exchangeGitHubCodeForAccessToken(
+        { clientId, clientSecret },
+        code,
+      );
+      user = await fetchGitHubUser(accessToken);
+    } catch (error) {
+      return new Response(
+        error instanceof Error ? error.message : "GitHub OAuth failed.",
+        { status: 502 },
+      );
+    }
+
+    const githubStore = new D1GitHubAccountStore(db);
+    const githubAccount = await resolveOrCreateGithubAccount(githubStore, user);
+    const accountId = githubAccount.accountId;
+    await new AcpRelayD1ControlPlaneStore(db).upsertAccount({ accountId });
+    const session: AcpRelayAccountSession = {
+      accountId,
+      clientId: undefined,
+      expiresAt: new Date(
+        Date.now() + SESSION_MAX_AGE_SECONDS * 1000,
+      ).toISOString(),
+      sessionId: crypto.randomUUID(),
+    };
+    const token = await createAcpRelayAccountSessionToken({ secret, session });
+
+    const redirectUrl = returnTo
+      ? new URL(returnTo, request.url)
+      : new URL("/authorize", request.url);
+    // Local daemon OAuth listeners cannot receive Secure cookies over HTTP.
+    if (isLocalhostUrl(redirectUrl)) {
+      redirectUrl.searchParams.set("token", token);
+      redirectUrl.searchParams.set("accountId", accountId);
+    }
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: redirectUrl.toString(),
+        "Set-Cookie": `${SESSION_COOKIE_NAME}=${token}; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}; HttpOnly; SameSite=Lax; Secure`,
+      },
+    });
+  }
+
+  // GET /login
+  const returnTo = url.searchParams.get("returnTo") ?? "/authorize";
+  const state = crypto.randomUUID();
+  const stateStore = await openOAuthStateStore(env);
+  await stateStore.put(state, returnTo);
+
+  const githubUrl = createGitHubAuthorizationUrl(
+    { clientId, clientSecret },
+    state,
+    new URL("/login/callback", request.url).origin,
+  );
+  return Response.redirect(githubUrl, 302);
+}
+
+async function getOAuthStateReturnTo(
+  state: string,
+  env: Env,
+): Promise<string | undefined> {
+  const stateStore = await openOAuthStateStore(env);
+  return stateStore.get(state);
+}
+
+interface OAuthStateStore {
+  put(state: string, returnTo: string): Promise<void>;
+  get(state: string): Promise<string | undefined>;
+}
+
+async function openOAuthStateStore(env: Env): Promise<OAuthStateStore> {
+  if (env.ACP_RELAY_DB) {
+    return new D1OAuthStateStore(env.ACP_RELAY_DB);
+  }
+  throw new Error("OAuth requires a database (D1).");
+}
+
+class D1OAuthStateStore implements OAuthStateStore {
+  constructor(private readonly db: D1Database) {}
+
+  async put(state: string, returnTo: string): Promise<void> {
+    await this.db
+      .prepare(
+        "INSERT INTO acp_oauth_states (state, return_to, created_at) VALUES (?, ?, ?) ON CONFLICT(state) DO UPDATE SET return_to = ?, created_at = ?",
+      )
+      .bind(state, returnTo, Date.now(), returnTo, Date.now())
+      .run();
+  }
+
+  async get(state: string): Promise<string | undefined> {
+    const row = await this.db
+      .prepare(
+        "SELECT return_to FROM acp_oauth_states WHERE state = ? AND created_at > ?",
+      )
+      .bind(state, Date.now() - 10 * 60 * 1000)
+      .first<{ return_to: string }>();
+    if (row) {
+      await this.db
+        .prepare("DELETE FROM acp_oauth_states WHERE state = ?")
+        .bind(state)
+        .run();
+    }
+    return row?.return_to;
+  }
+}
+
 async function routeDeviceRenewalRequest(
   request: Request,
   env: Env,
@@ -597,6 +997,69 @@ async function routeDeviceRenewalRequest(
       method: "POST",
     }),
   );
+}
+
+async function handleRelayLogUploadRequest(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") {
+    return new Response("Method not allowed.", {
+      headers: { allow: "POST" },
+      status: 405,
+    });
+  }
+
+  const contentLength = Number(request.headers.get("content-length") ?? 0);
+  if (Number.isFinite(contentLength) && contentLength > MAX_LOG_UPLOAD_BYTES) {
+    return json({ error: "Log upload body is too large." }, { status: 413 });
+  }
+
+  const accountSession = await verifyAccountSessionRequest({
+    env,
+    request,
+  });
+  if (!accountSession.ok) {
+    return json({ error: accountSession.reason }, {
+      status: accountSession.status,
+    });
+  }
+
+  const parsedBody = await readJsonBody(request);
+  if (!parsedBody.ok) {
+    return json({ error: parsedBody.reason }, { status: 400 });
+  }
+
+  const batch = parseRelayLogUploadBatch(parsedBody.value);
+  if (!batch.ok) {
+    return json({ error: batch.reason }, { status: 400 });
+  }
+
+  const uploadId = crypto.randomUUID();
+  const receivedAt = new Date().toISOString();
+  for (const [index, record] of batch.value.records.entries()) {
+    console.log(
+      JSON.stringify({
+        accountId: accountSession.session.accountId,
+        accountSessionId: accountSession.session.sessionId,
+        context: batch.value.context,
+        eventName: "acp.relay.log",
+        index,
+        receivedAt,
+        record,
+        spanId: typeof record.spanId === "string" ? record.spanId : undefined,
+        source: batch.value.source,
+        traceId: typeof record.traceId === "string" ? record.traceId : undefined,
+        uploadId,
+      }),
+    );
+  }
+
+  return json({
+    accepted: batch.value.records.length,
+    ok: true,
+    uploadId,
+  });
 }
 
 async function verifyAccountSessionRequest(input: {
@@ -670,7 +1133,31 @@ function readAccountSessionToken(request: Request): string | undefined {
   if (header) {
     return header;
   }
-  return readCookie(request.headers.get("cookie"), "acp_relay_session");
+  const cookie = readCookie(request.headers.get("cookie"), "acp_relay_session");
+  if (cookie) {
+    return cookie;
+  }
+  return readLocalhostQueryAccountSessionToken(request);
+}
+
+function readLocalhostQueryAccountSessionToken(
+  request: Request,
+): string | undefined {
+  const url = new URL(request.url);
+  if (!isLocalhostUrl(url)) {
+    return undefined;
+  }
+  const token = url.searchParams.get("token");
+  return token && token.trim() ? token : undefined;
+}
+
+function isLocalhostUrl(url: URL): boolean {
+  return (
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "[::1]" ||
+    url.hostname === "::1"
+  );
 }
 
 function readCookie(header: string | null, name: string): string | undefined {
@@ -689,7 +1176,7 @@ function readCookie(header: string | null, name: string): string | undefined {
 async function verifyDaemonRegistrationRequest(input: {
   accountId: string;
   env: Env;
-  hostId: string;
+  daemonId: string;
   request: Request;
 }): Promise<
   | {
@@ -700,34 +1187,122 @@ async function verifyDaemonRegistrationRequest(input: {
       reason: string;
     }
 > {
-  const host = input.env.ACP_RELAY_DB
-    ? await new AcpRelayD1ControlPlaneStore(input.env.ACP_RELAY_DB).getHost({
-        accountId: input.accountId,
-        hostId: input.hostId,
-      })
-    : undefined;
-  if (input.env.ACP_RELAY_DB && (!host || host.disabled)) {
+  if (!input.env.ACP_RELAY_DB) {
+    return { ok: false, reason: "Host registry is not configured." };
+  }
+  const store = new AcpRelayD1ControlPlaneStore(input.env.ACP_RELAY_DB);
+  let host = await store.getHost({
+    accountId: input.accountId,
+    daemonId: input.daemonId,
+  });
+  if (!host) {
+    const registration = await tryAutoRegisterDaemon({
+      accountId: input.accountId,
+      daemonId: input.daemonId,
+      env: input.env,
+      request: input.request,
+      store,
+    });
+    if (!registration.ok) {
+      return registration;
+    }
+    host = registration.host;
+  }
+  if (!host || host.disabled) {
     return { ok: false, reason: "Host is not registered for this account." };
   }
 
   const hostPublicKeys = [host?.publicKey, host?.previousPublicKey].filter(
     (value): value is string => typeof value === "string" && value.length > 0,
   );
-  if (hostPublicKeys.length > 0) {
-    return verifyDaemonRegistrationProof({
-      accountId: input.accountId,
-      hostId: input.hostId,
-      nonce: input.request.headers.get("x-acp-daemon-nonce") ?? "",
-      publicKeys: hostPublicKeys,
-      signature: input.request.headers.get("x-acp-daemon-signature") ?? "",
-      timestamp: input.request.headers.get("x-acp-daemon-timestamp") ?? "",
-    });
+  if (hostPublicKeys.length === 0) {
+    return {
+      ok: false,
+      reason: "Daemon registration proof key is not configured.",
+    };
   }
 
-  return {
-    ok: false,
-    reason: "Host key is not provisioned for this daemon.",
+  const proof = await verifyDaemonRegistrationProof({
+    accountId: input.accountId,
+    daemonId: input.daemonId,
+    nonce: input.request.headers.get("x-acp-daemon-nonce") ?? "",
+    publicKeys: hostPublicKeys,
+    signature: input.request.headers.get("x-acp-daemon-signature") ?? "",
+    timestamp: input.request.headers.get("x-acp-daemon-timestamp") ?? "",
+  });
+  if (proof.ok) {
+    return proof;
+  }
+  const registration = await tryAutoRegisterDaemon({
+    accountId: input.accountId,
+    daemonId: input.daemonId,
+    env: input.env,
+    request: input.request,
+    store,
+  });
+  return registration.ok ? { ok: true } : proof;
+}
+
+async function tryAutoRegisterDaemon(input: {
+  accountId: string;
+  daemonId: string;
+  env: Env;
+  request: Request;
+  store: AcpRelayD1ControlPlaneStore;
+}): Promise<
+  | {
+      ok: true;
+      host: AcpRelayHostRecord;
+    }
+  | {
+      ok: false;
+      reason: string;
+    }
+> {
+  const session = await verifyAccountSessionRequest({
+    env: input.env,
+    request: input.request,
+    requestedAccountId: input.accountId,
+  });
+  if (!session.ok) {
+    return {
+      ok: false,
+      reason: "Host is not registered for this account.",
+    };
+  }
+  const publicKey = input.request.headers.get("x-acp-daemon-public-key");
+  if (!publicKey) {
+    return {
+      ok: false,
+      reason: "Daemon registration public key is required.",
+    };
+  }
+  const proof = await verifyDaemonRegistrationProof({
+    accountId: input.accountId,
+    daemonId: input.daemonId,
+    nonce: input.request.headers.get("x-acp-daemon-nonce") ?? "",
+    publicKey,
+    signature: input.request.headers.get("x-acp-daemon-signature") ?? "",
+    timestamp: input.request.headers.get("x-acp-daemon-timestamp") ?? "",
+  });
+  if (!proof.ok) {
+    return proof;
+  }
+  const host: AcpRelayHostRecord = {
+    accountId: input.accountId,
+    daemonId: input.daemonId,
+    publicKey,
   };
+  await input.store.upsertAccount({ accountId: input.accountId });
+  await input.store.upsertHost(host);
+  await input.store.upsertGrant({
+    accountId: input.accountId,
+    daemonId: input.daemonId,
+    grantId: `default:${input.accountId}:${input.daemonId}`,
+    policyVersion: 1,
+    scopes: DEFAULT_AUTOMATIC_GRANT_SCOPES,
+  });
+  return { host, ok: true };
 }
 
 async function handleControlPlaneRequest(
@@ -930,9 +1505,9 @@ function parseClientDeviceRecord(
     return accountId;
   }
 
-  const clientDeviceId = readRequiredString(record, "clientDeviceId");
-  if (!clientDeviceId.ok) {
-    return clientDeviceId;
+  const clientId = readRequiredString(record, "clientId");
+  if (!clientId.ok) {
+    return clientId;
   }
 
   const disabled = readOptionalBoolean(record, "disabled");
@@ -949,7 +1524,7 @@ function parseClientDeviceRecord(
     ok: true,
     value: {
       accountId: accountId.value,
-      clientDeviceId: clientDeviceId.value,
+      clientId: clientId.value,
       disabled: disabled.value,
       publicKey: publicKey.value,
     },
@@ -967,9 +1542,9 @@ function parseHostRecord(value: unknown): ParseResult<AcpRelayHostRecord> {
     return accountId;
   }
 
-  const hostId = readRequiredString(record, "hostId");
-  if (!hostId.ok) {
-    return hostId;
+  const daemonId = readRequiredString(record, "daemonId");
+  if (!daemonId.ok) {
+    return daemonId;
   }
 
   const disabled = readOptionalBoolean(record, "disabled");
@@ -992,7 +1567,7 @@ function parseHostRecord(value: unknown): ParseResult<AcpRelayHostRecord> {
     value: {
       accountId: accountId.value,
       disabled: disabled.value,
-      hostId: hostId.value,
+      daemonId: daemonId.value,
       previousPublicKey: previousPublicKey.value,
       publicKey: publicKey.value,
     },
@@ -1015,14 +1590,14 @@ function parseGrantRecord(value: unknown): ParseResult<AcpRelayGrantRecord> {
     return accountId;
   }
 
-  const clientDeviceId = readOptionalString(record, "clientDeviceId");
-  if (!clientDeviceId.ok) {
-    return clientDeviceId;
+  const clientId = readOptionalString(record, "clientId");
+  if (!clientId.ok) {
+    return clientId;
   }
 
-  const hostId = readRequiredString(record, "hostId");
-  if (!hostId.ok) {
-    return hostId;
+  const daemonId = readRequiredString(record, "daemonId");
+  if (!daemonId.ok) {
+    return daemonId;
   }
 
   const workspaceId = readOptionalString(record, "workspaceId");
@@ -1054,9 +1629,9 @@ function parseGrantRecord(value: unknown): ParseResult<AcpRelayGrantRecord> {
     ok: true,
     value: {
       accountId: accountId.value,
-      clientDeviceId: clientDeviceId.value,
+      clientId: clientId.value,
       grantId: grantId.value,
-      hostId: hostId.value,
+      daemonId: daemonId.value,
       policyVersion: policyVersion.value,
       revoked: revoked.value,
       scopes: scopes.value,
@@ -1079,9 +1654,9 @@ function parseDeviceRenewalProof(
     return accountId;
   }
 
-  const clientDeviceId = readRequiredString(record, "clientDeviceId");
-  if (!clientDeviceId.ok) {
-    return clientDeviceId;
+  const clientId = readRequiredString(record, "clientId");
+  if (!clientId.ok) {
+    return clientId;
   }
 
   const connectionId = readRequiredString(record, "connectionId");
@@ -1089,9 +1664,9 @@ function parseDeviceRenewalProof(
     return connectionId;
   }
 
-  const hostId = readRequiredString(record, "hostId");
-  if (!hostId.ok) {
-    return hostId;
+  const daemonId = readRequiredString(record, "daemonId");
+  if (!daemonId.ok) {
+    return daemonId;
   }
 
   const nonce = readRequiredString(record, "nonce");
@@ -1118,13 +1693,64 @@ function parseDeviceRenewalProof(
     ok: true,
     value: {
       accountId: accountId.value,
-      clientDeviceId: clientDeviceId.value,
+      clientId: clientId.value,
       connectionId: connectionId.value,
-      hostId: hostId.value,
+      daemonId: daemonId.value,
       nonce: nonce.value,
       signature: signature.value,
       ticketJti: ticketJti.value,
       timestamp: timestamp.value,
+    },
+  };
+}
+
+type RelayLogUploadBatch = {
+  context?: Record<string, unknown>;
+  records: readonly Record<string, unknown>[];
+  source: string;
+};
+
+function parseRelayLogUploadBatch(
+  value: unknown,
+): ParseResult<RelayLogUploadBatch> {
+  const record = asRecord(value);
+  if (!record) {
+    return parseError("Log upload body must be an object.");
+  }
+  if (record.version !== 1) {
+    return parseError("Log upload version must be 1.");
+  }
+  const source = readRequiredString(record, "source");
+  if (!source.ok) {
+    return source;
+  }
+  const records = record.records;
+  if (!Array.isArray(records)) {
+    return parseError("records must be an array.");
+  }
+  if (records.length > MAX_LOG_UPLOAD_RECORDS) {
+    return parseError(`records must contain at most ${MAX_LOG_UPLOAD_RECORDS} entries.`);
+  }
+  const parsedRecords: Record<string, unknown>[] = [];
+  for (const entry of records) {
+    const parsed = asRecord(entry);
+    if (!parsed) {
+      return parseError("records entries must be objects.");
+    }
+    parsedRecords.push(parsed);
+  }
+  const context = record.context === undefined || record.context === null
+    ? undefined
+    : asRecord(record.context);
+  if (record.context !== undefined && record.context !== null && !context) {
+    return parseError("context must be an object when provided.");
+  }
+  return {
+    ok: true,
+    value: {
+      context,
+      records: parsedRecords,
+      source: source.value,
     },
   };
 }

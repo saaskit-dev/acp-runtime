@@ -3,10 +3,15 @@
 # Remote ACP Runtime 实施计划
 
 本文档把 [RFC-0006](../rfcs/0006-remote-acp-runtime-relay.md) 落成可执行的实现顺序。
-第一优先级是原生 ACP client 路径：
+第一优先级是原生 ACP client 路径。原生 ACP 既包含能直接连接 WebSocket ACP 的
+client，也包含只能启动本地 stdio ACP command 的 client：
 
 ```text
 Native ACP Client
+  -> Relay /acp
+  OR
+Native ACP Client
+  -> generic stdio ACP bridge
   -> Relay /acp
   -> bootstrap auth and host selection
   -> Host Daemon
@@ -18,11 +23,38 @@ Native ACP Client
 
 ## Phase 0：设计与边界
 
+- 产品优先级：用户体验第一，同时安全不能降级。不能用反复浏览器授权、手填 ID、
+  旧标签页或让用户重试来弥补 runtime state 缺失。安全的流程应该从签名、可审计的
+  metadata 自动恢复；不安全或有歧义的流程应该明确失败，并给出可执行的恢复路径。
 - 以 RFC-0006 作为 account、host、client device、grant、ticket、relay、daemon 边界的 source of truth。
 - 保持 local-first runtime 行为不变；现有 `AcpRuntime` 使用不能依赖 relay。
 - 原生 ACP client 兼容只聚焦标准 ACP `initialize/authenticate/session/*` 方法。
-- 第一阶段不实现 `src/runtime/remote/client`。
+- 已授权的 remote 路径必须被视为透明 ACP transport。relay 和 daemon 可以增加 auth、
+  grant 校验、routing、ticket renewal、workspace policy 和 observability，但不能消费
+  ACP data-plane 语义后再从 runtime read model 重建。
+- 第一阶段允许实现通用 stdio ACP bridge，服务不能直接打开 WebSocket ACP endpoint
+  的 client。bridge 必须保持 editor-agnostic，只做 transport adaptation。
 - 第一阶段不实现 `examples/remote`。
+
+### 当前需要消除的 UX 债务
+
+- 为历史 session 持久化 remote binding metadata。`session/load` 和
+  `session/resume` 应该从记录的 daemon、agent、workspace、grant 和 ticket context
+  恢复，而不是重新打开 `/authorize`，也不是根据在线 daemon 猜测。
+- `session/update` 历史回放必须透明。历史 updates 应该来自被选择的 ACP agent，并通过
+  daemon proxy 直接转发，而不是由 daemon 从 runtime history 重新构造。
+- `/authorize` 应该只用于新 session 的明确选择和显式重新授权。不能仅因为 client
+  进程重启就出现授权页。
+- 用有界等待和明确 ACP error 替代静默 loading。bridge、relay、daemon 都不能让 ACP
+  client 无限等待一个没有被展示出来的浏览器操作。
+- 旧授权标签页要显示为过期视图，并提供清晰的 restart/reopen 操作；不能让 stale page
+  看起来像主路径。
+- 正常使用中的 ticket renewal 必须无感。只有 grant 被撤销、metadata 缺失、daemon
+  离线、账号/session 过期时，才应该打断用户。
+- 在 ACP config/options 中一致展示当前 machine、agent、workspace 和 recovery state，
+  让 client UI 能展示真实绑定状态。
+- 避免靠猜测默认值。恢复历史 session 时使用持久化签名 metadata；新建 session 时使用
+  Codex 这类明确默认值，并允许用户修改。
 
 ## Phase 1：Native ACP Remote MVP
 
@@ -32,6 +64,9 @@ Native ACP Client
 - 支持 native ACP client side 和 daemon side 的 full-duplex JSON-RPC。
 - 保持 ACP message schema 不变；remote routing metadata 放在 ACP payload 之外。
 - 用 SDK `ClientSideConnection` 和 `AgentSideConnection` 加测试。
+- 实现通用 stdio bridge：本地通过 stdio 读写 ACP JSON-RPC，同时把同样的消息转发到
+  relay `/acp` WebSocket。bridge 不能包含 editor-specific 行为，也不能实现 runtime
+  语义。
 
 ### 1.2 Relay Bootstrap Facade
 
@@ -40,6 +75,7 @@ Native ACP Client
 - Bootstrap `authenticate` 创建 pending authorization。
 - 浏览器授权完成后，把 ACP connection 绑定到目标 host。
 - 连接绑定前拒绝 `session/new` 等 runtime 方法。
+- 无论 ACP client 直连 WebSocket 还是通过 stdio bridge，relay bootstrap 行为必须一致。
 
 ### 1.3 Daemon Connection
 
@@ -77,6 +113,7 @@ Native ACP Client
 ### 1.7 MVP Validation
 
 - 使用 SDK-backed ACP client smoke path 打 relay endpoint。
+- 为只能启动本地 ACP command 的 client 增加 stdio-bridge smoke path。
 - 使用 simulator agent 作为 daemon 侧本地 runtime agent。
 - 验证 prompt text、event streaming、cancel 和 permission flow。
 - Focused tests 保持 deterministic，不能依赖 Cloudflare account state。
@@ -145,10 +182,11 @@ Native ACP Client
 - 支持同一 `connectionId` 的 client 短断重连。
 - Daemon 仍在线时，在 Durable Object 内存中按
   `ACP_RELAY_CLIENT_RECONNECT_GRACE_MS` 保留已绑定 client route。
+  生产默认 5 分钟；30 秒对编辑器重启、电脑睡眠唤醒、网络切换来说太短。
 - 通过 shard alarm 清理过期断线 route，并通知 daemon。
 - 支持同一 `hostId` 的 daemon 短断重连。
 - 按 `ACP_RELAY_DAEMON_RECONNECT_GRACE_MS` 保持已绑定 client 不关闭，
-  daemon 重连后重放 route `Hello` frame。
+  daemon 重连后重放 route `Hello` frame。生产默认 5 分钟。
 - 通过 shard alarm 清理 daemon 重连宽限过期状态，并关闭受影响 client。
 - 尽可能恢复 pending authorization。
 
@@ -421,7 +459,7 @@ Native ACP Client
 
 - 保持 `@saaskit-dev/acp-runtime` 作为 core local runtime package。
 - 拆出 `@saaskit-dev/acp-remote-protocol`。
-- 拆出 `@saaskit-dev/acp-runtime-daemon`。
+- daemon 和 bridge entrypoint 保持在统一的 `acp-runtime` CLI 下。
 - 保持 `@saaskit-dev/acp-relay-worker` 作为 Cloudflare worker package。
 - 自家 client API 稳定后增加 `@saaskit-dev/acp-remote-client`。
 
@@ -442,8 +480,9 @@ Native ACP Client
 
 ## 当前实现检查点
 
-- 当前实现范围已锁定为原生 ACP client 路径。本切片不实现自家 IDE client、
-  `src/runtime/remote/client`、`examples/remote` 或 Remote IDE channel UI。
+- 当前实现范围已锁定为原生 ACP client 路径，包括 direct WebSocket ACP 和通用
+  stdio bridge 兼容。本切片不实现自家 IDE client、`examples/remote` 或 Remote IDE
+  channel UI。
 - `src/runtime/remote/protocol` 已定义 versioned remote frames 和 WebSocket
   JSON-RPC stream adapter。
 - `packages/relay-worker` 已暴露 `/acp`、`/client`、`/daemon`、`/authorize`
@@ -452,6 +491,8 @@ Native ACP Client
   `packages/relay-worker/migrations` 下的 D1 migration。
 - relay 使用 account-level routing shard，不是用户可见的 room 概念。
 - 未绑定的 native ACP client 会从 `/acp` 收到 bootstrap ACP auth method。
+- stdio-only ACP client 通过通用 bridge 支持：bridge 暴露本地 stdio ACP command，
+  并转发到 `/acp`。这不是产品专用编辑器集成，必须保持 transport adapter 定位。
 - `packages/relay-worker` 已有轻量 control-plane store interface 和内存实现，
   覆盖 account、client device、host、grant。
 - `packages/relay-worker` 也已增加可写的 D1-backed control-plane store
@@ -471,6 +512,9 @@ Native ACP Client
 - `/authorize` 只有在 active grant 允许该 account/client device 访问目标 host
   时才会绑定 `connectionId -> hostId`，并由 relay 为 daemon 签发短期
   connection ticket。
+- daemon metadata 会优先把 ACP registry id 作为 agent 选择项上报。Relay ticket 可以
+  携带 `agent.id`，daemon 再把这个 id 交给 `AcpRuntime`，因此 registry 解析、
+  launch args、env 和 cache 行为都留在 runtime 内部。
 - 绑定 native ACP route 时，relay 会向 daemon 发送 remote `Hello` 和内部
   daemon-side `initialize` request。内部 response 会被 relay 吞掉，native ACP
   client 看不到 relay bootstrap 的实现细节。
@@ -499,7 +543,8 @@ Native ACP Client
   交给注入的 WebSocket factory。
 - daemon connector 也提供 CLI/env config parser，支持 `--account-id`、
   `--host-id`、`--relay-url` 和 `--identity-path`，产品 CLI 可以把真实
-  WebSocket 实现接入同一 connector path，不需要额外本地 proxy。
+  WebSocket 实现接入同一 connector path。这与 client-side stdio bridge 是两件事：
+  后者只负责把 stdio-only ACP client 适配到 relay `/acp`。
 - host-key registration 是唯一 daemon registration path。
 - `src/runtime/remote/daemon` 会从 relay ACP frames 创建
   `AgentSideConnection`；daemon connection API 必须配置 ticket verification key，
@@ -535,7 +580,8 @@ Native ACP Client
   使用 `ACP_RELAY_HEARTBEAT_INTERVAL_MS` 和
   `ACP_RELAY_HEARTBEAT_TIMEOUT_MS` 配置。
 - 当前 Worker smoke 已覆盖 native ACP client JSON-RPC 通过 Worker routing、
-  Durable Object routing、daemon connection 和 simulator-backed 本地 runtime。
+  Durable Object routing、daemon connection 和 simulator-backed 本地 runtime。还应
+  增加单独的 stdio-bridge smoke，覆盖本地 stdio command 兼容路径。
 
 ## 最近下一步
 
@@ -543,10 +589,11 @@ Native ACP Client
 
 1. WebSocket ACP stream adapter。
 2. Relay `/acp` 承接原生 ACP JSON-RPC。
-3. Daemon `/daemon` 接收 relay frame 并创建 `AgentSideConnection`。
-4. Worker/Durable Object smoke 用 simulator agent 跑通原生 ACP `initialize`、
+3. 通用 stdio ACP bridge 将 stdio-only client 适配到 relay `/acp`。
+4. Daemon `/daemon` 接收 relay frame 并创建 `AgentSideConnection`。
+5. Worker/Durable Object smoke 用 simulator agent 跑通原生 ACP `initialize`、
    `authenticate`、`session/new` 和 `session/prompt`。
 
 下一步仍然只围绕原生 ACP 路径做到部署可用：真实 login provider 接入
-`/authorize`、daemon CLI packaging、Cloudflare staging 部署，以及原生 ACP
-compatibility smoke。自家 IDE client 工作继续明确暂停。
+`/authorize`、daemon CLI packaging、Cloudflare staging 部署、WebSocket ACP smoke
+以及通用 stdio-bridge compatibility smoke。自家 IDE client 工作继续明确暂停。

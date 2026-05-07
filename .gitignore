@@ -2,8 +2,15 @@ node_modules/
 dist/
 *.tsbuildinfo
 .DS_Store
+.dev.vars
+packages/*/.dev.vars
 .tmp/
 harness-outputs/
+.claude/settings.local.json
+.commandcode/
+.playwright-mcp/
+packages/*/.wrangler/
+*.tgz
 
 # Legacy root-level runtime artifacts kept ignored for backwards compatibility.
 .simulator-agent-acp*/

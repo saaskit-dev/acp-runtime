@@ -50,6 +50,7 @@ export {
   mapAcpPromptToRuntimePrompt,
   mapRemotePermissionRequestToAcp,
   mapRuntimeConfigOptionsToAcp,
+  mapRuntimeHistoryEntryToAcpNotifications,
   mapRuntimeModesToAcp,
   mapRuntimeSessionListToAcp,
   mapRuntimeSessionToAcpResponse,

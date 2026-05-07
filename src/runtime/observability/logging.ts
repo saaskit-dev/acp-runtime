@@ -111,6 +111,24 @@ export function emitRuntimeLog(input: {
   });
 }
 
+export function emitRuntimeSuppressedError(input: {
+  attributes?: LogAttributes;
+  body: string;
+  context?: Context;
+  eventName: string;
+  exception: unknown;
+  severityNumber?: SeverityNumber;
+}): void {
+  emitRuntimeLog({
+    attributes: input.attributes,
+    body: input.body,
+    context: input.context,
+    eventName: input.eventName,
+    exception: input.exception,
+    severityNumber: input.severityNumber ?? SeverityNumber.WARN,
+  });
+}
+
 export function isRuntimeLogEnabled(input: {
   context?: Context;
   eventName: string;

@@ -43,7 +43,10 @@ import type {
   AcpRuntimeStartSessionOptions,
 } from "./types.js";
 import { SeverityNumber } from "@opentelemetry/api-logs";
-import { emitRuntimeLog } from "../observability/logging.js";
+import {
+  emitRuntimeLog,
+  emitRuntimeSuppressedError,
+} from "../observability/logging.js";
 import { sessionAttributes, withSpan } from "../observability/tracing.js";
 
 type RuntimeConstructorOptions = AcpRuntimeOptions & {
@@ -111,6 +114,7 @@ export class AcpRuntime {
     return this.loadSession({
       ...resolved,
       sessionId: options.sessionId,
+      _traceContext: getTraceContext(options),
     });
   }
 
@@ -122,6 +126,7 @@ export class AcpRuntime {
     return this.forkSession({
       ...resolved,
       sessionId: options.sessionId,
+      _traceContext: getTraceContext(options),
     });
   }
 
@@ -147,11 +152,14 @@ export class AcpRuntime {
       initialConfig: options.initialConfig,
       queue: options.queue,
       snapshot,
+      _traceContext: getTraceContext(options),
     });
   }
 
   private async startSession(
-    options: AcpRuntimeCreateOptions,
+    options: AcpRuntimeCreateOptions & {
+      _traceContext?: import("@opentelemetry/api").Context;
+    },
   ): Promise<AcpRuntimeSession> {
     return withSpan(
       "acp.session.start",
@@ -161,6 +169,7 @@ export class AcpRuntime {
           agent: options.agent,
           cwd: options.cwd,
         }),
+        parentContext: getTraceContext(options),
       },
       async (span, spanContext) => {
         try {
@@ -179,7 +188,11 @@ export class AcpRuntime {
               options.initialConfig,
             );
           } catch (error) {
-            await driver.close().catch(() => {});
+            await closeDriverForCleanup(driver, {
+              action: "start",
+              context: spanContext,
+              reason: "initial config failure",
+            });
             throw error;
           }
           const sessionId = driver.snapshot().session.id;
@@ -219,7 +232,9 @@ export class AcpRuntime {
   }
 
   private async loadSession(
-    options: AcpRuntimeLoadOptions,
+    options: AcpRuntimeLoadOptions & {
+      _traceContext?: import("@opentelemetry/api").Context;
+    },
   ): Promise<AcpRuntimeSession> {
     return withSpan(
       "acp.session.load",
@@ -230,6 +245,7 @@ export class AcpRuntime {
           cwd: options.cwd,
           sessionId: options.sessionId,
         }),
+        parentContext: getTraceContext(options),
       },
       async (span, spanContext) => {
         try {
@@ -326,7 +342,9 @@ export class AcpRuntime {
   }
 
   private async listRemoteSessions(
-    options: AcpRuntimeListAgentSessionsOptions,
+    options: AcpRuntimeListAgentSessionsOptions & {
+      _traceContext?: import("@opentelemetry/api").Context;
+    },
   ): Promise<AcpRuntimeSessionList> {
     return withSpan(
       "acp.session.list",
@@ -336,6 +354,7 @@ export class AcpRuntime {
           agent: options.agent,
           cwd: options.cwd,
         }),
+        parentContext: getTraceContext(options),
       },
       async (span, spanContext) => {
         try {
@@ -386,6 +405,7 @@ export class AcpRuntime {
     options: AcpRuntimeForkSessionOptions & {
       agent: AcpRuntimeAgent;
       cwd: string;
+      _traceContext?: import("@opentelemetry/api").Context;
     },
   ): Promise<AcpRuntimeSession> {
     return withSpan(
@@ -397,6 +417,7 @@ export class AcpRuntime {
           cwd: options.cwd,
           sessionId: options.sessionId,
         }),
+        parentContext: getTraceContext(options),
       },
       async (span, spanContext) => {
         try {
@@ -418,7 +439,11 @@ export class AcpRuntime {
               options.initialConfig,
             );
           } catch (error) {
-            await driver.close().catch(() => {});
+            await closeDriverForCleanup(driver, {
+              action: "fork",
+              context: spanContext,
+              reason: "initial config failure",
+            });
             throw error;
           }
           const forkedSessionId = driver.snapshot().session.id;
@@ -496,6 +521,7 @@ export class AcpRuntime {
             cursor: options.cursor,
             cwd: options.cwd,
             handlers: options.handlers,
+            _traceContext: getTraceContext(options),
           })
         : { nextCursor: undefined, sessions: [] };
 
@@ -523,7 +549,9 @@ export class AcpRuntime {
   }
 
   private async resumeSession(
-    options: AcpRuntimeResumeOptions,
+    options: AcpRuntimeResumeOptions & {
+      _traceContext?: import("@opentelemetry/api").Context;
+    },
   ): Promise<AcpRuntimeSession> {
     return withSpan(
       "acp.session.resume",
@@ -534,6 +562,7 @@ export class AcpRuntime {
           cwd: options.snapshot.cwd,
           sessionId: options.snapshot.session.id,
         }),
+        parentContext: getTraceContext(options),
       },
       async (span, spanContext) => {
         try {
@@ -670,7 +699,10 @@ export class AcpRuntime {
     const existing = this.activeSessions.get(sessionId);
     if (existing) {
       if (existing.driver !== driver) {
-        await driver.close().catch(() => {});
+        await closeDriverForCleanup(driver, {
+          action: "start",
+          reason: "duplicate active session",
+        });
       }
       return existing;
     }
@@ -680,7 +712,10 @@ export class AcpRuntime {
     const existingAfterPersist = this.activeSessions.get(sessionId);
     if (existingAfterPersist) {
       if (existingAfterPersist.driver !== driver) {
-        await driver.close().catch(() => {});
+        await closeDriverForCleanup(driver, {
+          action: "start",
+          reason: "duplicate active session after persistence",
+        });
       }
       return existingAfterPersist;
     }
@@ -726,7 +761,10 @@ export class AcpRuntime {
     } catch (error) {
       if (entry.refCount === 0 && this.activeSessions.get(entry.sessionId) === entry) {
         this.activeSessions.delete(entry.sessionId);
-        await entry.driver.close().catch(() => {});
+        await closeDriverForCleanup(entry.driver, {
+          action: "load",
+          reason: "initial config failure",
+        });
       }
       throw error;
     }
@@ -834,6 +872,36 @@ export class AcpRuntime {
   }
 }
 
+async function closeDriverForCleanup(
+  driver: AcpSessionDriver,
+  input: {
+    action: "fork" | "load" | "resume" | "start";
+    context?: import("@opentelemetry/api").Context;
+    reason: string;
+  },
+): Promise<void> {
+  try {
+    await driver.close();
+  } catch (error) {
+    const snapshot = driver.snapshot();
+    emitRuntimeSuppressedError({
+      attributes: {
+        ...sessionAttributes({
+          action: input.action,
+          agent: snapshot.agent,
+          cwd: snapshot.cwd,
+          sessionId: snapshot.session.id,
+        }),
+        "acp.session.cleanup.reason": input.reason,
+      },
+      body: "Runtime session cleanup failed.",
+      context: input.context,
+      eventName: "acp.session.cleanup.failed",
+      exception: error,
+    });
+  }
+}
+
 function createSessionRegistry(
   options: RuntimeConstructorOptions,
 ): AcpRuntimeSessionRegistry | undefined {
@@ -847,6 +915,13 @@ function createSessionRegistry(
         resolveRuntimeHomePath("state", "runtime-session-registry.json"),
     ),
   });
+}
+
+function getTraceContext(
+  input: object,
+): import("@opentelemetry/api").Context | undefined {
+  return (input as { _traceContext?: import("@opentelemetry/api").Context })
+    ._traceContext;
 }
 
 function assertNoSystemPromptForSessionOpen(

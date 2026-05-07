@@ -15,6 +15,7 @@ import {
   resolveRuntimeCachePath,
   resolveRuntimeHomePath,
 } from "../paths.js";
+import { emitRuntimeSuppressedError } from "../observability/logging.js";
 
 const REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -384,7 +385,17 @@ async function writeFileAtomically(path: string, data: string | Buffer): Promise
   try {
     await rename(tempPath, path);
   } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => undefined);
+    await rm(tempPath, { force: true }).catch((cleanupError) => {
+      emitRuntimeSuppressedError({
+        attributes: {
+          "acp.registry.cache_path": path,
+          "acp.registry.temp_path": tempPath,
+        },
+        body: "Agent registry cache temp file cleanup failed.",
+        eventName: "acp.registry.cache.cleanup.failed",
+        exception: cleanupError,
+      });
+    });
     throw error;
   }
 }
@@ -401,8 +412,26 @@ async function withCacheLock<T>(
         await handle.writeFile(`${process.pid}\n`, "utf8");
         return await operation();
       } finally {
-        await handle.close().catch(() => undefined);
-        await rm(lockPath, { force: true }).catch(() => undefined);
+        await handle.close().catch((cleanupError) => {
+          emitRuntimeSuppressedError({
+            attributes: {
+              "acp.registry.cache_lock_path": lockPath,
+            },
+            body: "Agent registry cache lock handle cleanup failed.",
+            eventName: "acp.registry.cache.cleanup.failed",
+            exception: cleanupError,
+          });
+        });
+        await rm(lockPath, { force: true }).catch((cleanupError) => {
+          emitRuntimeSuppressedError({
+            attributes: {
+              "acp.registry.cache_lock_path": lockPath,
+            },
+            body: "Agent registry cache lock file cleanup failed.",
+            eventName: "acp.registry.cache.cleanup.failed",
+            exception: cleanupError,
+          });
+        });
       }
     } catch (error) {
       if (!isFileExistsError(error)) {

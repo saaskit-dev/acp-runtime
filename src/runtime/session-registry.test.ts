@@ -1,10 +1,14 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { AcpRuntimeSessionRegistry } from "./registry/session-registry.js";
+import {
+  AcpRuntimeSessionRegistry,
+  type AcpRuntimeSessionRegistryState,
+  type AcpRuntimeSessionRegistryStore,
+} from "./registry/session-registry.js";
 import { AcpRuntimeJsonSessionRegistryStore } from "./registry/session-registry-store.js";
 import type { AcpRuntimeSnapshot } from "./core/types.js";
 
@@ -232,4 +236,104 @@ describe("AcpRuntimeSessionRegistry persistence", () => {
       "session-beta",
     ]);
   });
+
+  it("coalesces registry persistence while a save is already in flight", async () => {
+    const savedStates: AcpRuntimeSessionRegistryState[] = [];
+    let releaseFirstSave: (() => void) | undefined;
+    const store: AcpRuntimeSessionRegistryStore = {
+      async load() {
+        return undefined;
+      },
+      async save(state) {
+        savedStates.push(state);
+        if (savedStates.length === 1) {
+          await new Promise<void>((resolve) => {
+            releaseFirstSave = resolve;
+          });
+        }
+      },
+    };
+    const registry = new AcpRuntimeSessionRegistry({ store });
+
+    const first = registry.rememberSnapshot(
+      createSnapshot({
+        agentType: "agent-alpha",
+        cwd: "/tmp/project-alpha",
+        sessionId: "session-alpha",
+      }),
+    );
+    await waitFor(() => savedStates.length === 1);
+
+    const second = registry.rememberSnapshot(
+      createSnapshot({
+        agentType: "agent-beta",
+        cwd: "/tmp/project-beta",
+        sessionId: "session-beta",
+      }),
+    );
+    const third = registry.rememberSnapshot(
+      createSnapshot({
+        agentType: "agent-gamma",
+        cwd: "/tmp/project-gamma",
+        sessionId: "session-gamma",
+      }),
+    );
+
+    await Promise.resolve();
+    expect(savedStates).toHaveLength(1);
+
+    releaseFirstSave?.();
+    await Promise.all([first, second, third]);
+
+    expect(savedStates).toHaveLength(2);
+    expect(
+      savedStates[1]?.sessions.map((entry) => entry.snapshot.session.id).sort(),
+    ).toEqual(["session-alpha", "session-beta", "session-gamma"]);
+  });
+
+  it("retries registry lock acquisition until the lock is released", async () => {
+    const root = await mkdtemp(join(tmpdir(), "acp-runtime-registry-"));
+    tempDirs.push(root);
+    const path = join(root, "registry.json");
+    const lockPath = `${path}.lock`;
+    await writeFile(lockPath, "busy\n", "utf8");
+
+    const registry = new AcpRuntimeSessionRegistry({
+      store: new AcpRuntimeJsonSessionRegistryStore(path),
+    });
+    const save = registry.rememberSnapshot(
+      createSnapshot({
+        agentType: "agent-lock",
+        cwd: "/tmp/project-lock",
+        sessionId: "session-lock",
+      }),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await rm(lockPath, { force: true });
+    await save;
+
+    const reader = new AcpRuntimeSessionRegistry({
+      store: new AcpRuntimeJsonSessionRegistryStore(path),
+    });
+    await reader.hydrate();
+
+    expect(reader.getSnapshot("session-lock")).toEqual(
+      createSnapshot({
+        agentType: "agent-lock",
+        cwd: "/tmp/project-lock",
+        sessionId: "session-lock",
+      }),
+    );
+  });
 });
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("Timed out waiting for condition.");
+}

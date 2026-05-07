@@ -6,6 +6,7 @@ import type {
   AcpRuntimeSessionRegistryState,
   AcpRuntimeSessionRegistryStore,
 } from "./session-registry.js";
+import { emitRuntimeSuppressedError } from "../observability/logging.js";
 
 const LOCK_STALE_MS = 30_000;
 const LOCK_TIMEOUT_MS = 5_000;
@@ -78,7 +79,17 @@ async function writeRegistryStateAtomically(
   try {
     await rename(tempPath, path);
   } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => undefined);
+    await rm(tempPath, { force: true }).catch((cleanupError) => {
+      emitRuntimeSuppressedError({
+        attributes: {
+          "acp.registry.path": path,
+          "acp.registry.temp_path": tempPath,
+        },
+        body: "Session registry temp file cleanup failed.",
+        eventName: "acp.registry.cleanup.failed",
+        exception: cleanupError,
+      });
+    });
     throw error;
   }
 }
@@ -119,8 +130,26 @@ async function withFileLock<T>(
         await handle.writeFile(`${process.pid}\n`, "utf8");
         return await operation();
       } finally {
-        await handle.close().catch(() => undefined);
-        await rm(lockPath, { force: true }).catch(() => undefined);
+        await handle.close().catch((cleanupError) => {
+          emitRuntimeSuppressedError({
+            attributes: {
+              "acp.registry.lock_path": lockPath,
+            },
+            body: "Session registry lock handle cleanup failed.",
+            eventName: "acp.registry.cleanup.failed",
+            exception: cleanupError,
+          });
+        });
+        await rm(lockPath, { force: true }).catch((cleanupError) => {
+          emitRuntimeSuppressedError({
+            attributes: {
+              "acp.registry.lock_path": lockPath,
+            },
+            body: "Session registry lock file cleanup failed.",
+            eventName: "acp.registry.cleanup.failed",
+            exception: cleanupError,
+          });
+        });
       }
     } catch (error) {
       if (!isFileExistsError(error)) {

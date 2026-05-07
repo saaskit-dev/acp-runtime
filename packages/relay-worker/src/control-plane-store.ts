@@ -1,4 +1,5 @@
 import type {
+  AcpRemoteAgentGrant,
   AcpRemoteGrant,
   AcpRemoteId,
   AcpRemoteScope,
@@ -11,7 +12,7 @@ export type AcpRelayAccountRecord = {
 
 export type AcpRelayClientDeviceRecord = {
   accountId: AcpRemoteId;
-  clientDeviceId: AcpRemoteId;
+  clientId: AcpRemoteId;
   disabled?: boolean;
   publicKey?: string;
 };
@@ -19,7 +20,7 @@ export type AcpRelayClientDeviceRecord = {
 export type AcpRelayHostRecord = {
   accountId: AcpRemoteId;
   disabled?: boolean;
-  hostId: AcpRemoteId;
+  daemonId: AcpRemoteId;
   previousPublicKey?: string;
   publicKey?: string;
 };
@@ -27,6 +28,15 @@ export type AcpRelayHostRecord = {
 export type AcpRelayGrantRecord = AcpRemoteGrant & {
   grantId?: AcpRemoteId;
   revoked?: boolean;
+};
+
+export type AcpRelaySessionBindingRecord = {
+  accountId: AcpRemoteId;
+  agent?: AcpRemoteAgentGrant;
+  clientId: AcpRemoteId;
+  daemonId: AcpRemoteId;
+  sessionId: AcpRemoteId;
+  workspaceRoots?: readonly string[];
 };
 
 export type AcpRelayGrantDecision =
@@ -43,20 +53,25 @@ export type AcpRelayControlPlaneStore = {
   getAccount(accountId: AcpRemoteId): Promise<AcpRelayAccountRecord | undefined>;
   getClientDevice(input: {
     accountId: AcpRemoteId;
-    clientDeviceId: AcpRemoteId;
+    clientId: AcpRemoteId;
   }): Promise<AcpRelayClientDeviceRecord | undefined>;
   getHost(input: {
     accountId: AcpRemoteId;
-    hostId: AcpRemoteId;
+    daemonId: AcpRemoteId;
   }): Promise<AcpRelayHostRecord | undefined>;
   listAuthorizableHosts(input: {
     accountId: AcpRemoteId;
-    clientDeviceId: AcpRemoteId;
+    clientId: AcpRemoteId;
   }): Promise<readonly AcpRelayHostRecord[]>;
+  getSessionBinding(input: {
+    accountId: AcpRemoteId;
+    clientId: AcpRemoteId;
+    sessionId: AcpRemoteId;
+  }): Promise<AcpRelaySessionBindingRecord | undefined>;
   resolveGrant(input: {
     accountId: AcpRemoteId;
-    clientDeviceId: AcpRemoteId;
-    hostId: AcpRemoteId;
+    clientId: AcpRemoteId;
+    daemonId: AcpRemoteId;
     requiredScopes?: readonly AcpRemoteScope[];
   }): Promise<AcpRelayGrantDecision>;
 };
@@ -68,6 +83,9 @@ export type AcpRelayWritableControlPlaneStore = AcpRelayControlPlaneStore & {
   ): Promise<void> | void;
   upsertGrant(record: AcpRelayGrantRecord): Promise<void> | void;
   upsertHost(record: AcpRelayHostRecord): Promise<void> | void;
+  upsertSessionBinding(
+    record: AcpRelaySessionBindingRecord,
+  ): Promise<void> | void;
 };
 
 export type AcpRelayInMemoryControlPlaneSeed = {
@@ -75,6 +93,7 @@ export type AcpRelayInMemoryControlPlaneSeed = {
   clientDevices?: readonly AcpRelayClientDeviceRecord[];
   grants?: readonly AcpRelayGrantRecord[];
   hosts?: readonly AcpRelayHostRecord[];
+  sessionBindings?: readonly AcpRelaySessionBindingRecord[];
 };
 
 export type D1DatabaseLike = {
@@ -127,6 +146,15 @@ type GrantRow = {
   workspace_roots_json?: string | null;
 };
 
+type SessionBindingRow = {
+  account_id: string;
+  agent_json: string | null;
+  client_device_id: string;
+  host_id: string;
+  session_id: string;
+  workspace_roots_json: string | null;
+};
+
 export class AcpRelayInMemoryControlPlaneStore
   implements AcpRelayWritableControlPlaneStore
 {
@@ -134,6 +162,10 @@ export class AcpRelayInMemoryControlPlaneStore
   private readonly clientDevices = new Map<string, AcpRelayClientDeviceRecord>();
   private readonly grants = new Map<string, AcpRelayGrantRecord>();
   private readonly hosts = new Map<string, AcpRelayHostRecord>();
+  private readonly sessionBindings = new Map<
+    string,
+    AcpRelaySessionBindingRecord
+  >();
 
   constructor(seed: AcpRelayInMemoryControlPlaneSeed = {}) {
     for (const account of seed.accounts ?? []) {
@@ -147,6 +179,9 @@ export class AcpRelayInMemoryControlPlaneStore
     }
     for (const grant of seed.grants ?? []) {
       this.upsertGrant(grant);
+    }
+    for (const binding of seed.sessionBindings ?? []) {
+      this.upsertSessionBinding(binding);
     }
   }
 
@@ -166,6 +201,10 @@ export class AcpRelayInMemoryControlPlaneStore
     this.grants.set(grantKey(record), record);
   }
 
+  upsertSessionBinding(record: AcpRelaySessionBindingRecord): void {
+    this.sessionBindings.set(sessionBindingKey(record), record);
+  }
+
   async getAccount(
     accountId: AcpRemoteId,
   ): Promise<AcpRelayAccountRecord | undefined> {
@@ -174,41 +213,49 @@ export class AcpRelayInMemoryControlPlaneStore
 
   async getClientDevice(input: {
     accountId: AcpRemoteId;
-    clientDeviceId: AcpRemoteId;
+    clientId: AcpRemoteId;
   }): Promise<AcpRelayClientDeviceRecord | undefined> {
     return this.clientDevices.get(clientDeviceKey(input));
   }
 
   async getHost(input: {
     accountId: AcpRemoteId;
-    hostId: AcpRemoteId;
+    daemonId: AcpRemoteId;
   }): Promise<AcpRelayHostRecord | undefined> {
     return this.hosts.get(hostKey(input));
   }
 
   async listAuthorizableHosts(input: {
     accountId: AcpRemoteId;
-    clientDeviceId: AcpRemoteId;
+    clientId: AcpRemoteId;
   }): Promise<readonly AcpRelayHostRecord[]> {
     const allowedHostIds = new Set(
       this.matchingGrantRecords(input)
         .filter((grant) => hasScopes(grant, ["acp:connect"]))
-        .map((grant) => grant.hostId),
+        .map((grant) => grant.daemonId),
     );
     return [...this.hosts.values()]
       .filter(
         (host) =>
           host.accountId === input.accountId &&
           !host.disabled &&
-          allowedHostIds.has(host.hostId),
+          allowedHostIds.has(host.daemonId),
       )
-      .sort((left, right) => left.hostId.localeCompare(right.hostId));
+      .sort((left, right) => left.daemonId.localeCompare(right.daemonId));
+  }
+
+  async getSessionBinding(input: {
+    accountId: AcpRemoteId;
+    clientId: AcpRemoteId;
+    sessionId: AcpRemoteId;
+  }): Promise<AcpRelaySessionBindingRecord | undefined> {
+    return this.sessionBindings.get(sessionBindingKey(input));
   }
 
   async resolveGrant(input: {
     accountId: AcpRemoteId;
-    clientDeviceId: AcpRemoteId;
-    hostId: AcpRemoteId;
+    clientId: AcpRemoteId;
+    daemonId: AcpRemoteId;
     requiredScopes?: readonly AcpRemoteScope[];
   }): Promise<AcpRelayGrantDecision> {
     const account = await this.getAccount(input.accountId);
@@ -227,7 +274,7 @@ export class AcpRelayInMemoryControlPlaneStore
     }
 
     const grant = this.matchingGrantRecords(input)
-      .filter((candidate) => candidate.hostId === input.hostId)
+      .filter((candidate) => candidate.daemonId === input.daemonId)
       .filter((candidate) => hasScopes(candidate, input.requiredScopes ?? []))
       .sort(compareGrantSpecificity)[0];
     if (!grant) {
@@ -237,8 +284,8 @@ export class AcpRelayInMemoryControlPlaneStore
     return {
       grant: {
         accountId: grant.accountId,
-        clientDeviceId: grant.clientDeviceId ?? input.clientDeviceId,
-        hostId: grant.hostId,
+        clientId: grant.clientId ?? input.clientId,
+        daemonId: grant.daemonId,
         policyVersion: grant.policyVersion,
         scopes: grant.scopes,
         workspaceId: grant.workspaceId,
@@ -250,14 +297,14 @@ export class AcpRelayInMemoryControlPlaneStore
 
   private matchingGrantRecords(input: {
     accountId: AcpRemoteId;
-    clientDeviceId: AcpRemoteId;
+    clientId: AcpRemoteId;
   }): AcpRelayGrantRecord[] {
     return [...this.grants.values()].filter(
       (grant) =>
         grant.accountId === input.accountId &&
         !grant.revoked &&
-        (grant.clientDeviceId === undefined ||
-          grant.clientDeviceId === input.clientDeviceId),
+        (grant.clientId === undefined ||
+          grant.clientId === input.clientId),
     );
   }
 }
@@ -296,8 +343,8 @@ export class AcpRelayD1ControlPlaneStore
       )
       .bind(
         record.accountId,
-        record.clientDeviceId,
-        record.publicKey ?? null,
+        record.clientId,
+        record.publicKey ?? "",
         record.disabled ? 1 : 0,
       )
       .run();
@@ -318,9 +365,9 @@ export class AcpRelayD1ControlPlaneStore
       )
       .bind(
         record.accountId,
-        record.hostId,
-        record.publicKey ?? null,
-        record.previousPublicKey ?? null,
+        record.daemonId,
+        record.publicKey ?? "",
+        record.previousPublicKey ?? "",
         record.disabled ? 1 : 0,
       )
       .run();
@@ -349,13 +396,40 @@ export class AcpRelayD1ControlPlaneStore
       .bind(
         record.grantId ?? stableGrantId(record),
         record.accountId,
-        record.clientDeviceId ?? null,
-        record.hostId,
+        record.clientId ?? null,
+        record.daemonId,
         record.workspaceId ?? null,
         record.workspaceRoots ? JSON.stringify(record.workspaceRoots) : null,
         record.policyVersion,
         JSON.stringify(record.scopes),
         record.revoked ? 1 : 0,
+      )
+      .run();
+  }
+
+  async upsertSessionBinding(
+    record: AcpRelaySessionBindingRecord,
+  ): Promise<void> {
+    await this.database
+      .prepare(
+        `insert into acp_remote_session_bindings(
+           account_id, client_device_id, session_id, host_id, agent_json,
+           workspace_roots_json, updated_at
+         )
+         values (?1, ?2, ?3, ?4, ?5, ?6, current_timestamp)
+         on conflict(account_id, client_device_id, session_id) do update set
+           host_id = excluded.host_id,
+           agent_json = excluded.agent_json,
+           workspace_roots_json = excluded.workspace_roots_json,
+           updated_at = current_timestamp`,
+      )
+      .bind(
+        record.accountId,
+        record.clientId,
+        record.sessionId,
+        record.daemonId,
+        record.agent ? JSON.stringify(record.agent) : null,
+        record.workspaceRoots ? JSON.stringify(record.workspaceRoots) : null,
       )
       .run();
   }
@@ -377,7 +451,7 @@ export class AcpRelayD1ControlPlaneStore
 
   async getClientDevice(input: {
     accountId: AcpRemoteId;
-    clientDeviceId: AcpRemoteId;
+    clientId: AcpRemoteId;
   }): Promise<AcpRelayClientDeviceRecord | undefined> {
     const row = await this.database
       .prepare(
@@ -386,14 +460,14 @@ export class AcpRelayD1ControlPlaneStore
          where account_id = ?1 and client_device_id = ?2
          limit 1`,
       )
-      .bind(input.accountId, input.clientDeviceId)
+      .bind(input.accountId, input.clientId)
       .first<ClientDeviceRow>();
     return row ? mapClientDeviceRow(row) : undefined;
   }
 
   async getHost(input: {
     accountId: AcpRemoteId;
-    hostId: AcpRemoteId;
+    daemonId: AcpRemoteId;
   }): Promise<AcpRelayHostRecord | undefined> {
     const row = await this.database
       .prepare(
@@ -402,20 +476,20 @@ export class AcpRelayD1ControlPlaneStore
          where account_id = ?1 and host_id = ?2
          limit 1`,
       )
-      .bind(input.accountId, input.hostId)
+      .bind(input.accountId, input.daemonId)
       .first<HostRow>();
     return row ? mapHostRow(row) : undefined;
   }
 
   async listAuthorizableHosts(input: {
     accountId: AcpRemoteId;
-    clientDeviceId: AcpRemoteId;
+    clientId: AcpRemoteId;
   }): Promise<readonly AcpRelayHostRecord[]> {
     const grants = await this.matchingGrantRecords(input);
     const allowedHostIds = new Set(
       grants
         .filter((grant) => hasScopes(grant, ["acp:connect"]))
-        .map((grant) => grant.hostId),
+        .map((grant) => grant.daemonId),
     );
     if (allowedHostIds.size === 0) {
       return [];
@@ -432,13 +506,31 @@ export class AcpRelayD1ControlPlaneStore
       .all<HostRow>();
     return hosts.results
       .map(mapHostRow)
-      .filter((host) => allowedHostIds.has(host.hostId));
+      .filter((host) => allowedHostIds.has(host.daemonId));
+  }
+
+  async getSessionBinding(input: {
+    accountId: AcpRemoteId;
+    clientId: AcpRemoteId;
+    sessionId: AcpRemoteId;
+  }): Promise<AcpRelaySessionBindingRecord | undefined> {
+    const row = await this.database
+      .prepare(
+        `select account_id, client_device_id, session_id, host_id, agent_json,
+                workspace_roots_json
+         from acp_remote_session_bindings
+         where account_id = ?1 and client_device_id = ?2 and session_id = ?3
+         limit 1`,
+      )
+      .bind(input.accountId, input.clientId, input.sessionId)
+      .first<SessionBindingRow>();
+    return row ? mapSessionBindingRow(row) : undefined;
   }
 
   async resolveGrant(input: {
     accountId: AcpRemoteId;
-    clientDeviceId: AcpRemoteId;
-    hostId: AcpRemoteId;
+    clientId: AcpRemoteId;
+    daemonId: AcpRemoteId;
     requiredScopes?: readonly AcpRemoteScope[];
   }): Promise<AcpRelayGrantDecision> {
     const account = await this.getAccount(input.accountId);
@@ -457,7 +549,7 @@ export class AcpRelayD1ControlPlaneStore
     }
 
     const grant = (await this.matchingGrantRecords(input))
-      .filter((candidate) => candidate.hostId === input.hostId)
+      .filter((candidate) => candidate.daemonId === input.daemonId)
       .filter((candidate) => hasScopes(candidate, input.requiredScopes ?? []))
       .sort(compareGrantSpecificity)[0];
     if (!grant) {
@@ -467,8 +559,8 @@ export class AcpRelayD1ControlPlaneStore
     return {
       grant: {
         accountId: grant.accountId,
-        clientDeviceId: grant.clientDeviceId ?? input.clientDeviceId,
-        hostId: grant.hostId,
+        clientId: grant.clientId ?? input.clientId,
+        daemonId: grant.daemonId,
         policyVersion: grant.policyVersion,
         scopes: grant.scopes,
         workspaceId: grant.workspaceId,
@@ -480,7 +572,7 @@ export class AcpRelayD1ControlPlaneStore
 
   private async matchingGrantRecords(input: {
     accountId: AcpRemoteId;
-    clientDeviceId: AcpRemoteId;
+    clientId: AcpRemoteId;
   }): Promise<AcpRelayGrantRecord[]> {
     const rows = await this.database
       .prepare(
@@ -491,7 +583,7 @@ export class AcpRelayD1ControlPlaneStore
            and revoked = 0
            and (client_device_id is null or client_device_id = ?2)`,
       )
-      .bind(input.accountId, input.clientDeviceId)
+      .bind(input.accountId, input.clientId)
       .all<GrantRow>();
     return rows.results.map(mapGrantRow);
   }
@@ -499,16 +591,16 @@ export class AcpRelayD1ControlPlaneStore
 
 function clientDeviceKey(input: {
   accountId: AcpRemoteId;
-  clientDeviceId: AcpRemoteId;
+  clientId: AcpRemoteId;
 }): string {
-  return `${input.accountId}:${input.clientDeviceId}`;
+  return `${input.accountId}:${input.clientId}`;
 }
 
 function hostKey(input: {
   accountId: AcpRemoteId;
-  hostId: AcpRemoteId;
+  daemonId: AcpRemoteId;
 }): string {
-  return `${input.accountId}:${input.hostId}`;
+  return `${input.accountId}:${input.daemonId}`;
 }
 
 function grantKey(input: AcpRelayGrantRecord): string {
@@ -517,10 +609,18 @@ function grantKey(input: AcpRelayGrantRecord): string {
   }
   return [
     input.accountId,
-    input.clientDeviceId ?? "*",
-    input.hostId,
+    input.clientId ?? "*",
+    input.daemonId,
     input.workspaceId ?? "*",
   ].join(":");
+}
+
+function sessionBindingKey(input: {
+  accountId: AcpRemoteId;
+  clientId: AcpRemoteId;
+  sessionId: AcpRemoteId;
+}): string {
+  return `${input.accountId}:${input.clientId}:${input.sessionId}`;
 }
 
 function stableGrantId(input: AcpRelayGrantRecord): string {
@@ -538,8 +638,8 @@ function compareGrantSpecificity(
   left: AcpRelayGrantRecord,
   right: AcpRelayGrantRecord,
 ): number {
-  const leftSpecificity = left.clientDeviceId ? 1 : 0;
-  const rightSpecificity = right.clientDeviceId ? 1 : 0;
+  const leftSpecificity = left.clientId ? 1 : 0;
+  const rightSpecificity = right.clientId ? 1 : 0;
   if (leftSpecificity !== rightSpecificity) {
     return rightSpecificity - leftSpecificity;
   }
@@ -556,7 +656,7 @@ function mapAccountRow(row: AccountRow): AcpRelayAccountRecord {
 function mapClientDeviceRow(row: ClientDeviceRow): AcpRelayClientDeviceRecord {
   return {
     accountId: row.account_id,
-    clientDeviceId: row.client_device_id,
+    clientId: row.client_device_id,
     disabled: Boolean(row.disabled),
     publicKey: row.public_key ?? undefined,
   };
@@ -566,7 +666,7 @@ function mapHostRow(row: HostRow): AcpRelayHostRecord {
   return {
     accountId: row.account_id,
     disabled: Boolean(row.disabled),
-    hostId: row.host_id,
+    daemonId: row.host_id,
     previousPublicKey: row.previous_public_key ?? undefined,
     publicKey: row.public_key ?? undefined,
   };
@@ -575,8 +675,8 @@ function mapHostRow(row: HostRow): AcpRelayHostRecord {
 function mapGrantRow(row: GrantRow): AcpRelayGrantRecord {
   return {
     accountId: row.account_id,
-    clientDeviceId: row.client_device_id ?? undefined,
-    hostId: row.host_id,
+    clientId: row.client_device_id ?? undefined,
+    daemonId: row.host_id,
     policyVersion: row.policy_version,
     revoked: Boolean(row.revoked),
     scopes: parseScopes(row.scopes_json),
@@ -584,6 +684,45 @@ function mapGrantRow(row: GrantRow): AcpRelayGrantRecord {
     workspaceRoots: row.workspace_roots_json
       ? parseStringArray(row.workspace_roots_json, "workspace roots")
       : undefined,
+  };
+}
+
+function mapSessionBindingRow(
+  row: SessionBindingRow,
+): AcpRelaySessionBindingRecord {
+  return {
+    accountId: row.account_id,
+    agent: row.agent_json ? parseAgentGrant(row.agent_json) : undefined,
+    clientId: row.client_device_id,
+    daemonId: row.host_id,
+    sessionId: row.session_id,
+    workspaceRoots: row.workspace_roots_json
+      ? parseStringArray(row.workspace_roots_json, "session binding workspace roots")
+      : undefined,
+  };
+}
+
+function parseAgentGrant(value: string): AcpRemoteAgentGrant | undefined {
+  const parsed: unknown = JSON.parse(value);
+  if (!isRecord(parsed)) {
+    return undefined;
+  }
+  if (typeof parsed.id === "string" && parsed.id.trim()) {
+    return { id: parsed.id };
+  }
+  if (typeof parsed.command !== "string" || !parsed.command.trim()) {
+    return undefined;
+  }
+  return {
+    command: parsed.command,
+    ...(Array.isArray(parsed.args) &&
+    parsed.args.every((entry) => typeof entry === "string")
+      ? { args: parsed.args }
+      : {}),
+    ...(isStringRecord(parsed.env) ? { env: parsed.env } : {}),
+    ...(typeof parsed.type === "string" && parsed.type.trim()
+      ? { type: parsed.type }
+      : {}),
   };
 }
 
@@ -597,4 +736,15 @@ function parseStringArray(value: string, label: string): readonly string[] {
     throw new Error(`Invalid ACP relay grant ${label} JSON.`);
   }
   return parsed;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return (
+    isRecord(value) &&
+    Object.values(value).every((entry) => typeof entry === "string")
+  );
 }

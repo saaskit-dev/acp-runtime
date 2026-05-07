@@ -12,35 +12,35 @@ describe("AcpRelayInMemoryControlPlaneStore", () => {
   it("resolves device-specific grants before account-wide grants", async () => {
     const store = new AcpRelayInMemoryControlPlaneStore({
       accounts: [{ accountId: "acct-1" }],
-      clientDevices: [{ accountId: "acct-1", clientDeviceId: "client-1" }],
+      clientDevices: [{ accountId: "acct-1", clientId: "client-1" }],
       grants: [
         {
           accountId: "acct-1",
-          hostId: "host-1",
+          daemonId: "host-1",
           policyVersion: 1,
           scopes: ["acp:connect"],
         },
         {
           accountId: "acct-1",
-          clientDeviceId: "client-1",
-          hostId: "host-1",
+          clientId: "client-1",
+          daemonId: "host-1",
           policyVersion: 2,
           scopes: ["acp:connect", "acp:turn:send"],
         },
       ],
-      hosts: [{ accountId: "acct-1", hostId: "host-1" }],
+      hosts: [{ accountId: "acct-1", daemonId: "host-1" }],
     });
 
     await expect(
       store.resolveGrant({
         accountId: "acct-1",
-        clientDeviceId: "client-1",
-        hostId: "host-1",
+        clientId: "client-1",
+        daemonId: "host-1",
         requiredScopes: ["acp:turn:send"],
       }),
     ).resolves.toMatchObject({
       grant: {
-        clientDeviceId: "client-1",
+        clientId: "client-1",
         policyVersion: 2,
       },
       ok: true,
@@ -51,25 +51,25 @@ describe("AcpRelayInMemoryControlPlaneStore", () => {
     const store = new AcpRelayInMemoryControlPlaneStore({
       accounts: [{ accountId: "acct-1" }],
       clientDevices: [
-        { accountId: "acct-1", clientDeviceId: "client-1", disabled: true },
+        { accountId: "acct-1", clientId: "client-1", disabled: true },
       ],
       grants: [
         {
           accountId: "acct-1",
-          hostId: "host-1",
+          daemonId: "host-1",
           policyVersion: 1,
           revoked: true,
           scopes: ["acp:connect"],
         },
       ],
-      hosts: [{ accountId: "acct-1", hostId: "host-1" }],
+      hosts: [{ accountId: "acct-1", daemonId: "host-1" }],
     });
 
     await expect(
       store.resolveGrant({
         accountId: "acct-1",
-        clientDeviceId: "client-1",
-        hostId: "host-1",
+        clientId: "client-1",
+        daemonId: "host-1",
         requiredScopes: ["acp:connect"],
       }),
     ).resolves.toMatchObject({
@@ -109,25 +109,25 @@ describe("AcpRelayD1ControlPlaneStore", () => {
     await expect(
       store.listAuthorizableHosts({
         accountId: "acct-1",
-        clientDeviceId: "client-1",
+        clientId: "client-1",
       }),
     ).resolves.toEqual([
       {
         accountId: "acct-1",
         disabled: false,
-        hostId: "host-1",
+        daemonId: "host-1",
       },
     ]);
     await expect(
       store.resolveGrant({
         accountId: "acct-1",
-        clientDeviceId: "client-1",
-        hostId: "host-1",
+        clientId: "client-1",
+        daemonId: "host-1",
         requiredScopes: ["acp:turn:send"],
       }),
     ).resolves.toMatchObject({
       grant: {
-        hostId: "host-1",
+        daemonId: "host-1",
         policyVersion: 3,
       },
       ok: true,
@@ -140,36 +140,60 @@ describe("AcpRelayD1ControlPlaneStore", () => {
       clientDevices: [],
       grants: [],
       hosts: [],
+      sessionBindings: [],
     });
     const store = new AcpRelayD1ControlPlaneStore(database);
 
     await store.upsertAccount({ accountId: "acct-2" });
     await store.upsertClientDevice({
       accountId: "acct-2",
-      clientDeviceId: "client-2",
+      clientId: "client-2",
     });
-    await store.upsertHost({ accountId: "acct-2", hostId: "host-2" });
+    await store.upsertHost({ accountId: "acct-2", daemonId: "host-2" });
     await store.upsertGrant({
       accountId: "acct-2",
-      clientDeviceId: "client-2",
+      clientId: "client-2",
       grantId: "grant-2",
-      hostId: "host-2",
+      daemonId: "host-2",
       policyVersion: 4,
       scopes: ["acp:connect", "acp:session:create"],
+      workspaceRoots: ["/work/project"],
+    });
+    await store.upsertSessionBinding({
+      accountId: "acct-2",
+      agent: { id: "codex-acp" },
+      clientId: "client-2",
+      daemonId: "host-2",
+      sessionId: "session-2",
+      workspaceRoots: ["/work/project"],
+    });
+
+    await expect(
+      store.getSessionBinding({
+        accountId: "acct-2",
+        clientId: "client-2",
+        sessionId: "session-2",
+      }),
+    ).resolves.toEqual({
+      accountId: "acct-2",
+      agent: { id: "codex-acp" },
+      clientId: "client-2",
+      daemonId: "host-2",
+      sessionId: "session-2",
       workspaceRoots: ["/work/project"],
     });
 
     await expect(
       store.resolveGrant({
         accountId: "acct-2",
-        clientDeviceId: "client-2",
-        hostId: "host-2",
+        clientId: "client-2",
+        daemonId: "host-2",
         requiredScopes: ["acp:session:create"],
       }),
     ).resolves.toMatchObject({
       grant: {
-        clientDeviceId: "client-2",
-        hostId: "host-2",
+        clientId: "client-2",
+        daemonId: "host-2",
         policyVersion: 4,
         workspaceRoots: ["/work/project"],
       },
@@ -178,9 +202,9 @@ describe("AcpRelayD1ControlPlaneStore", () => {
 
     await store.upsertGrant({
       accountId: "acct-2",
-      clientDeviceId: "client-2",
+      clientId: "client-2",
       grantId: "grant-2",
-      hostId: "host-2",
+      daemonId: "host-2",
       policyVersion: 5,
       revoked: true,
       scopes: ["acp:connect", "acp:session:create"],
@@ -189,8 +213,8 @@ describe("AcpRelayD1ControlPlaneStore", () => {
     await expect(
       store.resolveGrant({
         accountId: "acct-2",
-        clientDeviceId: "client-2",
-        hostId: "host-2",
+        clientId: "client-2",
+        daemonId: "host-2",
         requiredScopes: ["acp:connect"],
       }),
     ).resolves.toMatchObject({
@@ -237,6 +261,16 @@ type FakeD1Rows = {
   clientDevices: FakeClientDeviceRow[];
   grants: FakeGrantRow[];
   hosts: FakeHostRow[];
+  sessionBindings?: FakeSessionBindingRow[];
+};
+
+type FakeSessionBindingRow = {
+  account_id: string;
+  agent_json: string | null;
+  client_device_id: string;
+  host_id: string;
+  session_id: string;
+  workspace_roots_json: string | null;
 };
 
 class FakeD1Database implements D1DatabaseLike {
@@ -334,6 +368,24 @@ class FakeD1PreparedStatement implements D1PreparedStatementLike {
       return { success: true };
     }
 
+    if (query.includes("insert into acp_remote_session_bindings")) {
+      const row = {
+        account_id: this.readStringBinding(0),
+        agent_json: this.readNullableStringBinding(4),
+        client_device_id: this.readStringBinding(1),
+        host_id: this.readStringBinding(3),
+        session_id: this.readStringBinding(2),
+        workspace_roots_json: this.readNullableStringBinding(5),
+      };
+      this.rows.sessionBindings ??= [];
+      upsertRow(this.rows.sessionBindings, row, (candidate) =>
+        candidate.account_id === row.account_id &&
+        candidate.client_device_id === row.client_device_id &&
+        candidate.session_id === row.session_id,
+      );
+      return { success: true };
+    }
+
     return { success: false };
   }
 
@@ -366,6 +418,14 @@ class FakeD1PreparedStatement implements D1PreparedStatementLike {
           row.account_id === accountId &&
           row.revoked === 0 &&
           (row.client_device_id === null || row.client_device_id === second),
+      );
+    }
+    if (query.includes("from acp_remote_session_bindings")) {
+      return (this.rows.sessionBindings ?? []).filter(
+        (row) =>
+          row.account_id === accountId &&
+          row.client_device_id === second &&
+          row.session_id === this.bindings[2],
       );
     }
     return [];

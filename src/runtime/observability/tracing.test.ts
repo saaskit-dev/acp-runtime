@@ -2,7 +2,7 @@ import { context, trace } from "@opentelemetry/api";
 import { describe, expect, it } from "vitest";
 
 import { testSpanExporter } from "../test-otel.js";
-import { buildTraceMeta, withSpan } from "./tracing.js";
+import { buildTraceMeta, traceContextFromMeta, withSpan } from "./tracing.js";
 
 describe("runtime tracing metadata", () => {
   it("does not emit invalid all-zero traceparent metadata", () => {
@@ -24,6 +24,18 @@ describe("runtime tracing metadata", () => {
       expect(trace.getSpan(spanContext)?.spanContext().traceId).toBe(
         String(meta?.traceparent).split("-")[1],
       );
+    });
+  });
+
+  it("extracts remote traceparent metadata into an OpenTelemetry context", () => {
+    const traceContext = traceContextFromMeta({
+      traceparent: "00-11111111111111111111111111111111-2222222222222222-01",
+    });
+
+    expect(trace.getSpan(traceContext!)?.spanContext()).toMatchObject({
+      isRemote: true,
+      spanId: "2222222222222222",
+      traceId: "11111111111111111111111111111111",
     });
   });
 });

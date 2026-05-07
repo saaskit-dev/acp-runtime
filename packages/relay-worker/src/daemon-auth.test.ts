@@ -11,7 +11,7 @@ describe("daemon registration proof", () => {
     const keyPair = await createDaemonRegistrationKeyPair();
     const input = {
       accountId: "acct-1",
-      hostId: "host-1",
+      daemonId: "host-1",
       nonce: "nonce-1",
       timestamp: "1777248000000",
     };
@@ -48,7 +48,7 @@ describe("daemon registration proof", () => {
     const keyPair = await createDaemonRegistrationKeyPair();
     const input = {
       accountId: "acct-1",
-      hostId: "host-1",
+      daemonId: "host-1",
       nonce: "nonce-1",
       timestamp: "1777248000000",
     };

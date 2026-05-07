@@ -18,6 +18,7 @@ import type {
 } from "../core/types.js";
 import {
   emitRuntimeLog,
+  emitRuntimeSuppressedError,
   isRuntimeLogEnabled,
   observedLogBody,
 } from "../observability/logging.js";
@@ -111,8 +112,20 @@ export function createStdioAcpConnectionFactory(
       () => disposing,
       () => operationTracker.summary(),
     );
-    void onExit.catch(() => {
-      // Observed by wrapped requests/closed; suppress global unhandled rejection noise.
+    void onExit.catch((error) => {
+      emitRuntimeSuppressedError({
+        attributes: {
+          "acp.agent.command": input.agent.command,
+          "acp.agent.type": input.agent.type,
+          "acp.process.pid": child.pid ?? undefined,
+          "acp.session.cwd": input.cwd,
+        },
+        body: "ACP stdio process exit rejection was not directly observed.",
+        context: input.traceContext,
+        eventName: "acp.stdio.exit.unobserved",
+        exception: error,
+        severityNumber: SeverityNumber.DEBUG,
+      });
     });
     const connection = wrapConnectionWithExit(
       sdkConnection,
@@ -128,8 +141,35 @@ export function createStdioAcpConnectionFactory(
       async dispose() {
         disposing = true;
         try {
-          await terminateAgentProcess(child);
-          await onExit.catch(() => {});
+          await terminateAgentProcess(child, (operation, error) => {
+            emitRuntimeSuppressedError({
+              attributes: {
+                "acp.agent.command": input.agent.command,
+                "acp.agent.type": input.agent.type,
+                "acp.process.cleanup.operation": operation,
+                "acp.process.pid": child.pid ?? undefined,
+                "acp.session.cwd": input.cwd,
+              },
+              body: "ACP stdio process cleanup failed.",
+              context: input.traceContext,
+              eventName: "acp.stdio.process.cleanup.failed",
+              exception: error,
+            });
+          });
+          await onExit.catch((error) => {
+            emitRuntimeSuppressedError({
+              attributes: {
+                "acp.agent.command": input.agent.command,
+                "acp.agent.type": input.agent.type,
+                "acp.process.pid": child.pid ?? undefined,
+                "acp.session.cwd": input.cwd,
+              },
+              body: "ACP stdio process exit failed during dispose.",
+              context: input.traceContext,
+              eventName: "acp.stdio.dispose.exit.failed",
+              exception: error,
+            });
+          });
         } finally {
           detachAgentHandles(child);
         }
@@ -797,12 +837,15 @@ function waitForChildExit(
   });
 }
 
-async function terminateAgentProcess(child: AgentProcess): Promise<void> {
+async function terminateAgentProcess(
+  child: AgentProcess,
+  onCleanupError: (operation: string, error: unknown) => void = () => {},
+): Promise<void> {
   if (!child.stdin.destroyed) {
     try {
       child.stdin.end();
-    } catch {
-      // best effort
+    } catch (error) {
+      onCleanupError("stdin.end", error);
     }
   }
 
@@ -813,8 +856,8 @@ async function terminateAgentProcess(child: AgentProcess): Promise<void> {
   if (!exited && isChildProcessRunning(child)) {
     try {
       child.kill("SIGTERM");
-    } catch {
-      // best effort
+    } catch (error) {
+      onCleanupError("kill.SIGTERM", error);
     }
     exited = await waitForChildExit(child, AGENT_CLOSE_TERM_GRACE_MS);
   }
@@ -822,10 +865,13 @@ async function terminateAgentProcess(child: AgentProcess): Promise<void> {
   if (!exited && isChildProcessRunning(child)) {
     try {
       child.kill("SIGKILL");
-    } catch {
-      // best effort
+    } catch (error) {
+      onCleanupError("kill.SIGKILL", error);
     }
-    await waitForChildExit(child, AGENT_CLOSE_KILL_GRACE_MS).catch(() => false);
+    await waitForChildExit(child, AGENT_CLOSE_KILL_GRACE_MS).catch((error) => {
+      onCleanupError("wait.SIGKILL", error);
+      return false;
+    });
   }
 }
 

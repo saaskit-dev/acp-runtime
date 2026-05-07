@@ -23,6 +23,7 @@ export const AcpRemoteFrameType = {
   Ping: "ping",
   Pong: "pong",
   Renew: "renew",
+
 } as const;
 
 export type AcpRemoteEndpointKind =
@@ -63,7 +64,7 @@ export type AcpRemoteClientDeviceType =
 
 export type AcpRemoteClientDevice = {
   accountId: AcpRemoteId;
-  clientDeviceId: AcpRemoteId;
+  clientId: AcpRemoteId;
   publicKey: string;
   trustLevel?: string;
   type: AcpRemoteClientDeviceType;
@@ -71,15 +72,27 @@ export type AcpRemoteClientDevice = {
 
 export type AcpRemoteHostDaemon = {
   alias?: string;
-  hostId: AcpRemoteId;
+  daemonId: AcpRemoteId;
   ownerAccountId: AcpRemoteId;
   publicKey: string;
 };
 
+export type AcpRemoteAgentGrant =
+  | {
+      id: string;
+    }
+  | {
+      args?: readonly string[];
+      command: string;
+      env?: Record<string, string | undefined>;
+      type?: string;
+    };
+
 export type AcpRemoteGrant = {
   accountId: AcpRemoteId;
-  clientDeviceId?: AcpRemoteId;
-  hostId: AcpRemoteId;
+  agent?: AcpRemoteAgentGrant;
+  clientId?: AcpRemoteId;
+  daemonId: AcpRemoteId;
   policyVersion: number;
   scopes: readonly AcpRemoteScope[];
   workspaceId?: AcpRemoteId;
@@ -104,7 +117,7 @@ export type AcpRemoteHelloFrame = {
   connectionId: AcpRemoteId;
   endpoint: AcpRemoteEndpointKind;
   frameType: typeof AcpRemoteFrameType.Hello;
-  hostId?: AcpRemoteId;
+  daemonId?: AcpRemoteId;
   protocolVersion: typeof ACP_REMOTE_PROTOCOL_VERSION;
   ticket?: AcpRemoteSignedConnectionTicket;
 };
@@ -158,13 +171,14 @@ export type AcpRemoteFrame =
   | AcpRemoteHelloFrame
   | AcpRemotePingFrame
   | AcpRemotePongFrame
-  | AcpRemoteRenewFrame;
+  | AcpRemoteRenewFrame
+;
 
 export type AcpRemoteConnectionRoute = {
   accountId: AcpRemoteId;
-  clientDeviceId: AcpRemoteId;
+  clientId: AcpRemoteId;
   connectionId: AcpRemoteId;
-  hostId: AcpRemoteId;
+  daemonId: AcpRemoteId;
   scopes: readonly AcpRemoteScope[];
   workspaceId?: AcpRemoteId;
 };

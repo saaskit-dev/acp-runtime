@@ -10,7 +10,10 @@ This RFC defines the target direction for turning `acp-runtime` from a
 local-first runtime into a remote-capable runtime infrastructure. The design
 prioritizes first-party web, desktop, and mobile clients while preserving a
 standards-compatible ACP entry point for native ACP clients as a first-class
-compatibility feature.
+compatibility feature. Some ACP clients can open a WebSocket endpoint directly;
+others only support launching a local stdio ACP command. The remote runtime
+should support both shapes without making the stdio bridge specific to any one
+editor or host product.
 
 The core principle is:
 
@@ -23,8 +26,9 @@ The core principle is:
 - Support one account managing many host daemons and many client devices.
 - Prioritize first-party clients for host, workspace, session, and future
   remote IDE workflows.
-- Preserve a native ACP client path through standard ACP authentication and
-  session methods.
+- Preserve native ACP client paths through standard ACP authentication and
+  session methods, including direct WebSocket clients and stdio-only clients
+  that need a local stdio-to-relay bridge.
 - Keep relay/content storage boundaries clear: store relationships and grants,
   not prompts, files, terminal output, images, browser streams, or transcripts.
 - Make Cloudflare Workers and Durable Objects the preferred initial deployment
@@ -38,6 +42,9 @@ The core principle is:
   mobile use.
 - Do not make native ACP clients understand account, host, workspace, or device
   management UI.
+- Do not make stdio bridge compatibility specific to one editor. The bridge is
+  a generic ACP transport adapter for any client that can only spawn a local
+  stdio ACP command.
 - Do not make the relay the final workspace authority.
 - Do not store sensitive content or runtime transcripts in the relay/control
   plane by default.
@@ -45,9 +52,13 @@ The core principle is:
 
 ## Current Implementation Scope
 
-The active implementation slice is intentionally native ACP only:
+The active implementation slice is intentionally native ACP only. It has two
+compatible client entry shapes:
 
 - `/acp` accepts native ACP JSON-RPC over WebSocket.
+- A generic stdio ACP bridge may be launched by clients that cannot connect to
+  WebSocket ACP endpoints directly. The bridge speaks ACP over stdio locally and
+  forwards the same ACP JSON-RPC to `/acp`.
 - `/authorize` performs browser account authorization and host selection.
 - `/daemon` connects the host daemon and creates daemon-side ACP connections.
 - Relay/account metadata is limited to relationships, keys, grants, tickets,
@@ -55,8 +66,10 @@ The active implementation slice is intentionally native ACP only:
 - Worker/Durable Object smoke validates native ACP `initialize`, `authenticate`,
   `session/new`, and `session/prompt` against the simulator agent.
 
-First-party IDE clients, `remote/client`, `examples/remote`, and remote IDE UI
-are explicitly paused until the native ACP path is deployment-ready.
+First-party IDE clients, `examples/remote`, and remote IDE UI are explicitly
+paused until the native ACP path is deployment-ready. Generic stdio bridge
+compatibility is part of the native ACP slice because it is a transport adapter,
+not a first-party remote IDE client.
 
 ## Architecture
 
@@ -64,6 +77,7 @@ are explicitly paused until the native ACP path is deployment-ready.
 First-party Client / Native ACP Client
         |
         | HTTPS / WebSocket / ACP over WebSocket
+        | or local stdio ACP bridge -> WebSocket /acp
         v
 Relay URL
         |
@@ -99,7 +113,8 @@ First-party clients are the primary product surface. They should own:
 
 Native ACP clients are compatibility clients. They should only need ACP:
 
-- connect to the relay ACP endpoint
+- connect to the relay ACP endpoint directly, or spawn a generic local stdio
+  bridge that connects to the relay ACP endpoint
 - call `initialize`
 - use ACP `authMethods` and `authenticate`
 - use ACP `session/*` methods after authorization
@@ -112,6 +127,12 @@ authorization page, not inside the ACP client.
 A native ACP client that connects to a single relay URL does not know the target
 host yet. The relay/control plane therefore needs a minimal ACP bootstrap
 facade for unbound native connections.
+
+For stdio-only clients, the local bridge must not add product semantics. It
+should translate stdio JSON-RPC to the relay WebSocket transport, surface the
+same bootstrap auth method, and keep host/workspace selection in the browser
+authorization flow. It is a generic transport adapter, not an editor-specific
+compatibility layer.
 
 The bootstrap facade may handle only:
 
@@ -355,10 +376,13 @@ path first.
 
 ## Native ACP Client Flow
 
-Native ACP clients should connect to one relay URL and use ACP authentication:
+Native ACP clients should use one relay URL and ACP authentication. Direct
+WebSocket clients connect to `/acp` themselves; stdio-only clients launch a
+generic stdio ACP bridge that connects to `/acp` on their behalf:
 
 ```text
-1. Native ACP client connects to wss://relay.example.com/acp.
+1. Native ACP client connects to wss://relay.example.com/acp, or launches the
+   stdio bridge which connects there.
 2. Client calls initialize.
 3. Relay bootstrap facade exposes an ACP auth method such as browser-login.
 4. Client calls authenticate({ methodId: "browser-login" }).
@@ -374,10 +398,11 @@ Native ACP clients should connect to one relay URL and use ACP authentication:
 The ACP client does not need multi-host UI. Host and workspace selection happen
 out of band in the browser authorization flow.
 
-If a native ACP client cannot display browser/device-code instructions from
-standard fields or `_meta`, it may not support this compatibility flow. That
-does not affect first-party clients, which use enhanced account APIs before
-opening the ACP channel.
+If a native ACP client cannot connect to WebSocket endpoints but can spawn a
+stdio ACP command, it should use the generic stdio bridge. If it cannot display
+browser/device-code instructions from standard fields or `_meta`, it may still
+not support this compatibility flow. That does not affect first-party clients,
+which use enhanced account APIs before opening the ACP channel.
 
 ## Protocol Layering
 
@@ -482,14 +507,17 @@ single relay service as long as they implement the same contracts.
 
 - Host daemon connects outbound to relay.
 - Relay exposes `/acp` over WebSocket.
-- Native ACP client uses the relay bootstrap ACP facade.
+- Native ACP client uses the relay bootstrap ACP facade, either directly over
+  WebSocket or through a generic stdio bridge.
 - Browser auth selects account, host, and workspace for the ACP connection.
 - Relay binds the native ACP connection to the selected daemon.
 - Daemon validates the ticket and serves the runtime ACP facade.
 - Support `initialize`, `authenticate`, `session/new`, `session/prompt`, events,
   and basic cancellation.
 - Do not build `examples/remote` in this phase.
-- Do not build `remote/client` or first-party client SDK helpers in this phase.
+- Do not build first-party client SDK helpers in this phase. A generic stdio
+  bridge is allowed in this phase because it only adapts transport for
+  stdio-only ACP clients.
 - Validation should use an ACP client-compatible smoke path against the relay
   endpoint.
 
@@ -533,13 +561,13 @@ single relay service as long as they implement the same contracts.
 - Keep remote relay code out of examples unless the example is specifically a
   remote runtime example.
 - Keep agent-specific ACP behavior in runtime profiles, not the relay.
-- Do not require native ACP clients to run a local proxy for the main remote
-  WebSocket path.
-- If stdio-only ACP clients are supported later, a local proxy may be offered as
-  an optional compatibility bridge, not as the primary architecture.
+- Do not require direct WebSocket-capable ACP clients to run a local proxy.
+- Provide stdio bridge compatibility as a generic ACP transport adapter for
+  clients that can only spawn a local stdio ACP command. Keep it editor-agnostic
+  and separate from first-party remote IDE client work.
 - Preserve the local-first runtime API so hosts can use `AcpRuntime` without any
   relay dependency.
 - Initial implementation should focus on `src/runtime/remote/protocol`,
-  `src/runtime/remote/daemon`, and `packages/relay-worker`. Defer
-  `src/runtime/remote/client` and `examples/remote` until the native ACP client
-  path is working end to end.
+  `src/runtime/remote/daemon`, the generic stdio bridge, and
+  `packages/relay-worker`. Defer first-party remote client APIs and
+  `examples/remote` until the native ACP client path is working end to end.

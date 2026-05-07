@@ -9,7 +9,9 @@
 设计优先级是：
 
 1. 自家 Web / Desktop / Mobile 客户端优先。
-2. 原生 ACP client 是一等兼容 feature 和生态接入口。
+2. 原生 ACP client 是一等兼容 feature 和生态接入口。这里同时包含能直接连接
+   WebSocket ACP endpoint 的 client，以及只能启动本地 stdio ACP command、需要
+   通用 stdio bridge 的 client。
 3. Relay 轻状态，不保存 prompt、文件、终端输出、图片、browser stream 或 ACP transcript。
 4. Account control plane 维护账号、设备、host、授权关系和短期连接票据。
 5. Host daemon 仍然是本地执行和本地权限兜底的 authority。
@@ -22,7 +24,9 @@
 
 - 一个账号可以管理多个宿主机 daemon、多个 client、多个 workspace、多个 ACP session。
 - 自家客户端提供完整产品体验：host 选择、workspace 选择、session 列表、权限 UI、自动续租和后续 Remote IDE 能力。
-- 原生 ACP client 可以通过同一个 relay URL 接入，不要求它理解账号、多 host、多 workspace UI。
+- 原生 ACP client 可以通过同一个 relay URL 接入；能直连 WebSocket 的 client
+  直接连 `/acp`，只能启动本地 stdio command 的 client 通过通用 stdio bridge
+  接入，不要求它理解账号、多 host、多 workspace UI。
 - Relay/control plane 只保存轻量关系和授权，不保存敏感内容。
 - Cloudflare Workers + Durable Objects 作为优先部署方向，同时保留 VPS / self-host 后端可替换性。
 - 网络、协议、安全、授权和 channel 设计必须为后续文件、终端、端口转发、browser、artifact、日志等 Remote IDE 能力预留空间。
@@ -31,15 +35,19 @@
 
 - 不要求用户为了 Web/Mobile 场景在本地再跑一个 client-side proxy。
 - 不要求原生 ACP client 理解账号、host、workspace、设备管理 UI。
+- 不把 stdio bridge 做成某个编辑器专用的兼容层；它是面向所有 stdio-only ACP
+  client 的通用 transport adapter。
 - 不让 relay 成为 workspace 的最终 authority。
 - 默认不在 relay/control plane 保存 prompt、文件、终端输出、图片、browser stream、session transcript。
 - 不把 Remote IDE 的所有能力强塞进 ACP 标准协议。
 
 ## 当前实现范围
 
-当前实现切片明确只做原生 ACP：
+当前实现切片明确只做原生 ACP，并支持两种 client 入口形态：
 
 - `/acp` 承接原生 ACP JSON-RPC over WebSocket。
+- 通用 stdio ACP bridge 可供不能直接连接 WebSocket ACP endpoint 的 client 启动；
+  bridge 在本地通过 stdio 说 ACP，并把同样的 ACP JSON-RPC 转发到 `/acp`。
 - `/authorize` 负责浏览器账号授权和 host 选择。
 - `/daemon` 连接 host daemon，并创建 daemon-side ACP connection。
 - Relay/account metadata 仅限关系、key、grant、ticket、presence 和 revocation
@@ -47,8 +55,9 @@
 - Worker/Durable Object smoke 用 simulator agent 验证原生 ACP `initialize`、
   `authenticate`、`session/new` 和 `session/prompt`。
 
-自家 IDE client、`remote/client`、`examples/remote` 和 Remote IDE UI 在原生 ACP
-路径达到可部署前明确暂停。
+自家 IDE client、`examples/remote` 和 Remote IDE UI 在原生 ACP 路径达到可部署前
+明确暂停。通用 stdio bridge 属于原生 ACP 切片，因为它只是 transport adapter，
+不是自家 Remote IDE client。
 
 ## 总体架构
 
@@ -56,6 +65,7 @@
 Our Client / Native ACP Client
         |
         | HTTPS / WebSocket / ACP over WebSocket
+        | 或 local stdio ACP bridge -> WebSocket /acp
         v
 Relay URL
         |
@@ -98,7 +108,8 @@ Host Daemon
 
 原生 ACP client 是兼容入口，只需要 ACP 标准流程：
 
-- 连接 relay ACP endpoint
+- 直接连接 relay ACP endpoint，或启动通用本地 stdio bridge，由 bridge 连接 relay
+  ACP endpoint
 - 调用 `initialize`
 - 使用 `authMethods` / `authenticate`
 - 授权完成后调用 `session/*`
@@ -120,6 +131,11 @@ Bootstrap facade 只允许处理：
 它不能实现正常 runtime 语义，例如 `session/new`、`session/prompt`、文件访问、终端访问或 agent-specific compatibility。
 Host 选择完成后，relay 将连接绑定到 daemon，并开始转发 runtime ACP 流量。
 Relay 应把原始 client initialize metadata/capabilities 传给 daemon 侧 ACP facade，让 daemon 建立真实 runtime session context。
+
+对于 stdio-only client，本地 bridge 不能加入产品语义。它只负责把本地 stdio
+JSON-RPC 转成 relay WebSocket transport，暴露同一个 bootstrap auth method，并把
+host/workspace 选择保留在浏览器授权流程中。它是通用 transport adapter，不是某个
+编辑器专用的兼容层。
 
 ### Account Control Plane
 
@@ -354,10 +370,13 @@ connection id、host id、当前 ticket JTI、timestamp 和 nonce 做签名 proo
 
 ## 原生 ACP Client 兼容流程
 
-原生 ACP client 连接同一个 relay URL，并通过 ACP auth 进入浏览器授权页：
+原生 ACP client 使用同一个 relay URL，并通过 ACP auth 进入浏览器授权页。能直连
+WebSocket 的 client 自己连 `/acp`；stdio-only client 启动通用 stdio bridge，由
+bridge 代为连接 `/acp`：
 
 ```text
-1. Native ACP client 连接 wss://relay.example.com/acp
+1. Native ACP client 连接 wss://relay.example.com/acp，或启动 stdio bridge
+   由 bridge 连接该地址
 2. client 调用 initialize
 3. relay bootstrap facade 返回 authMethods，例如 browser-login
 4. client 调用 authenticate({ methodId: "browser-login" })
@@ -372,7 +391,9 @@ connection id、host id、当前 ticket JTI、timestamp 和 nonce 做签名 proo
 
 这样原生 ACP client 不需要懂多 host UI；host/workspace 选择在浏览器授权页完成。
 
-如果某个原生 ACP client 不能从标准字段或 `_meta` 展示 browser/device-code 指引，它可能无法使用这条兼容流程。
+如果某个原生 ACP client 不能连接 WebSocket endpoint，但可以启动本地 stdio ACP
+command，就应使用通用 stdio bridge。如果它不能从标准字段或 `_meta` 展示
+browser/device-code 指引，它仍可能无法使用这条兼容流程。
 这不影响自家客户端，因为自家客户端会先通过增强账号 API 完成 host 选择，再打开 ACP channel。
 
 ## 协议分层
@@ -473,13 +494,15 @@ VPS / self-host 可以使用 Postgres、SQLite、Redis、Nginx/Caddy 或单体 r
 
 - Host daemon 主动连接 relay。
 - Relay 暴露 `/acp` WebSocket。
-- 原生 ACP client 使用 relay bootstrap ACP facade。
+- 原生 ACP client 使用 relay bootstrap ACP facade，可直接走 WebSocket，也可通过
+  通用 stdio bridge。
 - Browser auth 为这条 ACP connection 选择 account、host 和 workspace。
 - Relay 将原生 ACP connection 绑定到目标 daemon。
 - Daemon 验证 ticket，并提供 runtime ACP facade。
 - 支持 `initialize`、`authenticate`、`session/new`、`session/prompt`、events 和基本 cancel。
 - 本阶段不实现 `examples/remote`。
-- 本阶段不实现 `remote/client` 或自家 client SDK helper。
+- 本阶段不实现自家 client SDK helper。通用 stdio bridge 允许进入本阶段，因为它
+  只为 stdio-only ACP client 做 transport adaptation。
 - 验证方式优先使用 ACP client-compatible smoke path 直接打 relay endpoint。
 
 ### Phase 2：可靠性
@@ -521,8 +544,10 @@ VPS / self-host 可以使用 Postgres、SQLite、Redis、Nginx/Caddy 或单体 r
 
 - Remote relay 逻辑不要塞进通用 examples，除非该 example 明确是 remote runtime 示例。
 - Agent-specific ACP 行为仍然放在 runtime profile，不放在 relay。
-- 主路径不要求原生 ACP client 跑本地 proxy。
-- 如果后续支持 stdio-only ACP client，本地 proxy 只能作为可选兼容桥，不是主要架构。
+- 不要求能直连 WebSocket 的 ACP client 跑本地 proxy。
+- 为只能启动本地 stdio ACP command 的 client 提供通用 stdio bridge 兼容。bridge
+  必须保持 editor-agnostic，并与自家 Remote IDE client 工作分离。
 - 保留 local-first runtime API，host 可以继续不依赖 relay 直接使用 `AcpRuntime`。
 - 初始实现聚焦 `src/runtime/remote/protocol`、`src/runtime/remote/daemon` 和 `packages/relay-worker`。
-  在原生 ACP client 端到端路径跑通前，暂缓 `src/runtime/remote/client` 和 `examples/remote`。
+  以及通用 stdio bridge。在原生 ACP client 端到端路径跑通前，暂缓自家 remote
+  client API 和 `examples/remote`。

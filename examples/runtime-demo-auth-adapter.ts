@@ -22,6 +22,12 @@ type DemoTerminalAuthenticationRequest = AcpRuntimeTerminalAuthenticationRequest
   successPatterns?: readonly string[];
 };
 
+const ACP_REMOTE_AUTH_URL_META = "acp-runtime/remote/authUrl";
+const ACP_REMOTE_CONNECTION_ID_META = "acp-runtime/remote/connectionId";
+const ACP_DAEMON_ID_ENV = "ACP_DAEMON_ID";
+const ACP_ACCOUNT_SESSION_ENV = "ACP_ACCOUNT_SESSION";
+const ACP_REMOTE_AUTO_AUTHORIZE_ENV = "ACP_REMOTE_AUTO_AUTHORIZE";
+
 export async function promptForDemoAuthentication(
   input: {
     inputCoordinator: DemoInputCoordinator;
@@ -47,6 +53,11 @@ export async function promptForDemoAuthentication(
       severityNumber: SeverityNumber.WARN,
     });
     return { cancel: true };
+  }
+
+  const remoteAuthorization = await authorizeRemoteRelayIfConfigured(method);
+  if (remoteAuthorization) {
+    input.renderer.writeLine("auth", remoteAuthorization);
   }
 
   const terminalRequest = resolveDemoTerminalAuthenticationRequest({
@@ -80,6 +91,64 @@ export async function promptForDemoAuthentication(
     eventName: "acp.demo.authentication.selected",
   });
   return { methodId: method.id };
+}
+
+async function authorizeRemoteRelayIfConfigured(
+  method: AcpRuntimeAuthenticationMethod,
+): Promise<string | undefined> {
+  const authUrl = readMetaString(method, ACP_REMOTE_AUTH_URL_META);
+  if (!authUrl) {
+    return undefined;
+  }
+
+  const daemonId = process.env[ACP_DAEMON_ID_ENV];
+  const accountSession = process.env[ACP_ACCOUNT_SESSION_ENV];
+  const autoAuthorize = readBooleanEnv(ACP_REMOTE_AUTO_AUTHORIZE_ENV);
+  if (!autoAuthorize || !daemonId || !accountSession) {
+    output.write(
+      `[runtime] remote authorization required: ${authUrl}\n` +
+        `[runtime] set ${ACP_REMOTE_AUTO_AUTHORIZE_ENV}=1, ${ACP_DAEMON_ID_ENV}, and ${ACP_ACCOUNT_SESSION_ENV} to authorize automatically.\n`,
+    );
+    return undefined;
+  }
+
+  const response = await fetch(authUrl, {
+    body: JSON.stringify({ daemonId }),
+    headers: {
+      Authorization: `Bearer ${accountSession}`,
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+  const body = await response.json().catch((error) => {
+    process.stderr.write(
+      `[runtime] remote relay authorization response parse failed: ${
+        error instanceof Error ? error.message : String(error)
+      }\n`,
+    );
+    return undefined;
+  }) as { ok?: unknown; reason?: unknown } | undefined;
+  if (!response.ok || body?.ok !== true) {
+    throw new Error(
+      `Remote relay authorization failed for ${readMetaString(method, ACP_REMOTE_CONNECTION_ID_META) ?? authUrl}: ${
+        typeof body?.reason === "string" ? body.reason : response.statusText
+      }`,
+    );
+  }
+  return `remote relay authorized ${daemonId}`;
+}
+
+function readBooleanEnv(name: string): boolean {
+  const value = process.env[name];
+  return value === "1" || value?.toLowerCase() === "true";
+}
+
+function readMetaString(
+  method: AcpRuntimeAuthenticationMethod,
+  key: string,
+): string | undefined {
+  const value = method.meta?.[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
 }
 
 export function resolveDemoTerminalAuthenticationRequest(input: {

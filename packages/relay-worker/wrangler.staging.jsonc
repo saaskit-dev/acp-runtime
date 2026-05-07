@@ -4,7 +4,7 @@
 // Required secrets (set via `wrangler secret put`):
 //   ACP_RELAY_ACCOUNT_SESSION_SECRET  - HMAC key for account session tokens
 //   ACP_RELAY_CONTROL_PLANE_SECRET    - Bearer token for control-plane API
-//   ACP_RELAY_TICKET_SECRET           - HMAC key for ticket signing
+//   ACP_RELAY_TICKET_PRIVATE_KEY      - Ed25519 PKCS#8 private key for ticket signing
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "acp-relay-worker-staging",
@@ -32,8 +32,8 @@
     }
   ],
   "vars": {
-    "ACP_RELAY_CLIENT_RECONNECT_GRACE_MS": "30000",
-    "ACP_RELAY_DAEMON_RECONNECT_GRACE_MS": "30000",
+    "ACP_RELAY_CLIENT_RECONNECT_GRACE_MS": "300000",
+    "ACP_RELAY_DAEMON_RECONNECT_GRACE_MS": "300000",
     "ACP_RELAY_HEARTBEAT_INTERVAL_MS": "30000",
     "ACP_RELAY_HEARTBEAT_TIMEOUT_MS": "45000",
     "ACP_RELAY_MAX_BUFFERED_FRAMES_PER_CONNECTION": "64",

@@ -7,6 +7,8 @@ import {
 } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
 
+import { MemoryWebSocket, createMemoryWebSocketPair, waitFor } from "../../../src/runtime/remote/shared/test-helpers.js";
+
 import {
   AcpRemoteChannelKind,
   AcpRemoteFrameType,
@@ -16,11 +18,925 @@ import {
   createAcpJsonRpcWebSocketStream,
   type AcpRemoteDataFrame,
   type AcpRemoteFrame,
+  type AcpRemoteScope,
 } from "../../../src/runtime/remote/protocol/index.js";
 import { AcpRelayInMemoryControlPlaneStore } from "./control-plane-store.js";
-import { AcpRelayBroker } from "./relay-core.js";
+import { AcpRelayBroker, createRelayAuthorizationPage } from "./relay-core.js";
 
 describe("AcpRelayBroker", () => {
+  it("embeds authorization host data as valid script JSON", () => {
+    const page = createRelayAuthorizationPage({
+      accountId: "acct-1",
+      connectionId: "conn-1",
+      hosts: [
+        {
+          daemonId: "host-1",
+          metadata: {
+            agentTypes: [{ command: "node", label: "Node", type: "sim" }],
+            machine: "dev-mac",
+            workspaceRoots: [{ label: "Project", path: "/tmp/<project>" }],
+          },
+        },
+      ],
+      requestUrl: 'https://relay.example.com/authorize?next="done"',
+    });
+
+    expect(page).toContain('const hosts = [{"daemonId":"host-1"');
+    expect(page).toContain("Machine / Agent");
+    expect(page).toContain("workspaceSummary");
+    expect(page).toContain('value.id === "codex-acp"');
+    expect(page).toContain("Default daemon agent");
+    expect(page).toContain("dev-mac");
+    expect(page).toContain(
+      'const authorizeUrl = "https://relay.example.com/authorize?next=\\"done\\"";',
+    );
+    expect(page).not.toContain("&quot;");
+    expect(page).not.toContain("/tmp/<project>");
+  });
+
+  it("renders expired authorization connections explicitly", () => {
+    const page = createRelayAuthorizationPage({
+      accountId: "acct-1",
+      connectionId: "conn-expired",
+      hosts: [],
+      requestUrl: "https://relay.example.com/authorize?connectionId=conn-expired",
+      unavailableReason:
+        "Client connection is no longer active. Restart the remote session from the ACP client.",
+    });
+
+    expect(page).toContain("Remote session expired");
+    expect(page).toContain("Client disconnected");
+    expect(page).toContain("Restart the remote session from the ACP client.");
+    expect(page).toContain("const hosts = [];");
+  });
+
+  it("requests workspace tree entries from an authorizable daemon", async () => {
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore(),
+      ticketSigningKey,
+    });
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const [, relayClientSocket] = createMemoryWebSocketPair();
+    let requestFrame: AcpRemoteDataFrame | undefined;
+
+    daemonSocket.addEventListener("message", (event) => {
+      const frame = assertAcpRemoteFrame(JSON.parse(String(event.data)));
+      if (frame.frameType === AcpRemoteFrameType.Data) {
+        requestFrame = frame;
+      }
+    });
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    broker.registerDaemon("host-a", relayDaemonSocket, {
+      agentTypes: [],
+      workspaceRoots: [{ path: "/Users/dev" }],
+    });
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: "https://relay.test/authorize?connectionId=conn-workspace-tree",
+      connectionId: "conn-workspace-tree",
+      socket: relayClientSocket,
+    });
+
+    const resultPromise = broker.listDaemonWorkspaceDirectory({
+      connectionId: "conn-workspace-tree",
+      daemonId: "host-a",
+      path: "/Users/dev",
+      root: "/Users/dev",
+    });
+    await waitFor(() => requestFrame !== undefined);
+    expect(requestFrame).toMatchObject({
+      channelKind: AcpRemoteChannelKind.Filesystem,
+      payload: {
+        kind: "workspace/list",
+        path: "/Users/dev",
+        root: "/Users/dev",
+      },
+    });
+
+    daemonSocket.send(JSON.stringify({
+      channelId: "workspace",
+      channelKind: AcpRemoteChannelKind.Filesystem,
+      connectionId: requestFrame!.connectionId,
+      frameType: AcpRemoteFrameType.Data,
+      payload: {
+        entries: [{ name: "acp-runtime", path: "/Users/dev/acp-runtime", type: "directory" }],
+        kind: "workspace/list/result",
+        ok: true,
+        path: "/Users/dev",
+        requestId: "unused",
+      },
+      seq: 1,
+    } satisfies AcpRemoteDataFrame));
+
+    await expect(resultPromise).resolves.toEqual({
+      entries: [{ name: "acp-runtime", path: "/Users/dev/acp-runtime", type: "directory" }],
+      ok: true,
+      path: "/Users/dev",
+    });
+  });
+
+  it("stores registry agent ids in authorization tickets", async () => {
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore(),
+      ticketSigningKey,
+    });
+    const connectionId = "conn-agent-id";
+    const [, relayClientSocket] = createMemoryWebSocketPair();
+    const [, relayDaemonSocket] = createMemoryWebSocketPair();
+
+    broker.registerDaemon("host-a", relayDaemonSocket, {
+      agentTypes: [{ id: "codex-acp", label: "Codex" }],
+      workspaceRoots: [],
+    });
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+
+    const result = await broker.authorizeClient({
+      clientAgent: { id: "codex-acp" },
+      connectionId,
+      daemonId: "host-a",
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      ticket: {
+        payload: {
+          agent: { id: "codex-acp" },
+        },
+      },
+    });
+  });
+
+  it("auto-registers the native client device before grant resolution", async () => {
+    const store = new AcpRelayInMemoryControlPlaneStore({
+      accounts: [{ accountId: "acct-1" }],
+      clientDevices: [],
+      grants: [
+        {
+          accountId: "acct-1",
+          daemonId: "host-a",
+          policyVersion: 1,
+          scopes: ["acp:connect"],
+        },
+      ],
+      hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
+    });
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: store,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-auto-client";
+    const [, relayClientSocket] = createMemoryWebSocketPair();
+    const [, relayDaemonSocket] = createMemoryWebSocketPair();
+
+    broker.registerDaemon("host-a", relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      clientId: "editor-bridge",
+      connectionId,
+      socket: relayClientSocket,
+    });
+
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await expect(
+      store.getClientDevice({
+        accountId: "acct-1",
+        clientId: "editor-bridge",
+      }),
+    ).resolves.toMatchObject({
+      accountId: "acct-1",
+      clientId: "editor-bridge",
+    });
+  });
+
+  it("rejects unadvertised authorization agent and workspace selections", async () => {
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore(),
+      ticketSigningKey,
+    });
+    const connectionId = "conn-selection-validation";
+    const [, relayClientSocket] = createMemoryWebSocketPair();
+    const [, relayDaemonSocket] = createMemoryWebSocketPair();
+
+    broker.registerDaemon("host-a", relayDaemonSocket, {
+      agentTypes: [{ id: "codex-acp", label: "Codex" }],
+      workspaceRoots: [{ path: "/Users/dev" }],
+    });
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+
+    await expect(
+      broker.authorizeClient({
+        clientAgent: { command: "/bin/sh" },
+        connectionId,
+        daemonId: "host-a",
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      reason: "Selected agent is not advertised by this daemon.",
+    });
+    await expect(
+      broker.authorizeClient({
+        connectionId,
+        daemonId: "host-a",
+        workspaceRoots: ["/etc"],
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      reason: "Selected workspace is not advertised by this daemon.",
+    });
+    await expect(
+      broker.authorizeClient({
+        clientAgent: { id: "codex-acp" },
+        connectionId,
+        daemonId: "host-a",
+        workspaceRoots: ["/Users/dev/acp-runtime"],
+      }),
+    ).resolves.toMatchObject({ ok: true });
+  });
+
+  it("reuses bootstrap authorization session selection for the first native session", async () => {
+    const broker = new AcpRelayBroker({
+      authWaitMs: 50,
+      controlPlaneStore: createControlPlaneStore(),
+      ticketSigningKey,
+    });
+    const connectionId = "conn-bootstrap-session-selection";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    let sessionNewPayload: AnyMessage | undefined;
+
+    bindBrokerClientSocket(broker, connectionId, relayClientSocket);
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    daemonSocket.addEventListener("message", (event) => {
+      const frame = assertAcpRemoteFrame(JSON.parse(String(event.data)));
+      if (frame.frameType !== AcpRemoteFrameType.Data) {
+        return;
+      }
+      const payload = frame.payload as AnyMessage;
+      if (
+        "id" in payload &&
+        "method" in payload &&
+        payload.method === "session/new"
+      ) {
+        sessionNewPayload = payload;
+        daemonSocket.send(
+          JSON.stringify({
+            channelId: "acp",
+            channelKind: AcpRemoteChannelKind.Acp,
+            connectionId,
+            frameType: AcpRemoteFrameType.Data,
+            payload: {
+              id: payload.id,
+              jsonrpc: "2.0",
+              result: { sessionId: "session-selected" },
+            },
+            seq: 1,
+          } satisfies AcpRemoteDataFrame),
+        );
+      }
+    });
+
+    broker.registerDaemon("host-a", relayDaemonSocket, {
+      agentTypes: [{ id: "codex-acp", label: "Codex" }],
+      workspaceRoots: [{ path: "/tmp" }],
+    });
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+
+    const clientConnection = createClientConnection(nativeClientSocket);
+    const initialize = await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+    expect(initialize.agentCapabilities).toMatchObject({
+      loadSession: true,
+      sessionCapabilities: {
+        close: {},
+        list: {},
+        resume: {},
+      },
+    });
+    const authentication = clientConnection.authenticate({
+      methodId: "acp-runtime-browser",
+    });
+    await expect(
+      broker.authorizeClient({
+        clientAgent: { id: "codex-acp" },
+        connectionId,
+        daemonId: "host-a",
+        workspaceRoots: ["/tmp/selected-project"],
+      }),
+    ).resolves.toMatchObject({ ok: true });
+    await expect(authentication).resolves.toMatchObject({
+      _meta: {
+        "acp-runtime/remote/daemonId": "host-a",
+      },
+    });
+
+    await expect(
+      clientConnection.newSession({ cwd: "/tmp/project", mcpServers: [] }),
+    ).resolves.toMatchObject({ sessionId: "session-selected" });
+
+    expect(sessionNewPayload).toMatchObject({
+      params: {
+        cwd: "/tmp/selected-project",
+        _meta: {
+          "acp-runtime/remote/sessionAgent": { id: "codex-acp" },
+          "acp-runtime/remote/sessionWorkspaceRoots": [
+            "/tmp/selected-project",
+          ],
+        },
+      },
+    });
+
+    nativeClientSocket.close();
+    daemonSocket.close();
+  });
+
+  it("allows native session/new to drive bootstrap authorization when client skips authenticate", async () => {
+    const broker = new AcpRelayBroker({
+      authWaitMs: 1_000,
+      controlPlaneStore: createControlPlaneStore({
+        scopes: [
+          "acp:connect",
+          "acp:session:create",
+          "acp:session:resume",
+          "acp:turn:send",
+        ],
+      }),
+      ticketSigningKey,
+    });
+    const connectionId = "conn-session-new-bootstrap";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    let forwardedSessionNew: AnyMessage | undefined;
+
+    bindBrokerClientSocket(broker, connectionId, relayClientSocket);
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    daemonSocket.addEventListener("message", (event) => {
+      const frame = assertAcpRemoteFrame(JSON.parse(String(event.data)));
+      if (frame.frameType !== AcpRemoteFrameType.Data) {
+        return;
+      }
+      const payload = frame.payload as AnyMessage;
+      if (
+        "id" in payload &&
+        "method" in payload &&
+        payload.method === "session/new"
+      ) {
+        forwardedSessionNew = payload;
+        daemonSocket.send(
+          JSON.stringify({
+            channelId: "acp",
+            channelKind: AcpRemoteChannelKind.Acp,
+            connectionId,
+            frameType: AcpRemoteFrameType.Data,
+            payload: {
+              id: payload.id,
+              jsonrpc: "2.0",
+              result: { sessionId: "session-from-session-new" },
+            },
+            seq: 1,
+          } satisfies AcpRemoteDataFrame),
+        );
+      }
+    });
+
+    broker.registerDaemon("host-a", relayDaemonSocket, {
+      agentTypes: [{ id: "codex-acp", label: "Codex" }],
+      workspaceRoots: [{ path: "/tmp" }],
+    });
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+
+    const clientConnection = createClientConnection(nativeClientSocket);
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+
+    const newSession = clientConnection.newSession({
+      cwd: "/tmp/project",
+      mcpServers: [],
+    });
+    await expect(
+      broker.authorizeClient({
+        clientAgent: { id: "codex-acp" },
+        connectionId,
+        daemonId: "host-a",
+        workspaceRoots: ["/tmp/selected-project"],
+      }),
+    ).resolves.toMatchObject({ ok: true });
+
+    await expect(newSession).resolves.toMatchObject({
+      sessionId: "session-from-session-new",
+    });
+    expect(forwardedSessionNew).toMatchObject({
+      params: {
+        cwd: "/tmp/selected-project",
+        _meta: {
+          "acp-runtime/remote/sessionAgent": { id: "codex-acp" },
+          "acp-runtime/remote/sessionWorkspaceRoots": [
+            "/tmp/selected-project",
+          ],
+        },
+      },
+    });
+
+    nativeClientSocket.close();
+    daemonSocket.close();
+  });
+
+  it("routes concurrent session/new selections by request scoped selection id", async () => {
+    const broker = new AcpRelayBroker({
+      authWaitMs: 1_000,
+      controlPlaneStore: createControlPlaneStore({
+        scopes: [
+          "acp:connect",
+          "acp:session:create",
+          "acp:session:resume",
+          "acp:turn:send",
+        ],
+      }),
+      ticketSigningKey,
+    });
+    const connectionId = "conn-concurrent-session-new";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const forwarded: AnyMessage[] = [];
+    let seq = 1;
+
+    bindBrokerClientSocket(broker, connectionId, relayClientSocket);
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    daemonSocket.addEventListener("message", (event) => {
+      const frame = assertAcpRemoteFrame(JSON.parse(String(event.data)));
+      if (frame.frameType !== AcpRemoteFrameType.Data) {
+        return;
+      }
+      const payload = frame.payload as AnyMessage;
+      if (
+        "id" in payload &&
+        "method" in payload &&
+        payload.method === "session/new"
+      ) {
+        forwarded.push(payload);
+        const cwd =
+          "params" in payload &&
+          typeof payload.params === "object" &&
+          payload.params !== null &&
+          "cwd" in payload.params &&
+          typeof payload.params.cwd === "string"
+            ? payload.params.cwd
+            : "unknown";
+        daemonSocket.send(
+          JSON.stringify({
+            channelId: "acp",
+            channelKind: AcpRemoteChannelKind.Acp,
+            connectionId,
+            frameType: AcpRemoteFrameType.Data,
+            payload: {
+              id: payload.id,
+              jsonrpc: "2.0",
+              result: { sessionId: `session:${cwd}` },
+            },
+            seq: seq++,
+          } satisfies AcpRemoteDataFrame),
+        );
+      }
+    });
+
+    broker.registerDaemon("host-a", relayDaemonSocket, {
+      agentTypes: [{ id: "codex-acp", label: "Codex" }],
+      workspaceRoots: [{ path: "/tmp" }],
+    });
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+
+    const clientConnection = createClientConnection(nativeClientSocket);
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+
+    const sessionA = clientConnection.newSession({
+      _meta: {
+        "acp-runtime/remote/sessionSelectionId": "selection-a",
+      },
+      cwd: "/tmp/request-a",
+      mcpServers: [],
+    } as Parameters<typeof clientConnection.newSession>[0]);
+    const sessionB = clientConnection.newSession({
+      _meta: {
+        "acp-runtime/remote/sessionSelectionId": "selection-b",
+      },
+      cwd: "/tmp/request-b",
+      mcpServers: [],
+    } as Parameters<typeof clientConnection.newSession>[0]);
+
+    await expect(
+      broker.authorizeClient({
+        clientAgent: { id: "codex-acp" },
+        connectionId,
+        daemonId: "host-a",
+        sessionSelectionId: "selection-b",
+        workspaceRoots: ["/tmp/selected-b"],
+      }),
+    ).resolves.toMatchObject({ ok: true });
+    await waitFor(() =>
+      forwarded.some((payload) =>
+        JSON.stringify(payload).includes("/tmp/selected-b"),
+      ),
+    );
+    expect(forwarded).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          params: expect.objectContaining({ cwd: "/tmp/selected-a" }),
+        }),
+      ]),
+    );
+
+    await expect(
+      broker.authorizeClient({
+        clientAgent: { id: "codex-acp" },
+        connectionId,
+        daemonId: "host-a",
+        sessionSelectionId: "selection-a",
+        workspaceRoots: ["/tmp/selected-a"],
+      }),
+    ).resolves.toMatchObject({ ok: true });
+
+    await expect(sessionA).resolves.toMatchObject({
+      sessionId: "session:/tmp/selected-a",
+    });
+    await expect(sessionB).resolves.toMatchObject({
+      sessionId: "session:/tmp/selected-b",
+    });
+    expect(forwarded).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          params: expect.objectContaining({ cwd: "/tmp/selected-a" }),
+        }),
+        expect.objectContaining({
+          params: expect.objectContaining({ cwd: "/tmp/selected-b" }),
+        }),
+      ]),
+    );
+
+    nativeClientSocket.close();
+    daemonSocket.close();
+  });
+
+  it("restores native session/load from remote binding metadata when client skips authenticate", async () => {
+    const broker = new AcpRelayBroker({
+      authWaitMs: 1_000,
+      controlPlaneStore: createControlPlaneStore({
+        scopes: [
+          "acp:connect",
+          "acp:session:create",
+          "acp:session:resume",
+          "acp:turn:send",
+        ],
+      }),
+      ticketSigningKey,
+    });
+    const connectionId = "conn-session-load-bootstrap";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    let forwardedSessionLoad: AnyMessage | undefined;
+
+    bindBrokerClientSocket(broker, connectionId, relayClientSocket);
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    daemonSocket.addEventListener("message", (event) => {
+      const frame = assertAcpRemoteFrame(JSON.parse(String(event.data)));
+      if (frame.frameType !== AcpRemoteFrameType.Data) {
+        return;
+      }
+      const payload = frame.payload as AnyMessage;
+      if (
+        "id" in payload &&
+        "method" in payload &&
+        payload.method === "session/load"
+      ) {
+        forwardedSessionLoad = payload;
+        daemonSocket.send(
+          JSON.stringify({
+            channelId: "acp",
+            channelKind: AcpRemoteChannelKind.Acp,
+            connectionId,
+            frameType: AcpRemoteFrameType.Data,
+            payload: {
+              id: payload.id,
+              jsonrpc: "2.0",
+              result: { sessionId: "session-loaded" },
+            },
+            seq: 1,
+          } satisfies AcpRemoteDataFrame),
+        );
+      }
+    });
+
+    broker.registerDaemon("host-a", relayDaemonSocket, {
+      agentTypes: [{ id: "codex-acp", label: "Codex" }],
+      workspaceRoots: [{ path: "/tmp" }],
+    });
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+
+    const clientConnection = createClientConnection(nativeClientSocket);
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+
+    const loadSession = clientConnection.loadSession({
+      cwd: "/tmp/project",
+      mcpServers: [],
+      sessionId: "session-existing",
+      _meta: {
+        "acp-runtime/remote/daemonId": "host-a",
+        "acp-runtime/remote/sessionAgent": { id: "codex-acp" },
+        "acp-runtime/remote/sessionWorkspaceRoots": ["/tmp/selected-project"],
+      },
+    } as Parameters<typeof clientConnection.loadSession>[0]);
+
+    await expect(loadSession).resolves.toMatchObject({
+      sessionId: "session-loaded",
+    });
+    expect(forwardedSessionLoad).toMatchObject({
+      params: {
+        cwd: "/tmp/selected-project",
+        sessionId: "session-existing",
+        _meta: {
+          "acp-runtime/remote/sessionAgent": { id: "codex-acp" },
+          "acp-runtime/remote/sessionWorkspaceRoots": [
+            "/tmp/selected-project",
+          ],
+        },
+      },
+    });
+
+    nativeClientSocket.close();
+    daemonSocket.close();
+  });
+
+  it("persists remote session bindings and restores later loads without client metadata", async () => {
+    const store = createControlPlaneStore({
+      scopes: [
+        "acp:connect",
+        "acp:session:create",
+        "acp:session:resume",
+      ],
+    });
+    const broker = new AcpRelayBroker({
+      authWaitMs: 1_000,
+      controlPlaneStore: store,
+      ticketSigningKey,
+    });
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const firstConnectionId = "conn-persist-binding-new";
+    const secondConnectionId = "conn-persist-binding-load";
+    const [firstNativeSocket, firstRelayClientSocket] = createMemoryWebSocketPair();
+    const [secondNativeSocket, secondRelayClientSocket] =
+      createMemoryWebSocketPair();
+    let restoredLoadPayload: AnyMessage | undefined;
+
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    daemonSocket.addEventListener("message", (event) => {
+      const frame = assertAcpRemoteFrame(JSON.parse(String(event.data)));
+      if (frame.frameType !== AcpRemoteFrameType.Data) {
+        return;
+      }
+      const payload = frame.payload as AnyMessage;
+      if (!("id" in payload) || !("method" in payload)) {
+        return;
+      }
+      if (payload.method === "session/new") {
+        daemonSocket.send(
+          JSON.stringify({
+            channelId: "acp",
+            channelKind: AcpRemoteChannelKind.Acp,
+            connectionId: frame.connectionId,
+            frameType: AcpRemoteFrameType.Data,
+            payload: {
+              id: payload.id,
+              jsonrpc: "2.0",
+              result: {
+                _meta: {
+                  "acp-runtime/remote/daemonId": "host-a",
+                  "acp-runtime/remote/sessionAgent": { id: "codex-acp" },
+                  "acp-runtime/remote/sessionWorkspaceRoots": [
+                    "/tmp/persisted-project",
+                  ],
+                },
+                sessionId: "persisted-session",
+              },
+            },
+            seq: frame.seq + 100,
+          } satisfies AcpRemoteDataFrame),
+        );
+      }
+      if (payload.method === "session/load") {
+        restoredLoadPayload = payload;
+        daemonSocket.send(
+          JSON.stringify({
+            channelId: "acp",
+            channelKind: AcpRemoteChannelKind.Acp,
+            connectionId: frame.connectionId,
+            frameType: AcpRemoteFrameType.Data,
+            payload: {
+              id: payload.id,
+              jsonrpc: "2.0",
+              result: { sessionId: "persisted-session" },
+            },
+            seq: frame.seq + 200,
+          } satisfies AcpRemoteDataFrame),
+        );
+      }
+    });
+
+    broker.registerDaemon("host-a", relayDaemonSocket, {
+      agentTypes: [{ id: "codex-acp", label: "Codex" }],
+      workspaceRoots: [{ path: "/tmp" }],
+    });
+    bindBrokerClientSocket(broker, firstConnectionId, firstRelayClientSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${firstConnectionId}`,
+      connectionId: firstConnectionId,
+      socket: firstRelayClientSocket,
+    });
+
+    const firstClient = createClientConnection(firstNativeSocket);
+    const firstSession = firstClient.newSession({
+      cwd: "/tmp/project",
+      mcpServers: [],
+    });
+    await broker.authorizeClient({
+      clientAgent: { id: "codex-acp" },
+      connectionId: firstConnectionId,
+      daemonId: "host-a",
+      workspaceRoots: ["/tmp/persisted-project"],
+    });
+    await expect(firstSession).resolves.toMatchObject({
+      sessionId: "persisted-session",
+    });
+    await waitForSessionBinding(store, "persisted-session");
+
+    bindBrokerClientSocket(broker, secondConnectionId, secondRelayClientSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${secondConnectionId}`,
+      connectionId: secondConnectionId,
+      socket: secondRelayClientSocket,
+    });
+    const secondClient = createClientConnection(secondNativeSocket);
+
+    await expect(
+      secondClient.loadSession({
+        cwd: "/tmp/project",
+        mcpServers: [],
+        sessionId: "persisted-session",
+      }),
+    ).resolves.toMatchObject({ sessionId: "persisted-session" });
+    expect(restoredLoadPayload).toMatchObject({
+      params: {
+        _meta: {
+          "acp-runtime/remote/sessionAgent": { id: "codex-acp" },
+          "acp-runtime/remote/sessionWorkspaceRoots": [
+            "/tmp/persisted-project",
+          ],
+        },
+        cwd: "/tmp/persisted-project",
+        sessionId: "persisted-session",
+      },
+    });
+
+    firstNativeSocket.close();
+    secondNativeSocket.close();
+    daemonSocket.close();
+  });
+
+  it("allows native session/new bootstrap to resume after a pre-authorization client reconnect", async () => {
+    let now = new Date("2026-04-27T00:00:00.000Z");
+    const broker = new AcpRelayBroker({
+      authWaitMs: 1_000,
+      clientReconnectGraceMs: 100,
+      controlPlaneStore: createControlPlaneStore(),
+      now: () => now,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-session-new-preauth-reconnect";
+    const [, firstRelayClientSocket] = createMemoryWebSocketPair();
+    const [, secondRelayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    let forwardedSessionNew: AnyMessage | undefined;
+
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    daemonSocket.addEventListener("message", (event) => {
+      const frame = assertAcpRemoteFrame(JSON.parse(String(event.data)));
+      if (frame.frameType !== AcpRemoteFrameType.Data) {
+        return;
+      }
+      const payload = frame.payload as AnyMessage;
+      if (
+        "id" in payload &&
+        "method" in payload &&
+        payload.method === "session/new"
+      ) {
+        forwardedSessionNew = payload;
+      }
+    });
+
+    broker.registerDaemon("host-a", relayDaemonSocket, {
+      agentTypes: [{ id: "codex-acp", label: "Codex" }],
+      workspaceRoots: [{ path: "/tmp" }],
+    });
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      nativeClientAck: true,
+      socket: firstRelayClientSocket,
+    });
+
+    const sessionNew = broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "session/new",
+        params: {
+          cwd: "/tmp/project",
+          mcpServers: [],
+        },
+      }),
+    );
+
+    broker.removeClient(connectionId, firstRelayClientSocket);
+    expect(broker.hasPendingClientReconnects()).toBe(true);
+
+    now = new Date("2026-04-27T00:00:00.050Z");
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: secondRelayClientSocket,
+    });
+    expect(broker.hasPendingClientReconnects()).toBe(false);
+
+    await expect(
+      broker.authorizeClient({
+        clientAgent: { id: "codex-acp" },
+        connectionId,
+        daemonId: "host-a",
+        workspaceRoots: ["/tmp/selected-project"],
+      }),
+    ).resolves.toMatchObject({ ok: true });
+    await sessionNew;
+
+    expect(forwardedSessionNew).toMatchObject({
+      params: {
+        cwd: "/tmp/selected-project",
+        _meta: {
+          "acp-runtime/remote/sessionAgent": { id: "codex-acp" },
+          "acp-runtime/remote/sessionWorkspaceRoots": [
+            "/tmp/selected-project",
+          ],
+        },
+      },
+    });
+
+    daemonSocket.close();
+  });
+
   it("bootstraps a native ACP client, authorizes a host, then forwards ACP frames", async () => {
     const broker = new AcpRelayBroker({
       authWaitMs: 1_000,
@@ -93,24 +1009,26 @@ describe("AcpRelayBroker", () => {
       "host-a",
     ]);
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({
       ok: true,
     });
     await expect(authentication).resolves.toMatchObject({
       _meta: {
-        "acp-runtime/remote/hostId": "host-a",
+        "acp-runtime/remote/daemonId": "host-a",
         "acp-runtime/remote/ticketKid": "test-key",
       },
     });
     expect(observedTicketKid).toBe("test-key");
 
+    const newSession = clientConnection.newSession({
+      cwd: "/tmp/project",
+      mcpServers: [],
+    });
     await expect(
-      clientConnection.newSession({
-        cwd: "/tmp/project",
-        mcpServers: [],
-      }),
-    ).resolves.toMatchObject({
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await expect(newSession).resolves.toMatchObject({
       sessionId: "session-1",
     });
 
@@ -152,9 +1070,9 @@ describe("AcpRelayBroker", () => {
       controlPlaneStore: new AcpRelayInMemoryControlPlaneStore({
         accounts: [{ accountId: "acct-1" }],
         clientDevices: [
-          { accountId: "acct-1", clientDeviceId: "native-acp-client" },
+          { accountId: "acct-1", clientId: "native-acp-client" },
         ],
-        hosts: [{ accountId: "acct-1", hostId: "host-a" }],
+        hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
       }),
       ticketSigningKey,
     });
@@ -172,7 +1090,7 @@ describe("AcpRelayBroker", () => {
     await expect(
       broker.authorizeClient({
         connectionId: "conn-no-grant",
-        hostId: "host-a",
+        daemonId: "host-a",
       }),
     ).resolves.toMatchObject({
       ok: false,
@@ -183,23 +1101,23 @@ describe("AcpRelayBroker", () => {
     );
   });
 
-  it("renews near-expiry tickets through explicit ACP authenticate", async () => {
+  it("renews near-expiry tickets before forwarding bound ACP traffic", async () => {
     let now = new Date("2026-04-27T00:00:00.000Z");
     const broker = new AcpRelayBroker({
       controlPlaneStore: new AcpRelayInMemoryControlPlaneStore({
         accounts: [{ accountId: "acct-1" }],
         clientDevices: [
-          { accountId: "acct-1", clientDeviceId: "native-acp-client" },
+          { accountId: "acct-1", clientId: "native-acp-client" },
         ],
         grants: [
           {
             accountId: "acct-1",
-            hostId: "host-a",
+            daemonId: "host-a",
             policyVersion: 7,
             scopes: ["acp:connect", "acp:session:list"],
           },
         ],
-        hosts: [{ accountId: "acct-1", hostId: "host-a" }],
+        hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
       }),
       now: () => now,
       ticketRenewBeforeMs: 900,
@@ -226,7 +1144,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
     await waitFor(() =>
       frames.some((frame) => frame.frameType === AcpRemoteFrameType.Hello),
@@ -255,32 +1173,6 @@ describe("AcpRelayBroker", () => {
       }),
     );
 
-    await waitFor(() => clientMessages.length > 0);
-    expect(clientMessages[0]).toMatchObject({
-      error: {
-        code: -32000,
-        message: "Authentication required: ACP remote ticket renewal required.",
-      },
-      id: 1,
-      jsonrpc: "2.0",
-    });
-    expect(
-      frames.some((frame) => frame.frameType === AcpRemoteFrameType.Data),
-    ).toBe(false);
-    clientMessages.length = 0;
-
-    await broker.handleClientText(
-      connectionId,
-      JSON.stringify({
-        id: "renew",
-        jsonrpc: "2.0",
-        method: "authenticate",
-        params: {
-          methodId: "acp-runtime-browser",
-        },
-      }),
-    );
-
     await waitFor(
       () => frames.some((frame) => frame.frameType === AcpRemoteFrameType.Renew),
     );
@@ -297,29 +1189,219 @@ describe("AcpRelayBroker", () => {
     expect(renewFrame.ticket.payload.issuedAt).toBe(
       "2026-04-27T00:00:00.200Z",
     );
+    expect(
+      frames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          (frame.payload as { id?: unknown }).id === 1,
+      ),
+    ).toBe(true);
+    expect(clientMessages).toEqual([]);
+  });
+
+  it("renews near-expiry tickets through explicit ACP authenticate", async () => {
+    let now = new Date("2026-04-27T00:00:00.000Z");
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: new AcpRelayInMemoryControlPlaneStore({
+        accounts: [{ accountId: "acct-1" }],
+        clientDevices: [
+          { accountId: "acct-1", clientId: "native-acp-client" },
+        ],
+        grants: [
+          {
+            accountId: "acct-1",
+            daemonId: "host-a",
+            policyVersion: 7,
+            scopes: ["acp:connect"],
+          },
+        ],
+        hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
+      }),
+      now: () => now,
+      ticketRenewBeforeMs: 900,
+      ticketSigningKey,
+      ticketTtlMs: 1_000,
+    });
+    const connectionId = "conn-explicit-renew";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const frames: AcpRemoteFrame[] = [];
+    const clientMessages: unknown[] = [];
+    daemonSocket.addEventListener("message", (event) => {
+      frames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    nativeClientSocket.addEventListener("message", (event) => {
+      clientMessages.push(JSON.parse(String(event.data)));
+    });
+
+    broker.registerDaemon("host-a", relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "auth",
+        jsonrpc: "2.0",
+        method: "authenticate",
+        params: {
+          methodId: "acp-runtime-browser",
+        },
+      }),
+    );
+    frames.length = 0;
+    clientMessages.length = 0;
+
+    now = new Date("2026-04-27T00:00:00.200Z");
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "renew",
+        jsonrpc: "2.0",
+        method: "authenticate",
+        params: {
+          methodId: "acp-runtime-browser",
+        },
+      }),
+    );
+    await waitFor(() =>
+      frames.some((frame) => frame.frameType === AcpRemoteFrameType.Renew),
+    );
     await waitFor(() => clientMessages.length > 0);
     expect(clientMessages[0]).toMatchObject({
       id: "renew",
       jsonrpc: "2.0",
       result: {
         _meta: {
-          "acp-runtime/remote/hostId": "host-a",
+          "acp-runtime/remote/daemonId": "host-a",
         },
       },
     });
+  });
+
+  it("renews near-expiry tickets before forwarding native session/new selections", async () => {
+    let now = new Date("2026-04-27T00:00:00.000Z");
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: new AcpRelayInMemoryControlPlaneStore({
+        accounts: [{ accountId: "acct-1" }],
+        clientDevices: [
+          { accountId: "acct-1", clientId: "native-acp-client" },
+        ],
+        grants: [
+          {
+            accountId: "acct-1",
+            daemonId: "host-a",
+            policyVersion: 7,
+            scopes: ["acp:connect", "acp:session:create"],
+          },
+        ],
+        hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
+      }),
+      now: () => now,
+      ticketRenewBeforeMs: 900,
+      ticketSigningKey,
+      ticketTtlMs: 1_000,
+    });
+    const connectionId = "conn-session-open-renew";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const frames: AcpRemoteFrame[] = [];
+    let sessionNewPayload: AnyMessage | undefined;
+
+    bindBrokerClientSocket(broker, connectionId, relayClientSocket);
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    daemonSocket.addEventListener("message", (event) => {
+      const frame = assertAcpRemoteFrame(JSON.parse(String(event.data)));
+      frames.push(frame);
+      if (frame.frameType !== AcpRemoteFrameType.Data) {
+        return;
+      }
+      const payload = frame.payload as AnyMessage;
+      if (
+        "id" in payload &&
+        "method" in payload &&
+        payload.method === "session/new"
+      ) {
+        sessionNewPayload = payload;
+        daemonSocket.send(
+          JSON.stringify({
+            channelId: "acp",
+            channelKind: AcpRemoteChannelKind.Acp,
+            connectionId,
+            frameType: AcpRemoteFrameType.Data,
+            payload: {
+              id: payload.id,
+              jsonrpc: "2.0",
+              result: { sessionId: "renewed-session" },
+            },
+            seq: 1,
+          } satisfies AcpRemoteDataFrame),
+        );
+      }
+    });
+
+    broker.registerDaemon("host-a", relayDaemonSocket, {
+      agentTypes: [{ id: "codex-acp", label: "Codex" }],
+      workspaceRoots: [{ path: "/tmp" }],
+    });
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+
+    const clientConnection = createClientConnection(nativeClientSocket);
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+    await clientConnection.authenticate({
+      methodId: "acp-runtime-browser",
+    });
     frames.length = 0;
 
-    await broker.handleClientText(
-      connectionId,
-      JSON.stringify({
-        id: 2,
-        jsonrpc: "2.0",
-        method: "session/list",
+    now = new Date("2026-04-27T00:00:00.200Z");
+    const newSession = clientConnection.newSession({
+      cwd: "/tmp/project",
+      mcpServers: [],
+    });
+    await expect(
+      broker.authorizeClient({
+        clientAgent: { id: "codex-acp" },
+        connectionId,
+        daemonId: "host-a",
+        workspaceRoots: ["/tmp/project"],
       }),
-    );
-    await waitFor(() =>
-      frames.some((frame) => frame.frameType === AcpRemoteFrameType.Data),
-    );
+    ).resolves.toMatchObject({ ok: true });
+
+    await expect(newSession).resolves.toMatchObject({
+      sessionId: "renewed-session",
+    });
+    expect(
+      frames.some((frame) => frame.frameType === AcpRemoteFrameType.Renew),
+    ).toBe(true);
+    expect(sessionNewPayload).toMatchObject({
+      params: {
+        cwd: "/tmp/project",
+        _meta: {
+          "acp-runtime/remote/sessionAgent": { id: "codex-acp" },
+          "acp-runtime/remote/sessionWorkspaceRoots": ["/tmp/project"],
+        },
+      },
+    });
+
+    nativeClientSocket.close();
+    daemonSocket.close();
   });
 
   it("renews first-party client tickets with a device-signed proof", async () => {
@@ -331,20 +1413,20 @@ describe("AcpRelayBroker", () => {
         clientDevices: [
           {
             accountId: "acct-1",
-            clientDeviceId: "client-1",
+            clientId: "client-1",
             publicKey: deviceKeyPair.publicKey,
           },
         ],
         grants: [
           {
             accountId: "acct-1",
-            clientDeviceId: "client-1",
-            hostId: "host-a",
+            clientId: "client-1",
+            daemonId: "host-a",
             policyVersion: 7,
             scopes: ["acp:connect", "acp:session:list"],
           },
         ],
-        hosts: [{ accountId: "acct-1", hostId: "host-a" }],
+        hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
       }),
       now: () => now,
       ticketSigningKey,
@@ -362,13 +1444,13 @@ describe("AcpRelayBroker", () => {
     broker.registerClient({
       accountId: "acct-1",
       authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
-      clientDeviceId: "client-1",
+      clientId: "client-1",
       connectionId,
       socket: relayClientSocket,
     });
     const authorization = await broker.authorizeClient({
       connectionId,
-      hostId: "host-a",
+      daemonId: "host-a",
     });
     expect(authorization).toMatchObject({ ok: true });
     if (!authorization.ok) {
@@ -378,9 +1460,9 @@ describe("AcpRelayBroker", () => {
     now = new Date("2026-04-27T00:00:00.500Z");
     const proofInput = {
       accountId: "acct-1",
-      clientDeviceId: "client-1",
+      clientId: "client-1",
       connectionId,
-      hostId: "host-a",
+      daemonId: "host-a",
       nonce: "nonce-device-renew",
       ticketJti: authorization.ticket.payload.jti,
       timestamp: String(now.getTime()),
@@ -395,7 +1477,7 @@ describe("AcpRelayBroker", () => {
 
     expect(result).toMatchObject({
       connectionId,
-      hostId: "host-a",
+      daemonId: "host-a",
       ok: true,
     });
     if (!result.ok) {
@@ -422,17 +1504,17 @@ describe("AcpRelayBroker", () => {
     const broker = new AcpRelayBroker({
       controlPlaneStore: new AcpRelayInMemoryControlPlaneStore({
         accounts: [{ accountId: "acct-1" }],
-        clientDevices: [{ accountId: "acct-1", clientDeviceId: "client-1" }],
+        clientDevices: [{ accountId: "acct-1", clientId: "client-1" }],
         grants: [
           {
             accountId: "acct-1",
-            clientDeviceId: "client-1",
-            hostId: "host-a",
+            clientId: "client-1",
+            daemonId: "host-a",
             policyVersion: 7,
             scopes: ["acp:connect", "fs:read", "terminal:start"],
           },
         ],
-        hosts: [{ accountId: "acct-1", hostId: "host-a" }],
+        hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
       }),
       ticketSigningKey,
     });
@@ -454,14 +1536,14 @@ describe("AcpRelayBroker", () => {
     broker.registerClient({
       accountId: "acct-1",
       authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
-      clientDeviceId: "client-1",
+      clientId: "client-1",
       connectionId,
-      hostId: "host-a",
+      daemonId: "host-a",
       socket: relayClientSocket,
       transport: "remote-frame",
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
 
     remoteClientSocket.send(
@@ -573,7 +1655,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
     await waitFor(() =>
       daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Hello),
@@ -594,23 +1676,24 @@ describe("AcpRelayBroker", () => {
 
     store.upsertGrant({
       accountId: "acct-1",
-      hostId: "host-a",
+      daemonId: "host-a",
       policyVersion: 8,
       revoked: true,
       scopes: ["acp:connect", "acp:session:create", "acp:turn:send"],
     });
-    await broker.handleClientText(
+    const turnMessage = broker.handleClientText(
       connectionId,
       JSON.stringify({
         id: 1,
         jsonrpc: "2.0",
-        method: "session/new",
+        method: "session/prompt",
         params: {
-          cwd: "/tmp/project",
-          mcpServers: [],
+          prompt: [{ text: "hello", type: "text" }],
+          sessionId: "session-1",
         },
       }),
     );
+    await turnMessage;
 
     await waitFor(
       () =>
@@ -658,7 +1741,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
     await broker.handleClientText(
       connectionId,
@@ -675,7 +1758,7 @@ describe("AcpRelayBroker", () => {
 
     store.upsertGrant({
       accountId: "acct-1",
-      hostId: "host-a",
+      daemonId: "host-a",
       policyVersion: 8,
       revoked: true,
       scopes: ["acp:connect", "acp:session:create", "acp:turn:send"],
@@ -724,7 +1807,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
     await waitFor(() =>
       daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Hello),
@@ -795,7 +1878,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
 
     broker.removeDaemon("host-a", relayDaemonSocket);
@@ -833,7 +1916,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
     await broker.handleClientText(
       connectionId,
@@ -860,7 +1943,7 @@ describe("AcpRelayBroker", () => {
     expect(broker.hasPendingDaemonReconnects()).toBe(false);
     daemonFrames.length = 0;
 
-    await broker.handleClientText(
+    const sessionMessage = broker.handleClientText(
       connectionId,
       JSON.stringify({
         id: 1,
@@ -872,6 +1955,10 @@ describe("AcpRelayBroker", () => {
         },
       }),
     );
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await sessionMessage;
 
     await waitFor(() =>
       daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Data),
@@ -903,7 +1990,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
 
     broker.removeDaemon("host-a", relayDaemonSocket);
@@ -936,10 +2023,11 @@ describe("AcpRelayBroker", () => {
       accountId: "acct-1",
       authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
       connectionId,
+      nativeClientAck: true,
       socket: firstRelayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
     await broker.handleClientText(
       connectionId,
@@ -972,7 +2060,7 @@ describe("AcpRelayBroker", () => {
     });
     expect(broker.hasPendingClientReconnects()).toBe(false);
 
-    await broker.handleClientText(
+    const sessionMessage = broker.handleClientText(
       connectionId,
       JSON.stringify({
         id: 1,
@@ -984,6 +2072,10 @@ describe("AcpRelayBroker", () => {
         },
       }),
     );
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await sessionMessage;
 
     await waitFor(() =>
       daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Data),
@@ -1022,7 +2114,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
     await broker.handleClientText(
       connectionId,
@@ -1069,6 +2161,99 @@ describe("AcpRelayBroker", () => {
     });
   });
 
+  it("replays unacknowledged native ACP responses after client reconnect", async () => {
+    let now = new Date("2026-04-27T00:00:00.000Z");
+    const broker = new AcpRelayBroker({
+      clientReconnectGraceMs: 100,
+      controlPlaneStore: createControlPlaneStore(),
+      now: () => now,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-native-response-replay";
+    const [firstNativeSocket, firstRelayClientSocket] = createMemoryWebSocketPair();
+    const [resumedNativeSocket, resumedRelayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const firstMessages: unknown[] = [];
+    const resumedMessages: unknown[] = [];
+    const daemonFrames: AcpRemoteFrame[] = [];
+
+    firstNativeSocket.addEventListener("message", (event) => {
+      firstMessages.push(JSON.parse(String(event.data)));
+    });
+    resumedNativeSocket.addEventListener("message", (event) => {
+      resumedMessages.push(JSON.parse(String(event.data)));
+    });
+    daemonSocket.addEventListener("message", (event) => {
+      daemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    bindBrokerClientSocket(broker, connectionId, firstRelayClientSocket);
+    bindBrokerClientSocket(broker, connectionId, resumedRelayClientSocket);
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+
+    broker.registerDaemon("host-a", relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      nativeClientAck: true,
+      socket: firstRelayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    daemonFrames.length = 0;
+
+    daemonSocket.send(
+      JSON.stringify({
+        channelId: "acp",
+        channelKind: AcpRemoteChannelKind.Acp,
+        connectionId,
+        frameType: AcpRemoteFrameType.Data,
+        payload: {
+          id: 1,
+          jsonrpc: "2.0",
+          result: { sessionId: "session-1" },
+        },
+        seq: 41,
+      } satisfies AcpRemoteDataFrame),
+    );
+
+    await waitFor(() => firstMessages.length > 0);
+    expect(firstMessages[0]).toMatchObject({ id: 1, jsonrpc: "2.0" });
+    expect(
+      daemonFrames.some(
+        (frame) => frame.frameType === AcpRemoteFrameType.Ack && frame.ack === 41,
+      ),
+    ).toBe(false);
+
+    broker.removeClient(connectionId, firstRelayClientSocket);
+    now = new Date("2026-04-27T00:00:00.050Z");
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      nativeClientAck: true,
+      socket: resumedRelayClientSocket,
+    });
+
+    await waitFor(() => resumedMessages.length > 0);
+    expect(resumedMessages[0]).toMatchObject({ id: 1, jsonrpc: "2.0" });
+
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "acp-runtime/remote/client_ack",
+        params: { id: 1 },
+      }),
+    );
+    await waitFor(() =>
+      daemonFrames.some(
+        (frame) => frame.frameType === AcpRemoteFrameType.Ack && frame.ack === 41,
+      ),
+    );
+  });
+
   it("expires disconnected client routes after reconnect grace", async () => {
     let now = new Date("2026-04-27T00:00:00.000Z");
     const broker = new AcpRelayBroker({
@@ -1093,7 +2278,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
     await broker.handleClientText(
       connectionId,
@@ -1154,7 +2339,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
     await broker.handleClientText(
       connectionId,
@@ -1167,7 +2352,7 @@ describe("AcpRelayBroker", () => {
         },
       }),
     );
-    await broker.handleClientText(
+    const sessionMessage = broker.handleClientText(
       connectionId,
       JSON.stringify({
         id: 1,
@@ -1179,6 +2364,10 @@ describe("AcpRelayBroker", () => {
         },
       }),
     );
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await sessionMessage;
 
     broker.removeDaemon("host-a", firstRelayDaemonSocket);
     now = new Date("2026-04-27T00:00:00.050Z");
@@ -1215,7 +2404,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
 
     broker.handleDaemonText(
@@ -1228,6 +2417,94 @@ describe("AcpRelayBroker", () => {
     );
 
     await waitFor(() => nativeClosed);
+  });
+
+  it("accepts low daemon seq numbers after daemon reconnect", async () => {
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore(),
+      ticketSigningKey,
+    });
+    const connectionId = "conn-daemon-seq-reset";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [, firstRelayDaemonSocket] = createMemoryWebSocketPair();
+    const [, secondRelayDaemonSocket] = createMemoryWebSocketPair();
+    const clientMessages: unknown[] = [];
+    nativeClientSocket.addEventListener("message", (event) => {
+      clientMessages.push(JSON.parse(String(event.data)));
+    });
+
+    broker.registerDaemon("host-a", firstRelayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+
+    broker.handleDaemonText(
+      JSON.stringify({
+        channelId: "acp",
+        channelKind: AcpRemoteChannelKind.Acp,
+        connectionId,
+        frameType: AcpRemoteFrameType.Data,
+        payload: {
+          id: "before",
+          jsonrpc: "2.0",
+          result: {},
+        },
+        seq: 30,
+      } satisfies AcpRemoteDataFrame),
+    );
+    await waitFor(() =>
+      clientMessages.some(
+        (message) =>
+          typeof message === "object" &&
+          message !== null &&
+          "id" in message &&
+          message.id === "before",
+      ),
+    );
+    clientMessages.length = 0;
+
+    broker.removeDaemon("host-a", firstRelayDaemonSocket);
+    broker.registerDaemon("host-a", secondRelayDaemonSocket);
+    broker.handleDaemonText(
+      JSON.stringify({
+        channelId: "acp",
+        channelKind: AcpRemoteChannelKind.Acp,
+        connectionId,
+        frameType: AcpRemoteFrameType.Data,
+        payload: {
+          error: {
+            code: -32602,
+            message: "Invalid params: Unknown remote runtime session.",
+          },
+          id: "after",
+          jsonrpc: "2.0",
+        },
+        seq: 1,
+      } satisfies AcpRemoteDataFrame),
+    );
+
+    await waitFor(() =>
+      clientMessages.some(
+        (message) =>
+          typeof message === "object" &&
+          message !== null &&
+          "id" in message &&
+          message.id === "after",
+      ),
+    );
+    expect(clientMessages[0]).toMatchObject({
+      error: {
+        code: -32602,
+      },
+      id: "after",
+      jsonrpc: "2.0",
+    });
   });
 
   it("pings daemons and records matching pong frames", async () => {
@@ -1293,7 +2570,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
 
     broker.pingDaemons();
@@ -1367,7 +2644,7 @@ describe("AcpRelayBroker", () => {
     for (const { connectionId } of registrations) {
       const result = await broker.authorizeClient({
         connectionId,
-        hostId: "host-a",
+        daemonId: "host-a",
       });
       expect(result).toMatchObject({ ok: true });
     }
@@ -1405,7 +2682,7 @@ describe("AcpRelayBroker", () => {
       });
       const auth = await broker.authorizeClient({
         connectionId: `conn-bulk-${i}`,
-        hostId: "host-a",
+        daemonId: "host-a",
       });
       expect(auth).toMatchObject({ ok: true });
     }
@@ -1427,7 +2704,7 @@ describe("AcpRelayBroker", () => {
 
     store.upsertGrant({
       accountId: "acct-1",
-      hostId: "host-a",
+      daemonId: "host-a",
       policyVersion: 8,
       revoked: true,
       scopes: ["acp:connect"],
@@ -1451,7 +2728,7 @@ describe("AcpRelayBroker", () => {
     });
 
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({
       ok: false,
       reason: "Relay ticket signing key is not configured.",
@@ -1465,7 +2742,7 @@ describe("AcpRelayBroker", () => {
     });
 
     await expect(
-      broker.authorizeClient({ connectionId: "nonexistent", hostId: "host-a" }),
+      broker.authorizeClient({ connectionId: "nonexistent", daemonId: "host-a" }),
     ).resolves.toMatchObject({
       ok: false,
       reason: "Unknown ACP connection.",
@@ -1487,7 +2764,7 @@ describe("AcpRelayBroker", () => {
     });
 
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({
       ok: false,
       reason: "Host daemon is not online.",
@@ -1515,7 +2792,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
 
     broker.handleDaemonText(
@@ -1539,7 +2816,7 @@ describe("AcpRelayBroker", () => {
     });
     const connectionId = "conn-invalid-jsonrpc";
     const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
-    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const [, relayDaemonSocket] = createMemoryWebSocketPair();
     let nativeClosed = false;
     nativeClientSocket.addEventListener("close", () => {
       nativeClosed = true;
@@ -1555,7 +2832,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
 
     await broker.handleClientText(connectionId, "not valid json rpc");
@@ -1583,9 +2860,9 @@ describe("AcpRelayBroker", () => {
     broker.registerClient({
       accountId: "acct-1",
       authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
-      clientDeviceId: "client-1",
+      clientId: "client-1",
       connectionId,
-      hostId: "host-a",
+      daemonId: "host-a",
       socket: relayClientSocket,
       transport: "remote-frame",
     });
@@ -1652,7 +2929,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
 
     await waitFor(() =>
@@ -1688,7 +2965,7 @@ describe("AcpRelayBroker", () => {
       socket: relayClientSocket,
     });
     await expect(
-      broker.authorizeClient({ connectionId, hostId: "host-a" }),
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
 
     const clientConnection = createClientConnection(nativeClientSocket);
@@ -1749,9 +3026,9 @@ describe("AcpRelayBroker", () => {
     broker.registerClient({
       accountId: "acct-1",
       authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
-      clientDeviceId: "client-1",
+      clientId: "client-1",
       connectionId,
-      hostId: "host-a",
+      daemonId: "host-a",
       socket: relayClientSocket,
       transport: "remote-frame",
     });
@@ -1783,86 +3060,26 @@ const ticketSigningKey = {
   secret: "relay-ticket-secret",
 };
 
-function createControlPlaneStore(): AcpRelayInMemoryControlPlaneStore {
+function createControlPlaneStore(input: {
+  scopes?: readonly AcpRemoteScope[];
+} = {}): AcpRelayInMemoryControlPlaneStore {
   return new AcpRelayInMemoryControlPlaneStore({
     accounts: [{ accountId: "acct-1" }],
-    clientDevices: [{ accountId: "acct-1", clientDeviceId: "native-acp-client" }],
+    clientDevices: [{ accountId: "acct-1", clientId: "native-acp-client" }],
     grants: [
       {
         accountId: "acct-1",
-        hostId: "host-a",
+        daemonId: "host-a",
         policyVersion: 7,
-        scopes: [
+        scopes: input.scopes ?? [
           "acp:connect",
           "acp:session:create",
           "acp:turn:send",
         ],
       },
     ],
-    hosts: [{ accountId: "acct-1", hostId: "host-a" }],
+    hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
   });
-}
-
-class MemoryWebSocket {
-  private readonly closeListeners = new Set<() => void>();
-  private readonly messageListeners = new Set<(event: { data: unknown }) => void>();
-  private closed = false;
-  peer?: MemoryWebSocket;
-
-  addEventListener(type: "close" | "error", listener: () => void): void;
-  addEventListener(type: "message", listener: (event: { data: unknown }) => void): void;
-  addEventListener(
-    type: "close" | "error" | "message",
-    listener: (() => void) | ((event: { data: unknown }) => void),
-  ): void {
-    if (type === "message") {
-      this.messageListeners.add(listener as (event: { data: unknown }) => void);
-    } else {
-      this.closeListeners.add(listener as () => void);
-    }
-  }
-
-  close(): void {
-    if (this.closed) {
-      return;
-    }
-    this.closed = true;
-    for (const listener of this.closeListeners) {
-      listener();
-    }
-    this.peer?.close();
-  }
-
-  removeEventListener(type: "close" | "error", listener: () => void): void;
-  removeEventListener(type: "message", listener: (event: { data: unknown }) => void): void;
-  removeEventListener(
-    type: "close" | "error" | "message",
-    listener: (() => void) | ((event: { data: unknown }) => void),
-  ): void {
-    if (type === "message") {
-      this.messageListeners.delete(listener as (event: { data: unknown }) => void);
-    } else {
-      this.closeListeners.delete(listener as () => void);
-    }
-  }
-
-  send(data: string): void {
-    if (this.closed) {
-      return;
-    }
-    queueMicrotask(() => {
-      this.peer?.receive(data);
-    });
-  }
-
-  private receive(data: string): void {
-    if (this.closed) {
-      return;
-    }
-    for (const listener of this.messageListeners) {
-      listener({ data });
-    }
-  }
 }
 
 function createClientConnection(socket: MemoryWebSocket): ClientSideConnection {
@@ -1883,12 +3100,22 @@ function createClientConnection(socket: MemoryWebSocket): ClientSideConnection {
   );
 }
 
-function createMemoryWebSocketPair(): [MemoryWebSocket, MemoryWebSocket] {
-  const left = new MemoryWebSocket();
-  const right = new MemoryWebSocket();
-  left.peer = right;
-  right.peer = left;
-  return [left, right];
+async function waitForSessionBinding(
+  store: AcpRelayInMemoryControlPlaneStore,
+  sessionId: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const binding = await store.getSessionBinding({
+      accountId: "acct-1",
+      clientId: "native-acp-client",
+      sessionId,
+    });
+    if (binding) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("Timed out waiting for persisted session binding.");
 }
 
 function bindBrokerClientSocket(
@@ -1921,14 +3148,4 @@ function isJsonRpcPayload(
     "method" in value &&
     typeof value.method === "string"
   );
-}
-
-async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    if (predicate()) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error("Timed out waiting for condition.");
 }

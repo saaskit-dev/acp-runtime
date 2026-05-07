@@ -37,13 +37,13 @@ describe("ACP remote daemon host identity", () => {
 
     const first = await loadOrCreateAcpRemoteDaemonIdentity({
       accountId: "acct-1",
-      hostId: "host-1",
+      daemonId: "host-1",
       now: new Date("2026-04-27T00:00:00.000Z"),
       path,
     });
     const second = await loadOrCreateAcpRemoteDaemonIdentity({
       accountId: "acct-1",
-      hostId: "host-1",
+      daemonId: "host-1",
       now: new Date("2026-04-27T00:01:00.000Z"),
       path,
     });
@@ -56,14 +56,14 @@ describe("ACP remote daemon host identity", () => {
     const path = join(root, "host.json");
     const first = await loadOrCreateAcpRemoteDaemonIdentity({
       accountId: "acct-1",
-      hostId: "host-1",
+      daemonId: "host-1",
       now: new Date("2026-04-27T00:00:00.000Z"),
       path,
     });
 
     const rotated = await rotateAcpRemoteDaemonIdentity({
       accountId: "acct-1",
-      hostId: "host-1",
+      daemonId: "host-1",
       now: new Date("2026-04-27T00:05:00.000Z"),
       path,
     });
@@ -81,7 +81,7 @@ describe("ACP remote daemon host identity", () => {
     );
     const headers = await createAcpRemoteDaemonRegistrationHeaders({
       accountId: "acct-1",
-      hostId: "host-1",
+      daemonId: "host-1",
       identity,
       nonce: "nonce-1",
       now: new Date("2026-04-27T00:00:00.000Z"),
@@ -90,7 +90,7 @@ describe("ACP remote daemon host identity", () => {
     await expect(
       verifyDaemonRegistrationProof({
         accountId: "acct-1",
-        hostId: "host-1",
+        daemonId: "host-1",
         nonce: headers["x-acp-daemon-nonce"],
         now: new Date("2026-04-27T00:00:00.000Z"),
         publicKey: identity.publicKey,
@@ -98,6 +98,7 @@ describe("ACP remote daemon host identity", () => {
         timestamp: headers["x-acp-daemon-timestamp"],
       }),
     ).resolves.toEqual({ ok: true });
+    expect(headers["x-acp-daemon-public-key"]).toBe(identity.publicKey);
   });
 
   it("derives a host registration record from stored identity", async () => {
@@ -112,12 +113,12 @@ describe("ACP remote daemon host identity", () => {
     expect(
       createAcpRemoteDaemonHostRegistrationRecord({
         accountId: "acct-1",
-        hostId: "host-1",
+        daemonId: "host-1",
         identity,
       }),
     ).toEqual({
       accountId: "acct-1",
-      hostId: "host-1",
+      daemonId: "host-1",
       previousPublicKey: undefined,
       publicKey: identity.publicKey,
     });

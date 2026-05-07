@@ -29,8 +29,10 @@ import {
   AcpRuntimeOperationPhase,
   AcpRuntimePermissionDecisionValue,
   AcpRuntimePermissionScope,
+  AcpRuntimePromptMessageRole,
   AcpRuntimeTurnEventType,
   type AcpRuntimeAgentConfigOption,
+  type AcpRuntimeHistoryEntry,
   type AcpRuntimeMcpServer,
   type AcpRuntimeOperation,
   type AcpRuntimeOutputPart,
@@ -262,6 +264,24 @@ export function mapRuntimeTurnEventToAcpNotifications(
     sessionId,
     update,
   }));
+}
+
+export function mapRuntimeHistoryEntryToAcpNotifications(
+  sessionId: string,
+  entry: AcpRuntimeHistoryEntry,
+): SessionNotification[] {
+  if (entry.type === AcpRuntimePromptMessageRole.User) {
+    return [
+      {
+        sessionId,
+        update: {
+          content: { text: entry.text, type: "text" },
+          sessionUpdate: "user_message_chunk",
+        },
+      },
+    ];
+  }
+  return mapRuntimeTurnEventToAcpNotifications(sessionId, entry);
 }
 
 export function mapRemotePermissionRequestToAcp(

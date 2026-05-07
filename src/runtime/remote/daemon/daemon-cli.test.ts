@@ -26,7 +26,8 @@ describe("remote daemon CLI connector", () => {
       }),
     ).toEqual({
       accountId: "acct-1",
-      hostId: "host-1",
+      daemonId: "host-1",
+      forceLogin: undefined,
       identityPath: "/tmp/identity.json",
       relayUrl: "wss://relay.test",
     });
@@ -45,19 +46,52 @@ describe("remote daemon CLI connector", () => {
       }),
     ).toEqual({
       accountId: "acct-1",
-      hostId: "host-1",
+      daemonId: "host-1",
+      forceLogin: undefined,
       identityPath: "/tmp/identity.json",
       relayUrl: "wss://relay.test",
     });
   });
 
-  it("rejects incomplete relay connection config", () => {
-    expect(() =>
+  it("defaults accountId and daemonId to undefined", () => {
+    expect(
       parseAcpRemoteDaemonCliConfig({
-        argv: ["--account-id", "acct-1"],
+        argv: ["--relay-url", "wss://relay.test"],
         env: {},
       }),
-    ).toThrow("Missing remote daemon host id.");
+    ).toEqual({
+      accountId: undefined,
+      daemonId: undefined,
+      forceLogin: undefined,
+      identityPath: undefined,
+      relayUrl: "wss://relay.test",
+    });
+  });
+
+  it("parses force-login without requiring a value", () => {
+    expect(
+      parseAcpRemoteDaemonCliConfig({
+        argv: ["--force-login"],
+        env: {},
+      }),
+    ).toMatchObject({
+      forceLogin: true,
+      relayUrl: "wss://relay.saaskit.app",
+    });
+  });
+
+  it("defaults relay URL to the hosted relay", () => {
+    expect(
+      parseAcpRemoteDaemonCliConfig({
+        argv: [],
+        env: {},
+      }),
+    ).toMatchObject({
+      relayUrl: "wss://relay.saaskit.app",
+    });
+  });
+
+  it("rejects unknown relay connection config", () => {
     expect(() =>
       parseAcpRemoteDaemonCliConfig({
         argv: ["--unknown"],

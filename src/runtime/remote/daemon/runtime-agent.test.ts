@@ -8,9 +8,13 @@ import {
 } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
 
+import { AcpProcessError } from "../../core/errors.js";
 import { AcpRuntimeTurnEventType } from "../../core/types.js";
 import type { AcpRuntimeSession } from "../../core/session.js";
-import type { AcpRuntimePrompt } from "../../core/types.js";
+import type {
+  AcpRuntimeHistoryEntry,
+  AcpRuntimePrompt,
+} from "../../core/types.js";
 import { createAcpRemoteRuntimeAgent } from "./runtime-agent.js";
 
 describe("AcpRemoteRuntimeAgent", () => {
@@ -58,7 +62,10 @@ describe("AcpRemoteRuntimeAgent", () => {
               command: "fake-agent",
               type: "fake",
             },
+            remoteDaemonId: "host-a",
+            remoteMachineName: "dev-mac",
             runtime,
+            workspaceRoots: ["/workspace"],
           },
         }),
       streams.server,
@@ -95,6 +102,36 @@ describe("AcpRemoteRuntimeAgent", () => {
       mcpServers: [],
     });
     expect(created.sessionId).toBe("runtime-session-1");
+    expect(created._meta).toMatchObject({
+      "acp-runtime/remote/daemonId": "host-a",
+      "acp-runtime/remote/sessionAgent": {
+        command: "fake-agent",
+        type: "fake",
+      },
+      "acp-runtime/remote/sessionWorkspaceRoots": ["/workspace"],
+    });
+    expect(created.configOptions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          category: "remote",
+          currentValue: "dev-mac",
+          id: "acp-runtime.remote.machine",
+          name: "Remote Machine",
+        }),
+        expect.objectContaining({
+          category: "remote",
+          currentValue: "fake",
+          id: "acp-runtime.remote.agent",
+          name: "Remote Agent",
+        }),
+        expect.objectContaining({
+          category: "remote",
+          currentValue: "/workspace",
+          id: "acp-runtime.remote.workspace",
+          name: "Remote Workspace",
+        }),
+      ]),
+    );
 
     const response = await clientConnection.prompt({
       prompt: [{ text: "hello", type: "text" }],
@@ -111,6 +148,201 @@ describe("AcpRemoteRuntimeAgent", () => {
             text: "hello from runtime",
             type: "text",
           },
+          sessionUpdate: "agent_message_chunk",
+        },
+      },
+    ]);
+  });
+
+  it("restores missing active sessions before prompt and deduplicates concurrent restores", async () => {
+    const streams = createStreamPair();
+    const prompts: AcpRuntimePrompt[] = [];
+    let loadCalls = 0;
+    const session = createFakeRuntimeSession({
+      id: "restored-session",
+      onPrompt(prompt) {
+        prompts.push(prompt);
+      },
+    });
+    const runtime = {
+      sessions: {
+        async list() {
+          return { sessions: [] };
+        },
+        async load() {
+          loadCalls += 1;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          return session;
+        },
+        async resume() {
+          throw new Error("resume should not be called after load succeeds");
+        },
+        async start() {
+          throw new Error("restore must not start a new session");
+        },
+      },
+    };
+
+    const agentConnection = new AgentSideConnection(
+      (connection) =>
+        createAcpRemoteRuntimeAgent({
+          connection,
+          options: {
+            agent: {
+              command: "fake-agent",
+              type: "fake",
+            },
+            runtime,
+            workspaceRoots: ["/workspace"],
+          },
+        }),
+      streams.server,
+    );
+    void agentConnection.closed.catch(() => {});
+
+    const clientConnection = new ClientSideConnection(
+      () =>
+        ({
+          async requestPermission() {
+            return {
+              outcome: {
+                optionId: "allow_once",
+                outcome: "selected",
+              },
+            };
+          },
+          async sessionUpdate() {},
+        }) satisfies Client,
+      streams.client,
+    );
+    void clientConnection.closed.catch(() => {});
+
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+
+    const prompt = {
+      _meta: {
+        "acp-runtime/remote/sessionAgent": {
+          command: "fake-agent",
+          type: "fake",
+        },
+        "acp-runtime/remote/sessionWorkspaceRoots": ["/workspace"],
+      },
+      prompt: [{ text: "restore me", type: "text" }],
+      sessionId: "restored-session",
+    } satisfies Parameters<typeof clientConnection.prompt>[0];
+
+    await expect(
+      Promise.all([
+        clientConnection.prompt(prompt),
+        clientConnection.prompt(prompt),
+      ]),
+    ).resolves.toEqual([
+      expect.objectContaining({ stopReason: "end_turn" }),
+      expect.objectContaining({ stopReason: "end_turn" }),
+    ]);
+    expect(loadCalls).toBe(1);
+    expect(prompts).toHaveLength(2);
+  });
+
+  it("replays runtime history before completing remote session load", async () => {
+    const streams = createStreamPair();
+    const notifications: unknown[] = [];
+    let drained = false;
+    const session = createFakeRuntimeSession({
+      history: [
+        { text: "previous user message", type: "user" },
+        {
+          text: "previous assistant message",
+          turnId: "turn-history",
+          type: AcpRuntimeTurnEventType.Text,
+        },
+      ],
+      id: "runtime-session-history",
+      onPrompt() {},
+    });
+    const runtime = {
+      sessions: {
+        async list() {
+          return { sessions: [] };
+        },
+        async load() {
+          drained = true;
+          return session;
+        },
+        async resume() {
+          throw new Error("load should restore history session");
+        },
+        async start() {
+          throw new Error("load should not start a new session");
+        },
+      },
+    };
+
+    const agentConnection = new AgentSideConnection(
+      (connection) =>
+        createAcpRemoteRuntimeAgent({
+          connection,
+          options: {
+            agent: {
+              command: "fake-agent",
+              type: "fake",
+            },
+            remoteDaemonId: "host-history",
+            runtime,
+            workspaceRoots: ["/workspace"],
+          },
+        }),
+      streams.server,
+    );
+    void agentConnection.closed.catch(() => {});
+
+    const clientConnection = new ClientSideConnection(
+      () =>
+        ({
+          async requestPermission() {
+            return {
+              outcome: {
+                optionId: "allow_once",
+                outcome: "selected",
+              },
+            };
+          },
+          async sessionUpdate(params) {
+            notifications.push(params);
+          },
+        }) satisfies Client,
+      streams.client,
+    );
+    void clientConnection.closed.catch(() => {});
+
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+
+    const loaded = await clientConnection.loadSession({
+      cwd: "/workspace",
+      mcpServers: [],
+      sessionId: "zed-history-session",
+    });
+
+    expect(loaded.sessionId).toBe("runtime-session-history");
+    expect(drained).toBe(true);
+    expect(notifications).toEqual([
+      {
+        sessionId: "zed-history-session",
+        update: {
+          content: { text: "previous user message", type: "text" },
+          sessionUpdate: "user_message_chunk",
+        },
+      },
+      {
+        sessionId: "zed-history-session",
+        update: {
+          content: { text: "previous assistant message", type: "text" },
           sessionUpdate: "agent_message_chunk",
         },
       },
@@ -221,7 +453,12 @@ describe("AcpRemoteRuntimeAgent", () => {
       (connection) =>
         createAcpRemoteRuntimeAgent({
           connection,
-          options: { agent: { command: "fake", type: "fake" }, runtime },
+          options: {
+            agent: { command: "fake", type: "fake" },
+            remoteDaemonId: "host-list",
+            runtime,
+            workspaceRoots: ["/workspace"],
+          },
         }),
       streams.server,
     );
@@ -253,12 +490,88 @@ describe("AcpRemoteRuntimeAgent", () => {
     const listed = await clientConnection.listSessions({ cwd: "/workspace" });
     expect(listCalled).toBe(true);
     expect(listed.sessions).toHaveLength(1);
+    expect(listed.sessions[0]?._meta).toMatchObject({
+      "acp-runtime/remote/daemonId": "host-list",
+      "acp-runtime/remote/sessionWorkspaceRoots": ["/workspace"],
+    });
 
     session.close = async () => {
       closeCalled = true;
     };
     await clientConnection.closeSession({ sessionId: created.sessionId });
     expect(closeCalled).toBe(true);
+  });
+
+  it("returns a clear error when remote load cannot restore the requested id", async () => {
+    const streams = createStreamPair();
+    let loadCalled = false;
+    let resumeCalled = false;
+    let startCalled = false;
+    const runtime = {
+      sessions: {
+        async list() {
+          return { sessions: [] };
+        },
+        async load() {
+          loadCalled = true;
+          throw new Error("missing local runtime snapshot");
+        },
+        async resume() {
+          resumeCalled = true;
+          throw new Error("missing active runtime snapshot");
+        },
+        async start() {
+          startCalled = true;
+          return createFakeRuntimeSession({
+            id: "should-not-start",
+            onPrompt() {},
+          });
+        },
+      },
+    };
+
+    const agentConnection = new AgentSideConnection(
+      (connection) =>
+        createAcpRemoteRuntimeAgent({
+          connection,
+          options: { agent: { command: "fake", type: "fake" }, runtime },
+        }),
+      streams.server,
+    );
+    void agentConnection.closed.catch(() => {});
+
+    const clientConnection = new ClientSideConnection(
+      () =>
+        ({
+          async requestPermission() {
+            return { outcome: { optionId: "allow_once", outcome: "selected" } };
+          },
+          async sessionUpdate() {},
+        }) satisfies Client,
+      streams.client,
+    );
+    void clientConnection.closed.catch(() => {});
+
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+
+    await expect(
+      clientConnection.loadSession({
+        cwd: "/workspace",
+        mcpServers: [],
+        sessionId: "stale-zed-session-id",
+      }),
+    ).rejects.toMatchObject({
+      code: -32602,
+      message: expect.stringContaining(
+        "Remote runtime session could not be restored",
+      ),
+    });
+    expect(loadCalled).toBe(true);
+    expect(resumeCalled).toBe(true);
+    expect(startCalled).toBe(false);
   });
 
   it("handles setSessionMode and setSessionConfigOption", async () => {
@@ -334,6 +647,22 @@ describe("AcpRemoteRuntimeAgent", () => {
       value: true,
     });
     expect(configSet).toEqual({ id: "auto_approve", value: true });
+
+    configSet = undefined;
+    const remoteConfig = await clientConnection.setSessionConfigOption({
+      configId: "acp-runtime.remote.workspace",
+      sessionId: created.sessionId,
+      value: "/workspace",
+    });
+    expect(configSet).toBeUndefined();
+    expect(remoteConfig.configOptions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          currentValue: "/workspace",
+          id: "acp-runtime.remote.workspace",
+        }),
+      ]),
+    );
   });
 
   it("forwards permission prompts to the remote client", async () => {
@@ -500,6 +829,87 @@ describe("AcpRemoteRuntimeAgent", () => {
     expect(cancelCalled).toBe(true);
     void promptPromise.catch(() => {});
   });
+
+  it("returns prompt failure causes to the ACP client", async () => {
+    const streams = createStreamPair();
+    const session = createFakeRuntimeSession({ onPrompt() {} });
+    session.turn.start = () => ({
+      completion: Promise.resolve({
+        output: [],
+        outputText: "",
+        turnId: "turn-failed",
+      }),
+      events: (async function* () {
+        yield { turnId: "turn-failed", type: AcpRuntimeTurnEventType.Started };
+        yield {
+          error: new AcpProcessError(
+            "ACP prompt request failed.",
+            new Error("Failed to authenticate. API Error: 401"),
+          ),
+          turnId: "turn-failed",
+          type: AcpRuntimeTurnEventType.Failed,
+        };
+      })(),
+      turnId: "turn-failed",
+    });
+    const runtime = {
+      sessions: {
+        async list() {
+          return { sessions: [] };
+        },
+        async load() {
+          return session;
+        },
+        async resume() {
+          return session;
+        },
+        async start() {
+          return session;
+        },
+      },
+    };
+
+    const agentConnection = new AgentSideConnection(
+      (connection) =>
+        createAcpRemoteRuntimeAgent({
+          connection,
+          options: { agent: { command: "fake", type: "fake" }, runtime },
+        }),
+      streams.server,
+    );
+    void agentConnection.closed.catch(() => {});
+
+    const clientConnection = new ClientSideConnection(
+      () =>
+        ({
+          async requestPermission() {
+            return { outcome: { optionId: "allow_once", outcome: "selected" } };
+          },
+          async sessionUpdate() {},
+        }) satisfies Client,
+      streams.client,
+    );
+    void clientConnection.closed.catch(() => {});
+
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+
+    const created = await clientConnection.newSession({
+      cwd: "/workspace",
+      mcpServers: [],
+    });
+
+    await expect(
+      clientConnection.prompt({
+        prompt: [{ text: "hello", type: "text" }],
+        sessionId: created.sessionId,
+      }),
+    ).rejects.toThrow(
+      "ACP prompt request failed. Caused by: Failed to authenticate. API Error: 401",
+    );
+  });
 });
 
 function createStreamPair(): { client: Stream; server: Stream } {
@@ -518,8 +928,12 @@ function createStreamPair(): { client: Stream; server: Stream } {
 }
 
 function createFakeRuntimeSession(input: {
+  history?: readonly AcpRuntimeHistoryEntry[];
+  id?: string;
   onPrompt(prompt: AcpRuntimePrompt): void;
 }): AcpRuntimeSession {
+  const id = input.id ?? "runtime-session-1";
+  let historyDrained = false;
   return {
     agent: {
       listConfigOptions: () => [],
@@ -537,7 +951,7 @@ function createFakeRuntimeSession(input: {
     diagnostics: {},
     initialConfigReport: undefined,
     metadata: {
-      id: "runtime-session-1",
+      id,
       title: "Runtime Session",
     },
     queue: {
@@ -551,11 +965,21 @@ function createFakeRuntimeSession(input: {
       },
       cwd: "/workspace",
       session: {
-        id: "runtime-session-1",
+        id,
       },
       version: 1,
     }),
-    state: {} as AcpRuntimeSession["state"],
+    state: {
+      history: {
+        drain: () => {
+          if (historyDrained) {
+            return [];
+          }
+          historyDrained = true;
+          return input.history ?? [];
+        },
+      },
+    } as AcpRuntimeSession["state"],
     status: "ready",
     turn: {
       cancel: async () => true,
@@ -587,6 +1011,21 @@ function createFakeRuntimeSession(input: {
       stream: () => createTurnEvents(),
     },
   } as unknown as AcpRuntimeSession;
+}
+
+async function waitFor(
+  predicate: () => boolean,
+  options: { intervalMs?: number; timeoutMs?: number } = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 1_000;
+  const intervalMs = options.intervalMs ?? 10;
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error("Timed out waiting for condition.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 }
 
 async function* createTurnEvents() {

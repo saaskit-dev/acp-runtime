@@ -4,6 +4,7 @@ import {
   propagation,
   SpanStatusCode,
   trace,
+  TraceFlags,
   type Attributes,
   type Context,
   type Span,
@@ -145,6 +146,39 @@ export function mergeTraceMeta<T extends Record<string, unknown>>(
       ...traceMeta,
     },
   };
+}
+
+export function traceContextFromMeta(
+  meta: unknown,
+  parentContext: Context = context.active(),
+): Context | undefined {
+  if (!meta || typeof meta !== "object") {
+    return undefined;
+  }
+  const traceparent = (meta as { traceparent?: unknown }).traceparent;
+  if (typeof traceparent !== "string") {
+    return undefined;
+  }
+  const match =
+    /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/i.exec(
+      traceparent.trim(),
+    );
+  if (!match || /^0+$/.test(match[1]) || /^0+$/.test(match[2])) {
+    return undefined;
+  }
+  const traceFlags = Number.parseInt(match[3], 16) & TraceFlags.SAMPLED
+    ? TraceFlags.SAMPLED
+    : TraceFlags.NONE;
+  const spanContext = {
+    isRemote: true,
+    spanId: match[2].toLowerCase(),
+    traceFlags,
+    traceId: match[1].toLowerCase(),
+  };
+  if (!isSpanContextValid(spanContext)) {
+    return undefined;
+  }
+  return trace.setSpan(parentContext, trace.wrapSpanContext(spanContext));
 }
 
 export function recordException(span: Span, error: unknown): void {

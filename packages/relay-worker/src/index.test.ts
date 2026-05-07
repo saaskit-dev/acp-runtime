@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   createAcpRemoteDeviceKeyPair,
@@ -48,7 +48,7 @@ describe("relay worker control-plane endpoints", () => {
         "/control-plane/client-devices",
         {
           accountId: "acct-1",
-          clientDeviceId: "client-1",
+          clientId: "client-1",
           publicKey: "client-public-key",
         },
       ],
@@ -56,7 +56,7 @@ describe("relay worker control-plane endpoints", () => {
         "/control-plane/hosts",
         {
           accountId: "acct-1",
-          hostId: "host-1",
+          daemonId: "host-1",
           publicKey: "host-public-key",
         },
       ],
@@ -64,9 +64,9 @@ describe("relay worker control-plane endpoints", () => {
         "/control-plane/grants",
         {
           accountId: "acct-1",
-          clientDeviceId: "client-1",
+          clientId: "client-1",
           grantId: "grant-1",
-          hostId: "host-1",
+          daemonId: "host-1",
           policyVersion: 3,
           scopes: ["acp:connect", "acp:session:list"],
           workspaceRoots: ["/work/project"],
@@ -88,13 +88,13 @@ describe("relay worker control-plane endpoints", () => {
     await expect(
       store.resolveGrant({
         accountId: "acct-1",
-        clientDeviceId: "client-1",
-        hostId: "host-1",
+        clientId: "client-1",
+        daemonId: "host-1",
         requiredScopes: ["acp:session:list"],
       }),
     ).resolves.toMatchObject({
       grant: {
-        hostId: "host-1",
+        daemonId: "host-1",
         policyVersion: 3,
         workspaceRoots: ["/work/project"],
       },
@@ -142,9 +142,9 @@ describe("relay worker control-plane endpoints", () => {
       new Request("https://relay.test/control-plane/grants", {
         body: JSON.stringify({
           accountId: "acct-1",
-          clientDeviceId: "client-1",
+          clientId: "client-1",
           grantId: "grant-1",
-          hostId: "host-1",
+          daemonId: "host-1",
           policyVersion: 3,
           revoked: true,
           scopes: ["acp:connect"],
@@ -254,13 +254,78 @@ describe("relay worker control-plane endpoints", () => {
     );
   });
 
+  it("accepts account session token query on localhost OAuth return requests", async () => {
+    const token = await createAcpRelayAccountSessionToken({
+      secret: "account-session-secret",
+      session: {
+        accountId: "acct-1",
+        expiresAt: "2099-04-28T00:00:00.000Z",
+        sessionId: "session-1",
+      },
+    });
+    const routedRequests: Request[] = [];
+    const env = createRoutedEnv({
+      ACP_RELAY_ACCOUNT_SESSION_SECRET: "account-session-secret",
+      ACP_RELAY_SHARDS: {
+        get() {
+          return {
+            async fetch(request: Request) {
+              routedRequests.push(request);
+              return new Response("routed", { status: 299 });
+            },
+          };
+        },
+        idFromName(name: string) {
+          expect(name).toBe("account:acct-1");
+          return {} as DurableObjectId;
+        },
+      } as DurableObjectNamespace,
+    });
+
+    const response = await worker.fetch(
+      new Request(
+        `http://localhost:8787/authorize?accountId=acct-1&connectionId=conn-1&token=${encodeURIComponent(token)}`,
+      ),
+      env,
+    );
+
+    expect(response.status).toBe(299);
+    expect(routedRequests).toHaveLength(1);
+    expect(routedRequests[0].headers.get("x-acp-verified-account-id")).toBe(
+      "acct-1",
+    );
+  });
+
+  it("does not accept account session token query on non-local relay URLs", async () => {
+    const token = await createAcpRelayAccountSessionToken({
+      secret: "account-session-secret",
+      session: {
+        accountId: "acct-1",
+        expiresAt: "2099-04-28T00:00:00.000Z",
+        sessionId: "session-1",
+      },
+    });
+
+    const response = await worker.fetch(
+      new Request(
+        `https://relay.test/authorize?accountId=acct-1&connectionId=conn-1&token=${encodeURIComponent(token)}`,
+      ),
+      createRoutedEnv({
+        ACP_RELAY_ACCOUNT_SESSION_SECRET: "account-session-secret",
+      }),
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.text()).resolves.toContain("Sign in required");
+  });
+
   it("routes device renewal requests by proof account", async () => {
     const keyPair = await createAcpRemoteDeviceKeyPair();
     const proofInput = {
       accountId: "acct-1",
-      clientDeviceId: "client-1",
+      clientId: "client-1",
       connectionId: "conn-1",
-      hostId: "host-1",
+      daemonId: "host-1",
       nonce: "nonce-1",
       ticketJti: "ticket-1",
       timestamp: Date.now().toString(),
@@ -311,6 +376,98 @@ describe("relay worker control-plane endpoints", () => {
     });
   });
 
+  it("accepts account-session log uploads without D1 and emits Cloudflare log records", async () => {
+    const token = await createAcpRelayAccountSessionToken({
+      secret: "account-session-secret",
+      session: {
+        accountId: "acct-1",
+        expiresAt: "2099-04-28T00:00:00.000Z",
+        sessionId: "session-1",
+      },
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      const response = await worker.fetch(
+        new Request("https://relay.test/api/logs", {
+          body: JSON.stringify({
+            context: {
+              "acp.remote.daemon_id": "host-1",
+            },
+            records: [
+              {
+                body: "Daemon connected.",
+                kind: "text",
+                observedAt: "2026-05-06T00:00:00.000Z",
+                spanId: "span-1",
+                traceId: "trace-1",
+              },
+            ],
+            source: "daemon",
+            version: 1,
+          }),
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          method: "POST",
+        }),
+        createEnv({
+          ACP_RELAY_ACCOUNT_SESSION_SECRET: "account-session-secret",
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        accepted: 1,
+        ok: true,
+      });
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      const line = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as Record<
+        string,
+        unknown
+      >;
+      expect(line).toMatchObject({
+        accountId: "acct-1",
+        accountSessionId: "session-1",
+        eventName: "acp.relay.log",
+        spanId: "span-1",
+        source: "daemon",
+        traceId: "trace-1",
+      });
+      expect(line.context).toMatchObject({
+        "acp.remote.daemon_id": "host-1",
+      });
+      expect(line.record).toMatchObject({
+        body: "Daemon connected.",
+        kind: "text",
+      });
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("rejects unauthenticated log uploads", async () => {
+    const response = await worker.fetch(
+      new Request("https://relay.test/api/logs", {
+        body: JSON.stringify({
+          records: [],
+          source: "daemon",
+          version: 1,
+        }),
+        method: "POST",
+      }),
+      createEnv({
+        ACP_RELAY_ACCOUNT_SESSION_SECRET: "account-session-secret",
+      }),
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({
+      error: "ACP relay account session is required.",
+    });
+  });
+
   it("accepts daemon registration signed by a registered host key", async () => {
     const keyPair = await createDaemonRegistrationKeyPair();
     const database = new FakeD1Database({
@@ -329,14 +486,14 @@ describe("relay worker control-plane endpoints", () => {
     const timestamp = Date.now().toString();
     const signature = await createDaemonRegistrationKeySignature({
       accountId: "acct-1",
-      hostId: "host-1",
+      daemonId: "host-1",
       nonce: "nonce-1",
       privateKey: keyPair.privateKey,
       timestamp,
     });
 
     const response = await worker.fetch(
-      new Request("https://relay.test/daemon?accountId=acct-1&hostId=host-1", {
+      new Request("https://relay.test/daemon?accountId=acct-1&daemonId=host-1", {
         headers: {
           Upgrade: "websocket",
           "x-acp-daemon-nonce": "nonce-1",
@@ -349,6 +506,70 @@ describe("relay worker control-plane endpoints", () => {
 
     expect(response.status).toBe(299);
     await expect(response.text()).resolves.toBe("routed");
+  });
+
+  it("auto-registers a daemon and default grant from an account session", async () => {
+    const keyPair = await createDaemonRegistrationKeyPair();
+    const token = await createAcpRelayAccountSessionToken({
+      secret: "account-session-secret",
+      session: {
+        accountId: "acct-1",
+        expiresAt: "2099-04-28T00:00:00.000Z",
+        sessionId: "session-1",
+      },
+    });
+    const database = new FakeD1Database({
+      accounts: [],
+      clientDevices: [],
+      grants: [],
+      hosts: [],
+    });
+    const timestamp = Date.now().toString();
+    const signature = await createDaemonRegistrationKeySignature({
+      accountId: "acct-1",
+      daemonId: "host-1",
+      nonce: "nonce-1",
+      privateKey: keyPair.privateKey,
+      timestamp,
+    });
+
+    const response = await worker.fetch(
+      new Request("https://relay.test/daemon?daemonId=host-1", {
+        headers: {
+          authorization: `Bearer ${token}`,
+          Upgrade: "websocket",
+          "x-acp-daemon-nonce": "nonce-1",
+          "x-acp-daemon-public-key": keyPair.publicKey,
+          "x-acp-daemon-signature": signature,
+          "x-acp-daemon-timestamp": timestamp,
+        },
+      }),
+      createRoutedEnv({
+        ACP_RELAY_ACCOUNT_SESSION_SECRET: "account-session-secret",
+        ACP_RELAY_DB: database as unknown as D1Database,
+      }),
+    );
+
+    expect(response.status).toBe(299);
+    expect(database.rows.accounts).toMatchObject([{ account_id: "acct-1" }]);
+    expect(database.rows.hosts).toMatchObject([
+      {
+        account_id: "acct-1",
+        host_id: "host-1",
+        public_key: keyPair.publicKey,
+      },
+    ]);
+    expect(database.rows.grants).toMatchObject([
+      {
+        account_id: "acct-1",
+        client_device_id: null,
+        host_id: "host-1",
+        revoked: 0,
+      },
+    ]);
+    expect(JSON.parse(database.rows.grants[0].scopes_json)).toContain(
+      "acp:connect",
+    );
   });
 
   it("rejects daemon registration with an invalid host key signature", async () => {
@@ -368,7 +589,7 @@ describe("relay worker control-plane endpoints", () => {
     });
 
     const response = await worker.fetch(
-      new Request("https://relay.test/daemon?accountId=acct-1&hostId=host-1", {
+      new Request("https://relay.test/daemon?accountId=acct-1&daemonId=host-1", {
         headers: {
           Upgrade: "websocket",
           "x-acp-daemon-nonce": "nonce-1",
@@ -383,6 +604,64 @@ describe("relay worker control-plane endpoints", () => {
     await expect(response.text()).resolves.toBe(
       "Invalid daemon registration signature.",
     );
+  });
+
+  it("auto-recovers a registered daemon key when account session is valid", async () => {
+    const staleKeyPair = await createDaemonRegistrationKeyPair();
+    const nextKeyPair = await createDaemonRegistrationKeyPair();
+    const token = await createAcpRelayAccountSessionToken({
+      secret: "account-session-secret",
+      session: {
+        accountId: "acct-1",
+        expiresAt: "2099-04-28T00:00:00.000Z",
+        sessionId: "session-1",
+      },
+    });
+    const database = new FakeD1Database({
+      accounts: [{ account_id: "acct-1", disabled: 0 }],
+      clientDevices: [],
+      grants: [],
+      hosts: [
+        {
+          account_id: "acct-1",
+          disabled: 0,
+          host_id: "host-1",
+          public_key: staleKeyPair.publicKey,
+        },
+      ],
+    });
+    const timestamp = Date.now().toString();
+    const signature = await createDaemonRegistrationKeySignature({
+      accountId: "acct-1",
+      daemonId: "host-1",
+      nonce: "nonce-1",
+      privateKey: nextKeyPair.privateKey,
+      timestamp,
+    });
+
+    const response = await worker.fetch(
+      new Request("https://relay.test/daemon?daemonId=host-1", {
+        headers: {
+          authorization: `Bearer ${token}`,
+          Upgrade: "websocket",
+          "x-acp-daemon-nonce": "nonce-1",
+          "x-acp-daemon-public-key": nextKeyPair.publicKey,
+          "x-acp-daemon-signature": signature,
+          "x-acp-daemon-timestamp": timestamp,
+        },
+      }),
+      createRoutedEnv({
+        ACP_RELAY_ACCOUNT_SESSION_SECRET: "account-session-secret",
+        ACP_RELAY_DB: database as unknown as D1Database,
+      }),
+    );
+
+    expect(response.status).toBe(299);
+    expect(database.rows.hosts[0]).toMatchObject({
+      account_id: "acct-1",
+      host_id: "host-1",
+      public_key: nextKeyPair.publicKey,
+    });
   });
 
   it("accepts daemon registration signed by a previous host key during rotation", async () => {
@@ -405,14 +684,14 @@ describe("relay worker control-plane endpoints", () => {
     const timestamp = Date.now().toString();
     const signature = await createDaemonRegistrationKeySignature({
       accountId: "acct-1",
-      hostId: "host-1",
+      daemonId: "host-1",
       nonce: "nonce-1",
       privateKey: previousKeyPair.privateKey,
       timestamp,
     });
 
     const response = await worker.fetch(
-      new Request("https://relay.test/daemon?accountId=acct-1&hostId=host-1", {
+      new Request("https://relay.test/daemon?accountId=acct-1&daemonId=host-1", {
         headers: {
           Upgrade: "websocket",
           "x-acp-daemon-nonce": "nonce-1",
@@ -441,7 +720,7 @@ describe("relay worker control-plane endpoints", () => {
     });
 
     const response = await worker.fetch(
-      new Request("https://relay.test/daemon?accountId=acct-1&hostId=host-1", {
+      new Request("https://relay.test/daemon?accountId=acct-1&daemonId=host-1", {
         headers: {
           Upgrade: "websocket",
           "x-acp-daemon-nonce": "nonce-1",
@@ -456,7 +735,7 @@ describe("relay worker control-plane endpoints", () => {
 
     expect(response.status).toBe(401);
     await expect(response.text()).resolves.toBe(
-      "Host key is not provisioned for this daemon.",
+      "Daemon registration proof key is not configured.",
     );
   });
 });
@@ -549,7 +828,7 @@ type FakeD1Rows = {
 };
 
 class FakeD1Database implements D1DatabaseLike {
-  constructor(private readonly rows: FakeD1Rows) {}
+  constructor(readonly rows: FakeD1Rows) {}
 
   prepare(query: string): D1PreparedStatementLike {
     return new FakeD1PreparedStatement(this.rows, query);

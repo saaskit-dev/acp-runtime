@@ -71,7 +71,11 @@ import { ACP_RUNTIME_SNAPSHOT_VERSION } from "../core/constants.js";
 import { AcpRuntimeSessionTimeline } from "../core/session-timeline.js";
 import type { AcpSessionBootstrap } from "./connection-types.js";
 import { AcpClientBridge } from "./authority-bridge.js";
-import { emitRuntimeLog, observedLogBody } from "../observability/logging.js";
+import {
+  emitRuntimeLog,
+  emitRuntimeSuppressedError,
+  observedLogBody,
+} from "../observability/logging.js";
 import {
   captureContentAttribute,
   captureContentEvent,
@@ -551,7 +555,19 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
               sessionId: this.bootstrap.sessionId,
             }),
           )
-          .catch(() => {}),
+          .catch((error) => {
+            emitRuntimeSuppressedError({
+              attributes: {
+                "acp.agent.command": this.bootstrap.agent.command,
+                "acp.agent.type": this.bootstrap.agent.type,
+                "acp.session.cwd": this.bootstrap.cwd,
+                "acp.session.id": this.bootstrap.sessionId,
+              },
+              body: "ACP session close request failed during runtime cleanup.",
+              eventName: "acp.session.close.cleanup.failed",
+              exception: error,
+            });
+          }),
         waitFor(1_000),
       ]);
     }
@@ -655,7 +671,6 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
         rejectCompletion = reject;
       },
     );
-    void completion.catch(() => {});
     const { context: turnContext, span: turnSpan } = childSpan(
       "acp.turn",
       context.active(),
@@ -666,6 +681,20 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
         ...promptAttributes(prompt),
       },
     );
+    void completion.catch((error) => {
+      emitRuntimeSuppressedError({
+        attributes: {
+          "acp.agent.type": this.bootstrap.agent.type,
+          "acp.session.id": this.bootstrap.sessionId,
+          "acp.turn.id": state.turnId,
+        },
+        body: "Runtime turn completion rejection was not directly observed.",
+        context: turnContext,
+        eventName: "acp.turn.completion.unobserved",
+        exception: error,
+        severityNumber: SeverityNumber.DEBUG,
+      });
+    });
     const activeTurn: ActiveTurn = {
       complete: (value) => settleCompletion?.(value),
       fail: (error) => rejectCompletion?.(error),
