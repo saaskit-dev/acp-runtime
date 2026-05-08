@@ -33,7 +33,11 @@ import {
   type AcpRemoteFrame,
   type AcpRemoteSignedConnectionTicket,
 } from "../protocol/index.js";
-import { createAcpRemoteDaemonConnection } from "./relay-connection.js";
+import {
+  createAcpRemoteDaemonConnection,
+  createAcpRemoteDaemonConnectionState,
+  type AcpRemoteDaemonRequestJournal,
+} from "./relay-connection.js";
 
 const tempDirs: string[] = [];
 const relayTicketKey = {
@@ -730,6 +734,298 @@ describe("ACP remote daemon relay connection", () => {
     daemon.close();
   });
 
+  it("keeps active sessions across daemon relay socket reconnects", async () => {
+    const state = createAcpRemoteDaemonConnectionState();
+    const [firstDaemonSocket, firstRelaySocket] = createMemoryWebSocketPair();
+    const [secondDaemonSocket, secondRelaySocket] = createMemoryWebSocketPair();
+    const firstOutboundFrames: AcpRemoteFrame[] = [];
+    const secondOutboundFrames: AcpRemoteFrame[] = [];
+    let startCalls = 0;
+    const ticket = await createAcpRemoteSignedConnectionTicket({
+      connectionId: "conn-daemon-socket-reconnect",
+      grant: {
+        accountId: "acct-smoke",
+        clientDeviceId: "client-smoke",
+        daemonId: "host-smoke",
+        policyVersion: 1,
+        scopes: ["acp:connect", "acp:session:create", "acp:turn:send"],
+      },
+      jti: "ticket-daemon-socket-reconnect",
+      key: relayTicketKey,
+      now: new Date("2026-04-27T00:00:00.000Z"),
+      ttlMs: 60_000,
+    });
+    firstRelaySocket.addEventListener("message", (event) => {
+      firstOutboundFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    secondRelaySocket.addEventListener("message", (event) => {
+      secondOutboundFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+
+    createAcpRemoteDaemonConnection({
+      agent: {
+        command: "fake-agent",
+        type: "fake",
+      },
+      daemonId: "host-smoke",
+      now: () => new Date("2026-04-27T00:00:30.000Z"),
+      runtime: {
+        sessions: {
+          async list() {
+            return { sessions: [] };
+          },
+          async load() {
+            throw new Error("Unexpected remote load.");
+          },
+          async resume() {
+            throw new Error("Unexpected remote resume.");
+          },
+          async start() {
+            startCalls += 1;
+            return createFakeRuntimeSession();
+          },
+        },
+      },
+      socket: firstDaemonSocket,
+      state,
+      ticketVerificationKeys: [relayTicketKey],
+    });
+
+    firstRelaySocket.send(createRelayHelloFrame("conn-daemon-socket-reconnect", ticket));
+    firstRelaySocket.send(createRelayAcpFrame("conn-daemon-socket-reconnect", 1, {
+      id: 1,
+      jsonrpc: "2.0",
+      method: "initialize",
+      params: {
+        clientCapabilities: {},
+        protocolVersion: PROTOCOL_VERSION,
+      },
+    }));
+    await waitFor(() =>
+      firstOutboundFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcResultPayload(frame.payload, 1),
+      ),
+    );
+    ackLatestDataFrame(
+      firstRelaySocket,
+      firstOutboundFrames,
+      "conn-daemon-socket-reconnect",
+    );
+
+    firstRelaySocket.send(createRelayAcpFrame("conn-daemon-socket-reconnect", 2, {
+      id: 2,
+      jsonrpc: "2.0",
+      method: "session/new",
+      params: {
+        cwd: "/tmp/project",
+        mcpServers: [],
+      },
+    }));
+    await waitFor(() =>
+      firstOutboundFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcResultPayload(frame.payload, 2),
+      ),
+    );
+    ackLatestDataFrame(
+      firstRelaySocket,
+      firstOutboundFrames,
+      "conn-daemon-socket-reconnect",
+    );
+
+    firstDaemonSocket.close();
+    const daemon = createAcpRemoteDaemonConnection({
+      agent: {
+        command: "fake-agent",
+        type: "fake",
+      },
+      daemonId: "host-smoke",
+      now: () => new Date("2026-04-27T00:00:30.000Z"),
+      runtime: createUnusedRuntime(),
+      socket: secondDaemonSocket,
+      state,
+      ticketVerificationKeys: [relayTicketKey],
+    });
+
+    secondRelaySocket.send(createRelayHelloFrame("conn-daemon-socket-reconnect", ticket));
+    secondRelaySocket.send(createRelayAcpFrame("conn-daemon-socket-reconnect", 3, {
+      id: 3,
+      jsonrpc: "2.0",
+      method: "session/prompt",
+      params: {
+        prompt: [{ text: "after reconnect", type: "text" }],
+        sessionId: "runtime-session-1",
+      },
+    }));
+
+    await waitFor(() =>
+      secondOutboundFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcResultPayload(frame.payload, 3),
+      ),
+    );
+    expect(startCalls).toBe(1);
+    expect(
+      secondOutboundFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Close),
+    ).toBe(false);
+
+    daemon.close();
+  });
+
+  it("does not replay journaled runtime-bound requests after daemon restart", async () => {
+    const journal = new MemoryDaemonRequestJournal([
+      {
+        connectionId: "conn-daemon-request-journal-received",
+        id: 7,
+        method: "session/prompt",
+        status: "received",
+      },
+    ]);
+    const [daemonSocket, relaySocket] = createMemoryWebSocketPair();
+    const outboundFrames: AcpRemoteFrame[] = [];
+    const ticket = await createAcpRemoteSignedConnectionTicket({
+      connectionId: "conn-daemon-request-journal-received",
+      grant: {
+        accountId: "acct-smoke",
+        clientDeviceId: "client-smoke",
+        daemonId: "host-smoke",
+        policyVersion: 1,
+        scopes: ["acp:connect", "acp:turn:send"],
+      },
+      jti: "ticket-daemon-request-journal-received",
+      key: relayTicketKey,
+      now: new Date("2026-04-27T00:00:00.000Z"),
+      ttlMs: 60_000,
+    });
+    relaySocket.addEventListener("message", (event) => {
+      outboundFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+
+    const daemon = createAcpRemoteDaemonConnection({
+      agent: {
+        command: "fake-agent",
+        type: "fake",
+      },
+      daemonId: "host-smoke",
+      now: () => new Date("2026-04-27T00:00:30.000Z"),
+      requestJournal: journal,
+      runtime: createUnusedRuntime(),
+      socket: daemonSocket,
+      ticketVerificationKeys: [relayTicketKey],
+    });
+
+    relaySocket.send(createRelayHelloFrame("conn-daemon-request-journal-received", ticket));
+    relaySocket.send(createRelayAcpFrame("conn-daemon-request-journal-received", 1, {
+      id: 7,
+      jsonrpc: "2.0",
+      method: "session/prompt",
+      params: {
+        prompt: [{ text: "duplicate after daemon restart", type: "text" }],
+        sessionId: "runtime-session-1",
+      },
+    }));
+
+    await waitFor(() =>
+      outboundFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          (frame.payload as { error?: { message?: string }; id?: number }).id ===
+            7,
+      ),
+    );
+    const response = outboundFrames.find(
+      (frame): frame is AcpRemoteDataFrame =>
+        frame.frameType === AcpRemoteFrameType.Data &&
+        (frame.payload as { id?: number }).id === 7,
+    );
+    expect((response?.payload as { error?: { message?: string } }).error?.message)
+      .toContain("already delivered this request to the runtime");
+
+    daemon.close();
+  });
+
+  it("replays completed journaled runtime-bound responses after daemon restart", async () => {
+    const journal = new MemoryDaemonRequestJournal([
+      {
+        connectionId: "conn-daemon-request-journal-completed",
+        id: "prompt-1",
+        method: "session/prompt",
+        payload: {
+          id: "prompt-1",
+          jsonrpc: "2.0",
+          result: {
+            stopReason: "end_turn",
+          },
+        },
+        status: "completed",
+      },
+    ]);
+    const [daemonSocket, relaySocket] = createMemoryWebSocketPair();
+    const outboundFrames: AcpRemoteFrame[] = [];
+    const ticket = await createAcpRemoteSignedConnectionTicket({
+      connectionId: "conn-daemon-request-journal-completed",
+      grant: {
+        accountId: "acct-smoke",
+        clientDeviceId: "client-smoke",
+        daemonId: "host-smoke",
+        policyVersion: 1,
+        scopes: ["acp:connect", "acp:turn:send"],
+      },
+      jti: "ticket-daemon-request-journal-completed",
+      key: relayTicketKey,
+      now: new Date("2026-04-27T00:00:00.000Z"),
+      ttlMs: 60_000,
+    });
+    relaySocket.addEventListener("message", (event) => {
+      outboundFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+
+    const daemon = createAcpRemoteDaemonConnection({
+      agent: {
+        command: "fake-agent",
+        type: "fake",
+      },
+      daemonId: "host-smoke",
+      now: () => new Date("2026-04-27T00:00:30.000Z"),
+      requestJournal: journal,
+      runtime: createUnusedRuntime(),
+      socket: daemonSocket,
+      ticketVerificationKeys: [relayTicketKey],
+    });
+
+    relaySocket.send(createRelayHelloFrame("conn-daemon-request-journal-completed", ticket));
+    relaySocket.send(createRelayAcpFrame("conn-daemon-request-journal-completed", 1, {
+      id: "prompt-1",
+      jsonrpc: "2.0",
+      method: "session/prompt",
+      params: {
+        prompt: [{ text: "duplicate completed after daemon restart", type: "text" }],
+        sessionId: "runtime-session-1",
+      },
+    }));
+
+    await waitFor(() =>
+      outboundFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          (frame.payload as { id?: string }).id === "prompt-1",
+      ),
+    );
+    const response = outboundFrames.find(
+      (frame): frame is AcpRemoteDataFrame =>
+        frame.frameType === AcpRemoteFrameType.Data &&
+        (frame.payload as { id?: string }).id === "prompt-1",
+    );
+    expect((response?.payload as { result?: { stopReason?: string } }).result)
+      .toEqual({ stopReason: "end_turn" });
+
+    daemon.close();
+  });
+
   it("runs a native ACP client prompt through relay frames into simulator-backed runtime", async () => {
     const root = await mkdtemp(join(tmpdir(), "acp-remote-smoke-"));
     const projectDir = join(root, "project");
@@ -932,6 +1228,20 @@ function createRelayAcpFrame(
   } satisfies AcpRemoteDataFrame);
 }
 
+function createRelayHelloFrame(
+  connectionId: string,
+  ticket: AcpRemoteSignedConnectionTicket,
+): string {
+  return JSON.stringify({
+    connectionId,
+    endpoint: AcpRemoteEndpointKind.Client,
+    frameType: AcpRemoteFrameType.Hello,
+    daemonId: ticket.payload.daemonId,
+    protocolVersion: ACP_REMOTE_PROTOCOL_VERSION,
+    ticket,
+  });
+}
+
 function ackLatestDataFrame(
   relaySocket: MemoryWebSocket,
   outboundFrames: readonly AcpRemoteFrame[],
@@ -953,6 +1263,57 @@ function ackLatestDataFrame(
       frameType: AcpRemoteFrameType.Ack,
     }),
   );
+}
+
+class MemoryDaemonRequestJournal implements AcpRemoteDaemonRequestJournal {
+  private entries: {
+    connectionId: string;
+    id: string | number;
+    method?: string;
+    payload?: AnyMessage;
+    status: "completed" | "received";
+  }[];
+
+  constructor(entries: MemoryDaemonRequestJournal["entries"] = []) {
+    this.entries = [...entries];
+  }
+
+  async lookup(connectionId: string, id: string | number) {
+    for (let index = this.entries.length - 1; index >= 0; index -= 1) {
+      const entry = this.entries[index];
+      if (entry.connectionId === connectionId && entry.id === id) {
+        return entry;
+      }
+    }
+    return undefined;
+  }
+
+  async markCompleted(entry: {
+    connectionId: string;
+    id: string | number;
+    method?: string;
+    payload: AnyMessage;
+  }) {
+    this.upsert({ ...entry, status: "completed" });
+  }
+
+  async markReceived(entry: {
+    connectionId: string;
+    id: string | number;
+    method?: string;
+  }) {
+    this.upsert({ ...entry, status: "received" });
+  }
+
+  private upsert(entry: MemoryDaemonRequestJournal["entries"][number]) {
+    this.entries = [
+      ...this.entries.filter(
+        (item) =>
+          item.connectionId !== entry.connectionId || item.id !== entry.id,
+      ),
+      entry,
+    ];
+  }
 }
 
 function delay(ms: number): Promise<void> {

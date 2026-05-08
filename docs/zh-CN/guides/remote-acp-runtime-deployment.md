@@ -42,6 +42,13 @@ wrangler secret put ACP_RELAY_ACCOUNT_SESSION_SECRET
 key。Daemon 默认使用 runtime 内置的 relay public key 验证 ticket；私有 relay
 部署可以通过 `ACP_REMOTE_DAEMON_TICKET_PUBLIC_KEYS` 覆盖 daemon 验签 key set。
 
+生产 relay 默认把断开的 client 和 daemon route 保留 24 小时，可通过
+`ACP_RELAY_CLIENT_RECONNECT_GRACE_MS` 和
+`ACP_RELAY_DAEMON_RECONNECT_GRACE_MS` 调整。Connection ticket 默认 1 小时过期
+（`ACP_RELAY_TICKET_TTL_MS`），并在过期前 5 分钟续票
+（`ACP_RELAY_TICKET_RENEW_BEFORE_MS`），这样 Cloudflare WebSocket 短断、电脑休眠
+或 daemon 重连都能恢复，不需要用户重新授权。
+
 5. 可选配置 `ACP_RELAY_LOGIN_URL` Worker variable。配置后，未登录的
    `/authorize` 会重定向到这个登录地址，并附带 `returnTo` 和 `accountId` query
    参数；未配置时，`/authorize` 渲染最小 sign-in-required 页面。
@@ -109,11 +116,26 @@ acp-runtime daemon install \
   --workspace-root ~/Projects
 ```
 
-`install` 使用和 `run` 一样的登录解析逻辑：优先使用 `--account-session` 或
-`ACP_REMOTE_DAEMON_ACCOUNT_SESSION`，然后读取 `~/.acp/relay-session.json`，没有缓存时
-打开浏览器 OAuth。安装后的服务复用这个缓存 session，所以正常用户不需要输入 relay
-ticket key 或 account token。如果要忽略旧缓存并重新登录，使用
-`acp-runtime daemon install --force-login`。
+npm 包安装本身不会自动注册后台 daemon。首次注册 service 是显式步骤，因为它会创建
+一个长期运行的本地进程，可能打开浏览器登录，也可能需要 launchd 或 sudo 权限。
+
+用户可以显式管理登录状态：
+
+```bash
+acp-runtime auth login
+acp-runtime auth status
+acp-runtime auth logout
+```
+
+`auth login` 会把 account session 保存到 `~/.acp/relay-session.json`。新登录后，它只
+会在没有 daemon service 时安装默认 macOS user daemon service。如果本地已经有有效登录
+缓存，它只提示已经登录。只有想单纯缓存登录、不注册后台服务时才使用 `auth login
+--no-daemon`。为了兼容旧流程，`install` 和 `run` 仍然执行同一套登录解析：优先使用
+`--account-session` 或 `ACP_REMOTE_DAEMON_ACCOUNT_SESSION`，然后读取缓存 session，没有
+缓存时打开浏览器 OAuth。安装后的服务复用这个缓存 session，所以正常用户不需要输入
+relay ticket key 或 account token。如果要忽略旧缓存、重新登录并重装默认 macOS user
+daemon service，使用 `acp-runtime auth login --force`。如果机器已经是 system mode，
+`auth login --force` 会自动走 system reinstall 路径，macOS 会提示输入 sudo 密码。
 
 在 macOS 上，`install` 会写入 user LaunchAgent：
 `~/Library/LaunchAgents/dev.saaskit.acp-runtime.daemon.plist`，用 `launchctl` 启动，
@@ -123,9 +145,35 @@ ticket key 或 account token。如果要忽略旧缓存并重新登录，使用
 relay 短暂断开后用指数退避自动重连。`acp-runtime daemon stop` 会 unload 这个
 LaunchAgent，所以会保持停止，直到再次执行 `start` 或 `install`。
 
+如果需要在用户登录前就随系统启动，可以使用可选的 system LaunchDaemon：
+
+```bash
+acp-runtime auth login
+acp-runtime daemon install --system
+```
+
+这会写入 `/Library/LaunchDaemons/dev.saaskit.acp-runtime.daemon.plist`，默认给
+`SUDO_USER` 设置 `UserName` 和 `HOME`。目标 home 很重要：它让 system daemon 复用该
+用户缓存的 `~/.acp/relay-session.json`，而不是 sudo 后去 `/var/root` 下查找登录缓存。
+只有需要覆盖自动检测结果时才使用 `--user` 或 `--home-dir`。service 安装后，
+`status`、`start`、`stop` 和 `uninstall` 会自动判断当前安装模式。只有需要强制 system
+mode，或处理异常冲突时才需要 `--system`。会修改 system service 的命令会自动通过
+`sudo` 重新执行，所以需要权限时 macOS 会提示输入密码。
+
+一台机器应该只安装一种 service 模式。安装 `--system` 会移除目标用户的 LaunchAgent。
+安装 user mode 时，如果 system LaunchDaemon 仍然存在，会拒绝继续，因为移除它需要
+sudo。
+
+npm 包升级后，如果 daemon service 已经安装，运行中的 daemon 会监控自己的可执行文件
+路径；当该文件被 npm 替换后，daemon 会退出，launchd 的 `KeepAlive` 会用升级后的代码
+重新拉起。首次安装、切换模式、修改 service 参数，或全局 npm 命令路径变化需要重写
+plist 时，user service 重新执行 `acp-runtime daemon install`，system service 重新执行
+`acp-runtime daemon install --system`。`start` 只加载已有 plist。
+
 常用命令：
 
 ```bash
+acp-runtime auth status
 acp-runtime daemon status
 acp-runtime daemon stop
 acp-runtime daemon start

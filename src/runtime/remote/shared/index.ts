@@ -9,6 +9,14 @@ export {
 } from "./relay-socket.js";
 
 export {
+  createAcpRemoteReconnectBackoff,
+  runAcpRemoteReconnectLoop,
+  type AcpRemoteReconnectBackoff,
+  type AcpRemoteReconnectBackoffOptions,
+  type AcpRemoteReconnectLoopOptions,
+} from "./reconnect.js";
+
+export {
   parseFrame,
   ACP_METHOD_SCOPE_BY_METHOD,
   ACP_NOTIFICATION_SCOPE_BY_METHOD,

@@ -46,6 +46,14 @@ base64url. Daemons verify tickets with the runtime's built-in relay public key;
 private relay deployments can override daemon verification with
 `ACP_REMOTE_DAEMON_TICKET_PUBLIC_KEYS`.
 
+The production relay keeps disconnected client and daemon routes resumable for
+24 hours by default (`ACP_RELAY_CLIENT_RECONNECT_GRACE_MS` and
+`ACP_RELAY_DAEMON_RECONNECT_GRACE_MS`). Connection tickets last 1 hour by
+default (`ACP_RELAY_TICKET_TTL_MS`) and are renewed 5 minutes before expiry
+(`ACP_RELAY_TICKET_RENEW_BEFORE_MS`) so short Cloudflare WebSocket drops,
+laptop sleep, and daemon reconnects can resume without forcing a new user
+authorization.
+
 5. Optionally configure `ACP_RELAY_LOGIN_URL` as a Worker variable. When set,
    unauthenticated `/authorize` requests redirect to this login URL with
    `returnTo` and `accountId` query parameters. When unset, `/authorize` renders
@@ -122,13 +130,32 @@ acp-runtime daemon install \
   --workspace-root ~/Projects
 ```
 
-`install` performs the same login resolution as `run`: it uses
+The npm package install does not register a background daemon by itself.
+First-time service registration is explicit because it creates a long-running
+local process, may open browser login, and may need launchd or sudo privileges.
+
+Users can manage login explicitly with:
+
+```bash
+acp-runtime auth login
+acp-runtime auth status
+acp-runtime auth logout
+```
+
+`auth login` stores the account session in `~/.acp/relay-session.json`. After a
+fresh login, it installs the default macOS user daemon service only when no
+daemon service exists. If a valid cached login already exists, it only reports
+that authentication is already complete. Use `auth login --no-daemon` only when
+intentionally caching login without registering a background service. `install`
+and `run` perform the same login resolution for compatibility: they use
 `--account-session` or `ACP_REMOTE_DAEMON_ACCOUNT_SESSION` when provided, then
-falls back to `~/.acp/relay-session.json`, and opens browser OAuth if no cached
-session exists. The installed service reuses that cached session, so normal
-users do not type relay ticket keys or account tokens. Use
-`acp-runtime daemon install --force-login` to ignore the cached session and
-refresh it before installing or updating the service.
+fall back to the cached session, and open browser OAuth if no cached session
+exists. The installed service reuses that cached session, so normal users do not
+type relay ticket keys or account tokens. Use `acp-runtime auth login --force`
+to refresh an expired or mismatched cached session and reinstall the default
+macOS user daemon service. If the machine is already installed in system mode,
+`auth login --force` automatically runs the system reinstall path and macOS
+prompts for sudo.
 
 On macOS, `install` writes a user LaunchAgent at
 `~/Library/LaunchAgents/dev.saaskit.acp-runtime.daemon.plist`, starts it with
@@ -139,9 +166,39 @@ failed exits. The daemon process also reconnects to the relay with exponential
 backoff after transient disconnects. `acp-runtime daemon stop` unloads the
 LaunchAgent so it stays stopped until `start` or `install` loads it again.
 
+For boot-time startup before GUI login, use the optional system LaunchDaemon:
+
+```bash
+acp-runtime auth login
+acp-runtime daemon install --system
+```
+
+This writes `/Library/LaunchDaemons/dev.saaskit.acp-runtime.daemon.plist` and
+sets `UserName` plus `HOME` for `SUDO_USER` by default. The target home is
+important: it lets the system daemon reuse the user's cached
+`~/.acp/relay-session.json` instead of looking under `/var/root` after sudo. Use
+`--user` or `--home-dir` only when overriding the detected default. After a
+service is installed, `status`, `start`, `stop`, and `uninstall` auto-detect
+whether the installed mode is user or system. Use `--system` only to force
+system mode or resolve an unexpected conflict.
+Commands that modify the system service automatically re-run through `sudo`, so
+macOS prompts for a password when needed.
+
+Only one service mode should be installed on a machine. Installing `--system`
+removes the target user's LaunchAgent. Installing user mode refuses to proceed
+if a system LaunchDaemon is still installed, because removing it requires sudo.
+
+After package upgrades, an already-installed daemon watches its own executable
+path and exits when npm replaces that file; launchd `KeepAlive` restarts it with
+the upgraded code. Rerun `acp-runtime daemon install` for user services, or
+`acp-runtime daemon install --system` for system services, when installing for
+the first time, switching modes, changing service options, or rewriting a plist
+whose global npm command path changed. `start` only loads the existing plist.
+
 Useful commands:
 
 ```bash
+acp-runtime auth status
 acp-runtime daemon status
 acp-runtime daemon stop
 acp-runtime daemon start

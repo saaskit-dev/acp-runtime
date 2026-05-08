@@ -16,7 +16,10 @@ import {
   type AcpSessionServiceOptions,
 } from "../acp/session-service.js";
 import { SingleFlight } from "./concurrency.js";
-import { applyRuntimeInitialConfig } from "./initial-config.js";
+import {
+  applyRuntimeInitialConfig,
+  applyRuntimeSnapshotConfig,
+} from "./initial-config.js";
 import type { AcpConnectionFactory } from "../acp/connection-types.js";
 import { resolveRuntimeHomePath } from "../paths.js";
 import { AcpRuntimeSessionRegistry } from "../registry/session-registry.js";
@@ -58,6 +61,14 @@ type ManagedSessionEntry = {
   driver: AcpSessionDriver;
   refCount: number;
   sessionId: string;
+};
+
+type ResolvedSessionOpenOptions = AcpRuntimeCreateOptions & {
+  storedSnapshot?: AcpRuntimeSnapshot;
+};
+
+type RuntimeLoadOptions = AcpRuntimeLoadOptions & {
+  storedSnapshot?: AcpRuntimeSnapshot;
 };
 
 export class AcpRuntime {
@@ -232,7 +243,7 @@ export class AcpRuntime {
   }
 
   private async loadSession(
-    options: AcpRuntimeLoadOptions & {
+    options: RuntimeLoadOptions & {
       _traceContext?: import("@opentelemetry/api").Context;
     },
   ): Promise<AcpRuntimeSession> {
@@ -288,7 +299,7 @@ export class AcpRuntime {
                 ...options,
                 _observability: this.options.observability,
                 _traceContext: spanContext,
-              } as AcpRuntimeLoadOptions),
+              } as RuntimeLoadOptions),
             );
           });
           reused = this.activeSessions.has(options.sessionId);
@@ -300,6 +311,7 @@ export class AcpRuntime {
           if (options.queue) {
             entry.driver.setQueuePolicy(options.queue);
           }
+          await this.applySnapshotConfigForOpen(entry, options.storedSnapshot);
           const initialConfigReport = await this.applyInitialConfigForOpen(
             entry,
             options.initialConfig,
@@ -618,6 +630,7 @@ export class AcpRuntime {
           if (options.queue) {
             entry.driver.setQueuePolicy(options.queue);
           }
+          await this.applySnapshotConfigForOpen(entry, options.snapshot);
           const initialConfigReport = await this.applyInitialConfigForOpen(
             entry,
             options.initialConfig,
@@ -770,6 +783,19 @@ export class AcpRuntime {
     }
   }
 
+  private async applySnapshotConfigForOpen(
+    entry: ManagedSessionEntry,
+    snapshot: AcpRuntimeSnapshot | undefined,
+  ): Promise<void> {
+    if (!snapshot) {
+      return;
+    }
+    await applyRuntimeSnapshotConfig(entry.driver, snapshot);
+    await this.sessionRegistry?.rememberSnapshot(entry.driver.snapshot(), {
+      title: entry.driver.metadata.title,
+    });
+  }
+
   private async releaseSession(
     sessionId: string,
     driver: AcpSessionDriver,
@@ -812,7 +838,7 @@ export class AcpRuntime {
 
   private async resolveSessionOpenOptions(
     options: AcpRuntimeLoadSessionOptions | AcpRuntimeResumeSessionOptions,
-  ): Promise<AcpRuntimeCreateOptions> {
+  ): Promise<ResolvedSessionOpenOptions> {
     const storedSnapshot = await this.getStoredSnapshot(options.sessionId);
     const agent = options.agent
       ? await this.resolveAgentInput(options.agent)
@@ -832,6 +858,7 @@ export class AcpRuntime {
       initialConfig: options.initialConfig,
       mcpServers: options.mcpServers ?? storedSnapshot?.mcpServers,
       queue: options.queue,
+      storedSnapshot,
     };
   }
 

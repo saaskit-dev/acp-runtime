@@ -5,10 +5,19 @@ export class MemoryWebSocket {
   private readonly closeListeners = new Set<MemoryWebSocketCloseListener>();
   private readonly errorListeners = new Set<MemoryWebSocketCloseListener>();
   private readonly messageListeners = new Set<MemoryWebSocketMessageListener>();
+  private attachment: unknown;
   private closed = false;
   peer?: MemoryWebSocket;
 
   accept(): void {}
+
+  deserializeAttachment(): unknown {
+    return this.attachment;
+  }
+
+  serializeAttachment(attachment: unknown): void {
+    this.attachment = attachment;
+  }
 
   addEventListener(
     type: "close",

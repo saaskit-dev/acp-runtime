@@ -5,6 +5,8 @@ declare class WebSocketPair {
 
 declare interface WebSocket {
   accept(): void;
+  deserializeAttachment?(): unknown;
+  serializeAttachment?(attachment: unknown): void;
 }
 
 declare interface DurableObjectId {}
@@ -15,10 +17,15 @@ declare interface DurableObjectNamespace {
 }
 
 declare interface DurableObjectState {
+  acceptWebSocket?(socket: WebSocket, tags?: string[]): void;
+  getWebSockets?(tag?: string): WebSocket[];
   storage: DurableObjectStorage;
 }
 
 declare interface DurableObjectStorage {
+  delete(key: string): Promise<boolean>;
+  get<T = unknown>(key: string): Promise<T | undefined>;
+  put<T = unknown>(key: string, value: T): Promise<void>;
   setAlarm(scheduledTime: Date | number): Promise<void>;
 }
 

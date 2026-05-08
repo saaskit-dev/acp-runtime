@@ -2,7 +2,7 @@ import type { Readable, Writable } from "node:stream";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import {
   connectAcpRemoteClientRelay,
@@ -14,6 +14,7 @@ import {
   readAcpRemoteTraceContextFromJsonRpcMessage,
   type AcpRemoteTraceContext,
 } from "../shared/trace-context.js";
+import { createAcpRemoteReconnectBackoff } from "../shared/reconnect.js";
 
 export type AcpRemoteStdioBridgeOptions = Omit<
   ConnectAcpRemoteClientRelayOptions,
@@ -62,24 +63,31 @@ export function createAcpRemoteStdioBridge(
   const output = options.output ?? process.stdout;
   const openAuthUrl = options.openAuthUrl ?? openUrl;
   const connectionId = options.connectionId ?? crypto.randomUUID();
-  const maxQueuedMessages = options.reconnect?.maxQueuedMessages ?? 128;
+  const reconnectQueuePauseThreshold =
+    options.reconnect?.maxQueuedMessages ?? 128;
   const pendingOutbound: PendingOutboundMessage[] = [];
   const deliveredResponseIds = new Set<string | number>();
   let authorizePromise: Promise<void> | undefined;
   let authUrl: string | undefined;
   let closed = false;
-  let reconnectDelayMs = options.reconnect?.minDelayMs ?? 1_000;
+  let inputPausedForReconnectQueue = false;
+  const reconnectBackoff = createAcpRemoteReconnectBackoff({
+    maxDelayMs: options.reconnect?.maxDelayMs,
+    minDelayMs: options.reconnect?.minDelayMs,
+  });
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let connection: ConnectedAcpRemoteClientRelay | undefined;
   let lineBuffer = "";
   const requestMethods = new Map<string | number, string>();
   const requestSessionIds = new Map<string | number, string>();
   const requestTraceContexts = new Map<string | number, AcpRemoteTraceContext>();
+  const inFlightOutbound = new Map<string | number, PendingOutboundMessage>();
   const debugLog = options.debugLog ?? (() => {});
   const sessionBindings = createSessionBindingStore({
     debugLog,
     relayUrl: String(options.relayUrl),
   });
+  let lastConfigOptions: unknown[] = [];
 
   const connect = () => {
     if (closed) {
@@ -106,6 +114,7 @@ export function createAcpRemoteStdioBridge(
             severityText: "ERROR",
           },
         );
+        settleInFlightRequestsAfterRelayClose();
         scheduleReconnect();
       },
       onError(error) {
@@ -119,16 +128,21 @@ export function createAcpRemoteStdioBridge(
           }
           return;
         }
+        if (responseId !== undefined) {
+          inFlightOutbound.delete(responseId);
+        }
         sessionBindings.storeFromResponse(message, requestMethods);
+        const clientMessage = injectRemoteDisplayConfigOption(message);
+        lastConfigOptions = readConfigOptions(clientMessage) ?? lastConfigOptions;
         logRelayMessage(
-          message,
+          clientMessage,
           requestMethods,
           requestSessionIds,
           requestTraceContexts,
           connectionId,
           debugLog,
         );
-        authUrl = readRelayAuthUrl(message) ?? authUrl;
+        authUrl = readRelayAuthUrl(clientMessage) ?? authUrl;
         if (authUrl && options.autoAuthorize && !authorizePromise) {
           debugLog("auto-authorize relay browser authentication");
           authorizePromise = authorizeRelay({
@@ -136,7 +150,7 @@ export function createAcpRemoteStdioBridge(
             ...options.autoAuthorize,
           });
         }
-        writeOutput(output, `${message}\n`, () => close(), () => {
+        writeOutput(output, `${clientMessage}\n`, () => close(), () => {
           if (responseId !== undefined) {
             deliveredResponseIds.add(responseId);
             sendNativeClientAck(responseId);
@@ -156,9 +170,7 @@ export function createAcpRemoteStdioBridge(
     if (closed || reconnectTimer) {
       return;
     }
-    const delayMs = reconnectDelayMs;
-    const maxDelayMs = options.reconnect?.maxDelayMs ?? 30_000;
-    reconnectDelayMs = Math.min(reconnectDelayMs * 2, maxDelayMs);
+    const delayMs = reconnectBackoff.nextDelayMs();
     debugLog(
       `relay connection closed; reconnecting in ${Math.round(delayMs / 1000)}s`,
       {
@@ -177,10 +189,12 @@ export function createAcpRemoteStdioBridge(
     if (!connection) {
       return;
     }
+    replayInFlightOutbound();
     const flushed = pendingOutbound.length;
     while (pendingOutbound.length > 0) {
       const next = pendingOutbound.shift();
       if (next !== undefined) {
+        trackInFlightOutbound(next.message);
         connection.send(next.message);
       }
     }
@@ -191,6 +205,7 @@ export function createAcpRemoteStdioBridge(
         severityText: "INFO",
       });
     }
+    resumeInputAfterReconnectQueue();
   };
 
   const sendToRelay = (message: string) => {
@@ -198,31 +213,12 @@ export function createAcpRemoteStdioBridge(
       queueOutbound(message);
       return;
     }
-    reconnectDelayMs = options.reconnect?.minDelayMs ?? 1_000;
+    reconnectBackoff.reset();
+    trackInFlightOutbound(message);
     connection.send(message);
   };
 
   const queueOutbound = (message: string) => {
-    if (pendingOutbound.length >= maxQueuedMessages) {
-      const id = readJsonRpcRequestId(message);
-      debugLog(
-        "relay unavailable; dropping outbound message because reconnect queue is full",
-        {
-          connectionId,
-          eventName: "acp.remote.bridge.reconnect_queue_full",
-          jsonRpcId: id,
-          severityText: "ERROR",
-        },
-      );
-      if (id !== undefined) {
-        writeJsonRpcError(output, id, {
-          code: -32002,
-          data: { connectionId },
-          message: "ACP relay is temporarily unavailable: reconnect queue is full.",
-        }, () => close());
-      }
-      return;
-    }
     const id = readJsonRpcRequestId(message);
     const queued: PendingOutboundMessage = {
       id,
@@ -233,6 +229,35 @@ export function createAcpRemoteStdioBridge(
       connectionId,
       eventName: "acp.remote.bridge.reconnect_queue_enqueued",
       jsonRpcId: id,
+      severityText: "INFO",
+    });
+    if (pendingOutbound.length >= reconnectQueuePauseThreshold) {
+      pauseInputForReconnectQueue();
+    }
+  };
+
+  const pauseInputForReconnectQueue = () => {
+    if (inputPausedForReconnectQueue) {
+      return;
+    }
+    inputPausedForReconnectQueue = true;
+    input.pause();
+    debugLog("paused stdio input while relay reconnect queue drains", {
+      connectionId,
+      eventName: "acp.remote.bridge.reconnect_queue_paused",
+      severityText: "INFO",
+    });
+  };
+
+  const resumeInputAfterReconnectQueue = () => {
+    if (!inputPausedForReconnectQueue || pendingOutbound.length > 0) {
+      return;
+    }
+    inputPausedForReconnectQueue = false;
+    input.resume();
+    debugLog("resumed stdio input after relay reconnect queue flushed", {
+      connectionId,
+      eventName: "acp.remote.bridge.reconnect_queue_resumed",
       severityText: "INFO",
     });
   };
@@ -248,6 +273,8 @@ export function createAcpRemoteStdioBridge(
     }
     connection?.close();
     pendingOutbound.splice(0);
+    inFlightOutbound.clear();
+    resumeInputAfterReconnectQueue();
     requestMethods.clear();
     requestSessionIds.clear();
     requestTraceContexts.clear();
@@ -284,6 +311,63 @@ export function createAcpRemoteStdioBridge(
     });
   };
 
+  const trackInFlightOutbound = (message: string) => {
+    const request = readJsonRpcRequest(message);
+    if (!request) {
+      return;
+    }
+    inFlightOutbound.set(request.id, {
+      id: request.id,
+      message,
+      method: request.method,
+    });
+  };
+
+  const replayInFlightOutbound = () => {
+    if (!connection || inFlightOutbound.size === 0) {
+      return;
+    }
+    const replayable = [...inFlightOutbound.values()].filter((entry) =>
+      isReplayableRelayClientRequest(entry.method)
+    );
+    for (const entry of replayable) {
+      connection.send(entry.message);
+    }
+    if (replayable.length > 0) {
+      debugLog(`replayed ${replayable.length} in-flight relay request(s)`, {
+        connectionId,
+        eventName: "acp.remote.bridge.inflight_replayed",
+        severityText: "INFO",
+      });
+    }
+  };
+
+  const settleInFlightRequestsAfterRelayClose = () => {
+    for (const entry of [...inFlightOutbound.values()]) {
+      if (isReplayableRelayClientRequest(entry.method)) {
+        continue;
+      }
+      inFlightOutbound.delete(entry.id!);
+      requestMethods.delete(entry.id!);
+      requestSessionIds.delete(entry.id!);
+      requestTraceContexts.delete(entry.id!);
+      const response = createRelayConnectionLostResponse(entry);
+      writeOutput(output, `${response}\n`, () => close());
+      debugLog(
+        `failed in-flight relay request after disconnect id=${formatJsonRpcId(
+          entry.id,
+        )} method=${entry.method}`,
+        {
+          connectionId,
+          eventName: "acp.remote.bridge.inflight_failed",
+          jsonRpcId: entry.id,
+          method: entry.method,
+          severityText: "ERROR",
+        },
+      );
+    }
+  };
+
   connect();
 
   const onData = (chunk: Buffer | string) => {
@@ -302,6 +386,14 @@ export function createAcpRemoteStdioBridge(
           ? addSessionSelectionId(outbound, connectionId)
           : undefined;
         outbound = sessionSelection?.message ?? outbound;
+        const remoteConfigResponse = createRemoteConfigSetResponse(
+          outbound,
+          lastConfigOptions,
+        );
+        if (remoteConfigResponse) {
+          writeOutput(output, `${remoteConfigResponse}\n`, () => close());
+          continue;
+        }
         outbound = ensureAcpRemoteTraceContext(outbound).message;
         logClientMessage(
           outbound,
@@ -362,15 +454,18 @@ export function createAcpRemoteStdioBridge(
 type PendingOutboundMessage = {
   id?: string | number;
   message: string;
+  method?: string;
 };
 
 const REMOTE_DAEMON_ID_META = "acp-runtime/remote/daemonId";
 const REMOTE_SESSION_AGENT_META = "acp-runtime/remote/sessionAgent";
+const REMOTE_SESSION_MACHINE_META = "acp-runtime/remote/sessionMachine";
 const REMOTE_SESSION_SELECTION_ID_META =
   "acp-runtime/remote/sessionSelectionId";
 const REMOTE_SESSION_WORKSPACE_ROOTS_META =
   "acp-runtime/remote/sessionWorkspaceRoots";
 const NATIVE_CLIENT_ACK_METHOD = "acp-runtime/remote/client_ack";
+const REMOTE_CONFIG_OPTION_PREFIX = "acp-runtime.remote.";
 
 function openUrl(url: string): void {
   const command =
@@ -614,6 +709,10 @@ function readRemoteBindingMetadata(
   if (agent) {
     metadata[REMOTE_SESSION_AGENT_META] = agent;
   }
+  const machine = readString(value[REMOTE_SESSION_MACHINE_META]);
+  if (machine) {
+    metadata[REMOTE_SESSION_MACHINE_META] = machine;
+  }
   const workspaceRoots = readStringArray(value[REMOTE_SESSION_WORKSPACE_ROOTS_META]);
   if (workspaceRoots) {
     metadata[REMOTE_SESSION_WORKSPACE_ROOTS_META] = workspaceRoots;
@@ -779,10 +878,148 @@ function isRelaySessionNewRequest(message: string): boolean {
   return parsed?.method === "session/new";
 }
 
+function createRemoteConfigSetResponse(
+  message: string,
+  configOptions: readonly unknown[],
+): string | undefined {
+  const parsed = parseJson(message);
+  if (!parsed || parsed.method !== "session/set_config_option") {
+    return undefined;
+  }
+  const params = isRecord(parsed.params) ? parsed.params : undefined;
+  const configId = readString(params?.configId);
+  if (!configId?.startsWith(REMOTE_CONFIG_OPTION_PREFIX)) {
+    return undefined;
+  }
+  if (!Object.prototype.hasOwnProperty.call(parsed, "id")) {
+    return undefined;
+  }
+  return JSON.stringify({
+    id: parsed.id,
+    jsonrpc: "2.0",
+    result: {
+      configOptions,
+    },
+  });
+}
+
+function injectRemoteDisplayConfigOption(message: string): string {
+  const parsed = parseJson(message);
+  const result = isRecord(parsed?.result) ? parsed.result : undefined;
+  const meta = isRecord(result?._meta) ? result._meta : undefined;
+  if (!result || !meta) {
+    return message;
+  }
+  const option = createRemoteDisplayConfigOption(meta, readString(result.sessionId));
+  if (!option) {
+    return message;
+  }
+  return JSON.stringify({
+    ...parsed,
+    result: {
+      ...result,
+      configOptions: [
+        ...readNonRemoteConfigOptions(result.configOptions),
+        option,
+      ],
+    },
+  });
+}
+
+function createRemoteDisplayConfigOption(
+  meta: Record<string, unknown>,
+  sessionId?: string,
+): Record<string, unknown> | undefined {
+  if (!readString(meta[REMOTE_DAEMON_ID_META])) {
+    return undefined;
+  }
+  const machine =
+    readString(meta[REMOTE_SESSION_MACHINE_META]) ?? "Unknown machine";
+  const agent = formatSessionAgent(readSessionAgent(meta[REMOTE_SESSION_AGENT_META]));
+  const workspace =
+    readStringArray(meta[REMOTE_SESSION_WORKSPACE_ROOTS_META])?.[0] ??
+    "No workspace preference";
+  const entries = [
+    { name: machine, value: machine },
+    { name: agent, value: agent },
+    { name: workspace, value: workspace },
+    ...(sessionId
+      ? [
+          {
+            name: sessionId,
+            value: sessionId,
+          },
+        ]
+      : []),
+  ];
+  const currentValue = entries[0]?.value ?? "remote-context";
+  return {
+    category: "remote",
+    currentValue,
+    description:
+      "Remote machine, agent, workspace, and session selected in ACP relay authorization.",
+    id: `${REMOTE_CONFIG_OPTION_PREFIX}context`,
+    name: "Remote Context",
+    options: entries,
+    type: "select",
+  };
+}
+
+function readConfigOptions(message: string): unknown[] | undefined {
+  const parsed = parseJson(message);
+  const result = isRecord(parsed?.result) ? parsed.result : undefined;
+  const configOptions = Array.isArray(result?.configOptions)
+    ? result.configOptions
+    : [];
+  return configOptions.length ? configOptions : undefined;
+}
+
+function readNonRemoteConfigOptions(value: unknown): unknown[] {
+  return Array.isArray(value)
+    ? value.filter((entry) => !isRemoteConfigOption(entry))
+    : [];
+}
+
+function isRemoteConfigOption(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    readString(value.id)?.startsWith(REMOTE_CONFIG_OPTION_PREFIX) === true
+  );
+}
+
+function formatSessionAgent(agent: Record<string, unknown> | undefined): string {
+  if (!agent) {
+    return "Default daemon agent";
+  }
+  const id = readString(agent.id);
+  if (id) {
+    return id;
+  }
+  const type = readString(agent.type);
+  if (type) {
+    return type;
+  }
+  const command = readString(agent.command);
+  return command ? basename(command) : "Default daemon agent";
+}
+
 function readJsonRpcRequestId(message: string): string | number | undefined {
   const parsed = parseJson(message);
   const id = parsed?.id;
   return isJsonRpcId(id) ? id : undefined;
+}
+
+function readJsonRpcRequest(
+  message: string,
+): { id: string | number; method: string } | undefined {
+  const parsed = parseJson(message);
+  if (!parsed || typeof parsed.method !== "string" || !isJsonRpcId(parsed.id)) {
+    return undefined;
+  }
+  return {
+    id: parsed.id,
+    method: parsed.method,
+  };
 }
 
 function readJsonRpcResponseId(message: string): string | number | undefined {
@@ -798,25 +1035,28 @@ function readJsonRpcResponseId(message: string): string | number | undefined {
   return isJsonRpcId(id) ? id : undefined;
 }
 
-function writeJsonRpcError(
-  output: Writable,
-  id: string | number,
-  error: {
-    code: number;
-    data?: Record<string, unknown>;
-    message: string;
-  },
-  onClosed: () => void,
-): void {
-  writeOutput(
-    output,
-    `${JSON.stringify({
-      error,
-      id,
-      jsonrpc: "2.0",
-    })}\n`,
-    onClosed,
+function isReplayableRelayClientRequest(method: string | undefined): boolean {
+  return (
+    method === "initialize" ||
+    method === "session/list" ||
+    method === "session/load" ||
+    method === "session/prompt" ||
+    method === "session/resume"
   );
+}
+
+function createRelayConnectionLostResponse(
+  request: PendingOutboundMessage,
+): string {
+  return JSON.stringify({
+    error: {
+      code: -32001,
+      message:
+        "Relay connection closed before this request completed. The request status is unknown; retry if appropriate.",
+    },
+    id: request.id,
+    jsonrpc: "2.0",
+  });
 }
 
 function logClientMessage(

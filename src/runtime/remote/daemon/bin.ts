@@ -4,11 +4,18 @@ import {
   connectAcpRemoteDaemonRelayFromCliConfig,
   parseAcpRemoteDaemonCliConfig,
 } from "./daemon-cli.js";
-import type { AcpRemoteDaemonDebugContext } from "./relay-connection.js";
+import {
+  createAcpRemoteDaemonConnectionState,
+  type AcpRemoteDaemonDebugContext,
+} from "./relay-connection.js";
 import type { DaemonMetadata } from "./relay-client.js";
-import { createAcpRemoteWebSocketFactory } from "../shared/index.js";
+import {
+  createAcpRemoteWebSocketFactory,
+  runAcpRemoteReconnectLoop,
+} from "../shared/index.js";
 import type { AcpRemoteWebSocketConstructor } from "../shared/index.js";
 import { createStdioAcpConnectionFactory } from "../../acp/stdio-connection.js";
+import { AcpRuntime } from "../../core/runtime.js";
 import {
   CLAUDE_CODE_ACP_REGISTRY_ID,
   CODEX_ACP_REGISTRY_ID,
@@ -24,17 +31,21 @@ import {
 } from "../protocol/tickets.js";
 import { ACP_REMOTE_DEFAULT_RELAY_URL } from "../defaults.js";
 import {
+  clearCachedSession,
   loadCachedSession,
   saveSession,
   loginViaOAuth,
+  validateRelaySession,
   type DaemonSession,
 } from "./daemon-login.js";
+import { createFileAcpRemoteDaemonRequestJournal } from "./request-journal.js";
 import { configureAcpRelayTelemetryFromEnv } from "../relay-log-upload.js";
-import { execSync } from "node:child_process";
-import { appendFileSync, mkdirSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { execFileSync, execSync } from "node:child_process";
+import { appendFileSync, mkdirSync, statSync } from "node:fs";
+import { homedir, hostname, userInfo } from "node:os";
 import { join } from "node:path";
 import {
+  type AcpRemoteDaemonServiceScope,
   getAcpRemoteDaemonUserServiceStatus,
   installAcpRemoteDaemonUserService,
   startAcpRemoteDaemonUserService,
@@ -46,11 +57,15 @@ const ACP_REMOTE_DAEMON_TICKET_PUBLIC_KEYS_ENV_VAR =
   "ACP_REMOTE_DAEMON_TICKET_PUBLIC_KEYS";
 const ACP_REMOTE_DAEMON_ACCOUNT_SESSION_ENV_VAR =
   "ACP_REMOTE_DAEMON_ACCOUNT_SESSION";
-const DEFAULT_RECONNECT_MIN_DELAY_MS = 1_000;
-const DEFAULT_RECONNECT_MAX_DELAY_MS = 30_000;
+const DAEMON_BINARY_CHANGE_CHECK_INTERVAL_MS = 60_000;
 const DAEMON_LOG_DIR = join(homedir(), ".acp-runtime", "logs");
 const DAEMON_TEXT_LOG_PATH = join(DAEMON_LOG_DIR, "daemon.log.text.jsonl");
 const DAEMON_ERROR_LOG_PATH = join(DAEMON_LOG_DIR, "daemon.log.errors.jsonl");
+const DAEMON_REQUEST_JOURNAL_PATH = join(
+  homedir(),
+  ".acp-runtime",
+  "daemon-request-journal.json",
+);
 
 type DaemonAgentMetadata = DaemonMetadata["agentTypes"][number];
 
@@ -135,7 +150,7 @@ function isLocalRelayUrl(relayUrl: string): boolean {
   }
 }
 
-function readWorkspaceRoots(argv: readonly string[]): string[] {
+function readWorkspaceRoots(argv: readonly string[], defaultHomeDir = homedir()): string[] {
   const roots: string[] = [];
   for (let index = 0; index < argv.length; index += 1) {
     if (
@@ -156,7 +171,7 @@ function readWorkspaceRoots(argv: readonly string[]): string[] {
         .filter(Boolean),
     );
   }
-  return roots.length > 0 ? roots : [homedir()];
+  return roots.length > 0 ? roots : [defaultHomeDir];
 }
 
 /**
@@ -202,18 +217,19 @@ function discoverAgentsInPath(): {
 
 function buildDaemonMetadata(
   discoveredAgents: readonly DaemonAgentMetadata[],
+  runtimeInstanceId: string,
   workspaceRoots: string[],
 ): DaemonMetadata | undefined {
   const agentTypes = dedupeDaemonAgents([
     ...DEFAULT_REGISTRY_AGENTS,
     ...discoveredAgents,
   ]);
-  if (workspaceRoots.length === 0 && agentTypes.length === 0) {
-    return { agentTypes: [], workspaceRoots: [] };
-  }
   return {
     agentTypes,
-    machine: hostname(),
+    ...(agentTypes.length > 0 || workspaceRoots.length > 0
+      ? { machine: hostname() }
+      : {}),
+    runtimeInstanceId,
     workspaceRoots: workspaceRoots.map((path) => ({ path })),
   };
 }
@@ -237,7 +253,7 @@ function dedupeDaemonAgents(
 async function resolveSession(
   argv: readonly string[],
   relayUrl: string,
-  options: { forceLogin?: boolean } = {},
+  options: { forceLogin?: boolean; homeDir?: string } = {},
 ): Promise<DaemonSession> {
   // 1. CLI/env override
   const idx = argv.indexOf("--account-session");
@@ -251,10 +267,24 @@ async function resolveSession(
 
   // 2. Cached session
   if (!options.forceLogin) {
-    const cached = await loadCachedSession();
+    const cached = await loadCachedSession(options.homeDir);
     if (cached) {
-      process.stderr.write(`Using cached session (${cached.accountId}).\n`);
-      return cached;
+      const validation = await validateRelaySession({ relayUrl, session: cached });
+      if (validation.ok) {
+        process.stderr.write(`Using cached session (${validation.accountId}).\n`);
+        return { ...cached, accountId: validation.accountId };
+      }
+      if (!validation.retryable) {
+        await clearCachedSession(options.homeDir);
+      }
+      throw new Error(
+        [
+          `Cached ACP relay session is no longer valid: ${validation.reason}`,
+          validation.retryable
+            ? "Keep the cached login and retry after the relay/network is reachable."
+            : "Run `acp-runtime auth login --force` to refresh login, then restart the daemon.",
+        ].join("\n"),
+      );
     }
   } else {
     process.stderr.write("Ignoring cached session because --force-login was set.\n");
@@ -265,8 +295,8 @@ async function resolveSession(
     "No cached session. Opening browser for GitHub login...\n",
   );
   const session = await loginViaOAuth(relayUrl);
-  await saveSession(session);
-  process.stderr.write(`Session saved for account ${session.accountId}.\n`);
+  await saveSession(session, options.homeDir);
+  process.stderr.write(`Session saved for account ${session.accountId} at ~/.acp-runtime/relay-session.json.\n`);
   return session;
 }
 
@@ -285,27 +315,63 @@ async function main(rawArgv: readonly string[]): Promise<void> {
     printHelp();
     return;
   }
+  const serviceOptions = readServiceOptions(argv, command.name);
+  if (serviceOptions.modeConflict) {
+    if (command.name === "status") {
+      process.stdout.write(
+        "mode: conflict\nBoth user and system daemon services are installed. " +
+        "Install one mode again to switch cleanly, or uninstall one mode explicitly.\n",
+      );
+      printServiceStatus(serviceOptions.modeConflict.userStatus, "user");
+      printServiceStatus(serviceOptions.modeConflict.systemStatus, "system");
+      return;
+    }
+    throw new Error(
+      "Both user and system daemon services are installed. Pass --system to manage " +
+      "the system daemon, or uninstall one mode before using automatic mode detection.",
+    );
+  }
+  if (shouldRerunWithSudo(command.name, serviceOptions.scope)) {
+    rerunWithSudo(rawArgv);
+    return;
+  }
 
   switch (command.name) {
     case "install":
       await installService(argv);
       return;
     case "uninstall":
-      await uninstallAcpRemoteDaemonUserService();
+      await uninstallAcpRemoteDaemonUserService(
+        undefined,
+        serviceOptions.scope,
+        serviceOptions.homeDir,
+      );
       process.stdout.write("ACP remote daemon service uninstalled.\n");
       return;
     case "start": {
-      const status = startAcpRemoteDaemonUserService();
+      const status = await startAcpRemoteDaemonUserService(
+        undefined,
+        serviceOptions.scope,
+        serviceOptions.homeDir,
+      );
       printServiceStatus(status);
       return;
     }
     case "stop": {
-      const status = stopAcpRemoteDaemonUserService();
+      const status = stopAcpRemoteDaemonUserService(
+        undefined,
+        serviceOptions.scope,
+        serviceOptions.homeDir,
+      );
       printServiceStatus(status);
       return;
     }
     case "status": {
-      const status = getAcpRemoteDaemonUserServiceStatus();
+      const status = getAcpRemoteDaemonUserServiceStatus(
+        undefined,
+        serviceOptions.scope,
+        serviceOptions.homeDir,
+      );
       printServiceStatus(status);
       return;
     }
@@ -317,35 +383,43 @@ async function main(rawArgv: readonly string[]): Promise<void> {
 
 async function installService(argv: readonly string[]): Promise<void> {
   const config = parseAcpRemoteDaemonCliConfig({ argv });
-  const workspaceRoots = readWorkspaceRoots(argv);
-  const session = await resolveSession(argv, config.relayUrl, {
+  const serviceOptions = readServiceOptions(argv, "install");
+  const workspaceRoots = readWorkspaceRoots(argv, serviceOptions.homeDir);
+  await resolveSession(argv, config.relayUrl, {
     forceLogin: config.forceLogin,
+    homeDir: serviceOptions.homeDir,
   });
   const env = {
     ...process.env,
-    ...(session.accountId ? { ACP_REMOTE_DAEMON_ACCOUNT_ID: session.accountId } : {}),
-    ...(config.accountSession ? { ACP_REMOTE_DAEMON_ACCOUNT_SESSION: config.accountSession } : {}),
   };
   const status = await installAcpRemoteDaemonUserService({
     daemonBinPath: process.argv[1],
     daemonId: config.daemonId,
     env,
+    homeDir: serviceOptions.homeDir,
     identityPath: config.identityPath,
     nodePath: process.execPath,
     relayUrl: config.relayUrl,
+    scope: serviceOptions.scope,
+    userName: serviceOptions.userName,
     workspaceRoots,
   });
   printServiceStatus(status);
   process.stdout.write(
-    `Installed ACP remote daemon service. Logs: ${homedir()}/.acp-runtime/logs/daemon.err.log\n`,
+    `Installed ACP remote daemon service. Logs: ${serviceOptions.homeDir}/.acp-runtime/logs/daemon.err.log\n`,
   );
 }
 
 async function runDaemon(argv: readonly string[]): Promise<void> {
   const config = parseAcpRemoteDaemonCliConfig({ argv });
   const workspaceRoots = readWorkspaceRoots(argv);
+  const runtimeInstanceId = crypto.randomUUID();
   const discoveredAgents = discoverAgentsInPath();
-  config.daemonMetadata = buildDaemonMetadata(discoveredAgents, workspaceRoots);
+  config.daemonMetadata = buildDaemonMetadata(
+    discoveredAgents,
+    runtimeInstanceId,
+    workspaceRoots,
+  );
   const WebSocketConstructor = await resolveWebSocket();
   const ticketVerificationKeys = readTicketVerificationKeys(config.relayUrl);
   const session = await resolveSession(argv, config.relayUrl, {
@@ -359,6 +433,7 @@ async function runDaemon(argv: readonly string[]): Promise<void> {
       "acp.remote.account_id": config.accountId,
       "acp.remote.daemon_id": config.daemonId,
       "acp.remote.machine": config.daemonMetadata?.machine,
+      "acp.remote.runtime_instance_id": runtimeInstanceId,
       "acp.remote.workspace_roots": workspaceRoots,
     },
     onError(error) {
@@ -402,7 +477,11 @@ async function runDaemon(argv: readonly string[]): Promise<void> {
     writeDaemonLog(message, undefined, context?.severityText ?? "INFO", context);
   };
 
-  const connectionFactory = createStdioAcpConnectionFactory();
+  const runtime = new AcpRuntime(createStdioAcpConnectionFactory());
+  const daemonConnectionState = createAcpRemoteDaemonConnectionState();
+  const requestJournal = createFileAcpRemoteDaemonRequestJournal({
+    path: DAEMON_REQUEST_JOURNAL_PATH,
+  });
   const agentList =
     config.daemonMetadata?.agentTypes.length
       ? config.daemonMetadata.agentTypes
@@ -411,60 +490,70 @@ async function runDaemon(argv: readonly string[]): Promise<void> {
           .join(", ")
       : "(none configured)";
   let stopping = false;
-  let reconnectDelayMs = DEFAULT_RECONNECT_MIN_DELAY_MS;
   let active: { close(): void } | undefined;
   const stop = () => {
     stopping = true;
     active?.close();
   };
+  const stopWatchingDaemonBinary = watchDaemonBinaryForChanges({
+    daemonBinPath: process.argv[1],
+    onChange({ currentMtimeMs, initialMtimeMs }) {
+      writeDaemonLog(
+        "Daemon executable changed on disk. Exiting so launchd can restart with the updated code.",
+        {
+          "acp.remote.daemon_bin": process.argv[1],
+          "acp.remote.daemon_bin_initial_mtime_ms": initialMtimeMs,
+          "acp.remote.daemon_bin_current_mtime_ms": currentMtimeMs,
+        },
+      );
+      process.exit(0);
+    },
+  });
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
 
-  while (!stopping) {
-    writeDaemonLog(
-      `Connecting to ${config.relayUrl}${config.daemonId ? ` (${config.daemonId})` : ""} (agents: ${agentList})...`,
-      { "acp.remote.relay_url": config.relayUrl },
-    );
-    try {
-      const connected = await connectAcpRemoteDaemonRelayFromCliConfig({
+  await runAcpRemoteReconnectLoop({
+    connect: async () => {
+      writeDaemonLog(
+        `Connecting to ${config.relayUrl}${config.daemonId ? ` (${config.daemonId})` : ""} (agents: ${agentList})...`,
+        { "acp.remote.relay_url": config.relayUrl },
+      );
+      return connectAcpRemoteDaemonRelayFromCliConfig({
         config,
-        connectionFactory,
         debugLog,
+        runtime,
+        requestJournal,
         socketFactory: createAcpRemoteWebSocketFactory(WebSocketConstructor),
+        state: daemonConnectionState,
         ticketVerificationKeys,
       });
+    },
+    isStopping: () => stopping,
+    onConnected(connected) {
       active = connected;
-      reconnectDelayMs = DEFAULT_RECONNECT_MIN_DELAY_MS;
       writeDaemonLog(
         `Daemon connected (${connected.daemonId}). Waiting for clients...`,
         { "acp.remote.daemon_id": connected.daemonId },
       );
-      await waitForDaemonDisconnect(connected);
+    },
+    onConnectError(error) {
       active = undefined;
-      if (!stopping) {
-        writeDaemonLog("Relay connection closed. Reconnecting...");
-      }
-    } catch (error) {
-      active = undefined;
-      if (stopping) {
-        break;
-      }
       writeDaemonLog(
         `Relay connection failed: ${error instanceof Error ? error.message : error}`,
         { "acp.remote.error": error instanceof Error ? error.message : String(error) },
         "ERROR",
       );
-    }
-
-    if (!stopping) {
-      writeDaemonLog(`Retrying in ${Math.round(reconnectDelayMs / 1000)}s...`);
-      await delay(reconnectDelayMs);
-      reconnectDelayMs = Math.min(
-        reconnectDelayMs * 2,
-        DEFAULT_RECONNECT_MAX_DELAY_MS,
-      );
-    }
-  }
+    },
+    onDisconnected() {
+      active = undefined;
+      writeDaemonLog("Relay connection closed. Reconnecting...");
+    },
+    onRetry(delayMs) {
+      writeDaemonLog(`Retrying in ${Math.round(delayMs / 1000)}s...`);
+    },
+    waitForDisconnect: waitForDaemonDisconnect,
+  });
+  stopWatchingDaemonBinary?.();
   await relayTelemetry?.close();
 }
 
@@ -522,8 +611,9 @@ function daemonSessionLogDir(sessionId: string): string {
 
 function waitForDaemonDisconnect(input: {
   close(): void;
+  daemonId: string;
   socket: {
-    addEventListener(type: "close" | "error", listener: () => void): void;
+    addEventListener(type: "close" | "error", listener: (event?: unknown) => void): void;
     send(data: string): void;
   };
 }): Promise<void> {
@@ -539,8 +629,14 @@ function waitForDaemonDisconnect(input: {
     }
   }, 15_000);
   return new Promise((resolve) => {
-    const done = () => {
+    const done = (event?: unknown) => {
       clearInterval(heartbeat);
+      const details = normalizeDaemonSocketCloseEvent(event);
+      const message = details
+        ? `Relay connection closed (${details}).`
+        : "Relay connection closed.";
+      process.stderr.write(`${message}\n`);
+      appendDaemonClassifiedLog(message, "INFO");
       resolve();
     };
     input.socket.addEventListener("close", done);
@@ -548,8 +644,21 @@ function waitForDaemonDisconnect(input: {
   });
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function normalizeDaemonSocketCloseEvent(event: unknown): string | undefined {
+  if (typeof event !== "object" || event === null) {
+    return undefined;
+  }
+  const candidate = event as { code?: unknown; reason?: unknown };
+  const parts: string[] = [];
+  if (typeof candidate.code === "number") {
+    parts.push(`code=${candidate.code}`);
+  }
+  if (typeof candidate.reason === "string" && candidate.reason) {
+    parts.push(`reason=${candidate.reason}`);
+  } else if (candidate.reason instanceof Uint8Array && candidate.reason.length) {
+    parts.push(`reason=${new TextDecoder().decode(candidate.reason)}`);
+  }
+  return parts.length ? parts.join(" ") : undefined;
 }
 
 function readCommand(argv: readonly string[]): {
@@ -570,16 +679,158 @@ function readCommand(argv: readonly string[]): {
   return { argv, name: "run" };
 }
 
+function readServiceOptions(
+  argv: readonly string[],
+  commandName: "install" | "run" | "start" | "status" | "stop" | "uninstall",
+): {
+  homeDir: string;
+  modeConflict?: {
+    systemStatus: ReturnType<typeof getAcpRemoteDaemonUserServiceStatus>;
+    userStatus: ReturnType<typeof getAcpRemoteDaemonUserServiceStatus>;
+  };
+  scope: AcpRemoteDaemonServiceScope;
+  userName?: string;
+} {
+  const system = argv.includes("--system");
+  const userHomeDir = readOptionValue(argv, "--home-dir") ?? homedir();
+  if (!system && commandName !== "install" && commandName !== "run") {
+    const userStatus = getAcpRemoteDaemonUserServiceStatus(
+      undefined,
+      "user",
+      userHomeDir,
+    );
+    const systemStatus = getAcpRemoteDaemonUserServiceStatus(
+      undefined,
+      "system",
+      userHomeDir,
+    );
+    if (systemStatus.installed && !userStatus.installed) {
+      return {
+        homeDir: userHomeDir,
+        scope: "system",
+        userName: process.env.SUDO_USER ?? userInfo().username,
+      };
+    }
+    if (systemStatus.installed && userStatus.installed) {
+      return {
+        homeDir: userHomeDir,
+        modeConflict: { systemStatus, userStatus },
+        scope: "user",
+      };
+    }
+  }
+  if (!system) {
+    return {
+      homeDir: userHomeDir,
+      scope: "user",
+    };
+  }
+
+  const userName = readOptionValue(argv, "--user") ??
+    process.env.SUDO_USER ??
+    userInfo().username;
+  const homeDir = readOptionValue(argv, "--home-dir") ?? resolveUserHome(userName);
+  return {
+    homeDir,
+    scope: "system",
+    userName,
+  };
+}
+
+function shouldRerunWithSudo(
+  command: "install" | "run" | "start" | "status" | "stop" | "uninstall",
+  scope: AcpRemoteDaemonServiceScope,
+): boolean {
+  return (
+    scope === "system" &&
+    command !== "run" &&
+    command !== "status" &&
+    process.getuid?.() !== 0
+  );
+}
+
+function rerunWithSudo(argv: readonly string[]): void {
+  execFileSync("sudo", [process.execPath, process.argv[1], ...argv], {
+    stdio: "inherit",
+  });
+}
+
+function readOptionValue(
+  argv: readonly string[],
+  option: string,
+): string | undefined {
+  const index = argv.indexOf(option);
+  if (index === -1) {
+    return undefined;
+  }
+  const value = argv[index + 1];
+  if (!value || value.startsWith("--")) {
+    throw new Error(`Missing value for ${option}.`);
+  }
+  return value;
+}
+
+function resolveUserHome(userName: string): string {
+  try {
+    const output = execSync(`dscl . -read /Users/${shellEscape(userName)} NFSHomeDirectory`, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const match = output.match(/NFSHomeDirectory:\s*(.+)\s*$/m);
+    if (match?.[1]) {
+      return match[1].trim();
+    }
+  } catch {
+    // Fall through to the conventional macOS user home path.
+  }
+  return `/Users/${userName}`;
+}
+
+function watchDaemonBinaryForChanges(input: {
+  daemonBinPath: string | undefined;
+  onChange(input: { currentMtimeMs: number; initialMtimeMs: number }): void;
+}): (() => void) | undefined {
+  const initialMtimeMs = readFileMtimeMs(input.daemonBinPath);
+  if (initialMtimeMs === undefined) {
+    return undefined;
+  }
+  const timer = setInterval(() => {
+    const currentMtimeMs = readFileMtimeMs(input.daemonBinPath);
+    if (currentMtimeMs === undefined || currentMtimeMs === initialMtimeMs) {
+      return;
+    }
+    clearInterval(timer);
+    input.onChange({ currentMtimeMs, initialMtimeMs });
+  }, DAEMON_BINARY_CHANGE_CHECK_INTERVAL_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+function readFileMtimeMs(path: string | undefined): number | undefined {
+  if (!path) {
+    return undefined;
+  }
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return undefined;
+  }
+}
+
+function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 function printHelp(): void {
   process.stdout.write(
     [
       "Usage:",
       "  acp-runtime daemon run [--relay-url <ws-url>]",
-      "  acp-runtime daemon install [--relay-url <ws-url>] [--workspace-root <path>...]",
-      "  acp-runtime daemon status",
-      "  acp-runtime daemon stop",
-      "  acp-runtime daemon start",
-      "  acp-runtime daemon uninstall",
+      "  acp-runtime daemon install [--relay-url <ws-url>] [--workspace-root <path>...] [--system]",
+      "  acp-runtime daemon status [--system]",
+      "  acp-runtime daemon stop [--system]",
+      "  acp-runtime daemon start [--system]",
+      "  acp-runtime daemon uninstall [--system]",
       "",
       "Options:",
       `  --relay-url          Relay WebSocket URL (default: ${ACP_REMOTE_DEFAULT_RELAY_URL})`,
@@ -588,6 +839,9 @@ function printHelp(): void {
       "  --workspace-root     Workspace root path (repeatable; default: home directory)",
       "  --account-session    Account session token (skip browser OAuth)",
       "  --force-login        Ignore cached session and open browser OAuth",
+      "  --system             Install/manage a boot-time LaunchDaemon instead of a login-time LaunchAgent",
+      "  --user               User for --system LaunchDaemon (default: SUDO_USER or current user)",
+      "  --home-dir           Home directory for --system (default: detected user home)",
       "",
       "Environment variables:",
       "  ACP_REMOTE_DAEMON_RELAY_URL            Relay WebSocket URL",
@@ -597,6 +851,9 @@ function printHelp(): void {
       "",
       "Service install:",
       "  install writes a macOS user LaunchAgent with RunAtLoad and KeepAlive.",
+      "  install --system writes a root-owned LaunchDaemon in /Library/LaunchDaemons",
+      "  and runs the daemon as the invoking sudo user by default.",
+      "  Installing one mode removes or rejects the other so only one service mode is active.",
       "  The daemon process also reconnects to the relay with exponential backoff.",
       "",
       "Agent discovery:",
@@ -606,7 +863,7 @@ function printHelp(): void {
       "",
       "Login flow:",
       "  If no --account-session or env var is set, the daemon checks",
-      "  ~/.acp/relay-session.json, otherwise opens browser OAuth and saves it.",
+      "  ~/.acp-runtime/relay-session.json, otherwise opens browser OAuth and saves it.",
       "  Use --force-login to refresh an expired or mismatched cached session.",
       "",
       "Local development:",
@@ -625,9 +882,10 @@ function printServiceStatus(status: {
   label: string;
   plistPath: string;
   running: boolean;
-}): void {
+}, mode?: AcpRemoteDaemonServiceScope): void {
   process.stdout.write(
     [
+      ...(mode ? [`mode: ${mode}`] : []),
       `label: ${status.label}`,
       `installed: ${status.installed ? "yes" : "no"}`,
       `running: ${status.running ? "yes" : "no"}`,

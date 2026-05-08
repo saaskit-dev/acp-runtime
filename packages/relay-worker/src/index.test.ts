@@ -1,9 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  AcpRemoteChannelKind,
+  AcpRemoteEndpointKind,
+  AcpRemoteFrameType,
   createAcpRemoteDeviceKeyPair,
   createAcpRemoteDeviceRenewalSignature,
+  createAcpRemoteSignedConnectionTicket,
+  type AcpRemoteDataFrame,
 } from "../../../src/runtime/remote/protocol/index.js";
+import { createMemoryWebSocketPair } from "../../../src/runtime/remote/shared/test-helpers.js";
 import { createAcpRelayAccountSessionToken } from "./account-session.js";
 import {
   AcpRelayD1ControlPlaneStore,
@@ -15,7 +21,7 @@ import {
   createDaemonRegistrationKeyPair,
   createDaemonRegistrationKeySignature,
 } from "./daemon-auth.js";
-import worker, { type Env } from "./index.js";
+import worker, { AcpRelayShard, type Env } from "./index.js";
 
 describe("relay worker control-plane endpoints", () => {
   it("requires a control-plane secret", async () => {
@@ -374,6 +380,334 @@ describe("relay worker control-plane endpoints", () => {
       accountId: "acct-1",
       connectionId: "conn-1",
     });
+  });
+
+  it("restores hibernated relay sockets from Durable Object attachments", async () => {
+    const database = new FakeD1Database({
+      accounts: [{ account_id: "acct-1", disabled: 0 }],
+      clientDevices: [
+        {
+          account_id: "acct-1",
+          client_device_id: "native-acp-client",
+          disabled: 0,
+          public_key: "native-client-key-not-used",
+        },
+      ],
+      grants: [
+        {
+          account_id: "acct-1",
+          client_device_id: null,
+          grant_id: "grant-1",
+          host_id: "host-1",
+          policy_version: 1,
+          revoked: 0,
+          scopes_json: JSON.stringify(["acp:connect", "acp:session:list"]),
+          workspace_id: null,
+        },
+      ],
+      hosts: [
+        {
+          account_id: "acct-1",
+          disabled: 0,
+          host_id: "host-1",
+          public_key: "host-public-key",
+        },
+      ],
+    });
+    const connectionId = "conn-hibernated";
+    const [daemonPeer, daemonSocket] = createMemoryWebSocketPair();
+    const [, clientSocket] = createMemoryWebSocketPair();
+    const daemonFrames: unknown[] = [];
+    daemonPeer.addEventListener("message", (event) => {
+      daemonFrames.push(JSON.parse(String(event.data)));
+    });
+    const ticket = await createAcpRemoteSignedConnectionTicket({
+      connectionId,
+      grant: {
+        accountId: "acct-1",
+        clientId: "native-acp-client",
+        daemonId: "host-1",
+        policyVersion: 1,
+        scopes: ["acp:connect", "acp:session:list"],
+      },
+      jti: "ticket-hibernated",
+      key: { kid: "test-key", secret: "relay-ticket-secret" },
+      now: new Date("2026-05-07T00:00:00.000Z"),
+      ttlMs: 60_000,
+    });
+    daemonSocket.serializeAttachment({
+      connectedAt: Date.now(),
+      connectionId: "daemon-hibernated",
+      daemonId: "host-1",
+      daemonMetadata: { agentTypes: [], workspaceRoots: [] },
+      endpoint: AcpRemoteEndpointKind.Daemon,
+      version: 1,
+    });
+    clientSocket.serializeAttachment({
+      accountId: "acct-1",
+      authUrl: "https://relay.test/authorize?connectionId=conn-hibernated",
+      bootstrapComplete: true,
+      clientId: "native-acp-client",
+      connectedAt: Date.now(),
+      connectionId,
+      daemonId: "host-1",
+      endpoint: AcpRemoteEndpointKind.Client,
+      nativeClientAck: true,
+      ticket,
+      transport: "native-acp",
+      version: 1,
+    });
+    const pendingResponseFrame: AcpRemoteDataFrame = {
+      channelId: "acp",
+      channelKind: AcpRemoteChannelKind.Acp,
+      connectionId,
+      frameType: AcpRemoteFrameType.Data,
+      payload: { id: 2, jsonrpc: "2.0", result: { ok: true } },
+      seq: 55,
+    };
+    const storage = new Map<string, unknown>([
+      [
+        `client-state:${connectionId}`,
+        {
+          bootstrapComplete: true,
+          bufferedClientPayloads: [],
+          clientPendingFrames: [pendingResponseFrame],
+          connectionId,
+          daemonId: "host-1",
+          daemonPendingFrames: [],
+          daemonQueuedFrames: [],
+          daemonRequests: [],
+          seq: 0,
+          ticket,
+        },
+      ],
+    ]);
+
+    const shard = new AcpRelayShard(
+      {
+        getWebSockets() {
+          return [daemonSocket, clientSocket] as unknown as WebSocket[];
+        },
+        storage: {
+          async delete(key: string) {
+            return storage.delete(key);
+          },
+          async get(key: string) {
+            return storage.get(key);
+          },
+          async put(key: string, value: unknown) {
+            storage.set(key, value);
+          },
+          async setAlarm() {},
+        },
+      } as DurableObjectState,
+      createEnv({
+        ACP_RELAY_DB: database as unknown as D1Database,
+        ACP_RELAY_TICKET_KID: "test-key",
+        ACP_RELAY_TICKET_SECRET: "relay-ticket-secret",
+      }),
+    );
+
+    await shard.webSocketMessage(
+      clientSocket as unknown as WebSocket,
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "acp-runtime/remote/client_ack",
+        params: { id: 2 },
+      }),
+    );
+    await shard.webSocketMessage(
+      clientSocket as unknown as WebSocket,
+      JSON.stringify({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "session/list",
+        params: {},
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    expect(
+      daemonFrames.some((frame) => {
+        const candidate = frame as { ack?: unknown; frameType?: unknown };
+        return (
+          candidate.frameType === AcpRemoteFrameType.Ack &&
+          candidate.ack === 55
+        );
+      }),
+    ).toBe(true);
+    expect(
+      daemonFrames.some((frame) => {
+        const candidate = frame as Partial<AcpRemoteDataFrame>;
+        return (
+          candidate.frameType === AcpRemoteFrameType.Data &&
+          candidate.channelKind === AcpRemoteChannelKind.Acp &&
+          typeof candidate.payload === "object" &&
+          candidate.payload !== null &&
+          "method" in candidate.payload &&
+          candidate.payload.method === "session/list"
+        );
+      }),
+    ).toBe(true);
+  });
+
+  it("applies ticket TTL and renewal window Worker variables", async () => {
+    const database = new FakeD1Database({
+      accounts: [{ account_id: "acct-1", disabled: 0 }],
+      clientDevices: [
+        {
+          account_id: "acct-1",
+          client_device_id: "native-acp-client",
+          disabled: 0,
+          public_key: "native-client-key-not-used",
+        },
+      ],
+      grants: [
+        {
+          account_id: "acct-1",
+          client_device_id: null,
+          grant_id: "grant-1",
+          host_id: "host-1",
+          policy_version: 1,
+          revoked: 0,
+          scopes_json: JSON.stringify(["acp:connect", "acp:session:list"]),
+          workspace_id: null,
+        },
+      ],
+      hosts: [
+        {
+          account_id: "acct-1",
+          disabled: 0,
+          host_id: "host-1",
+          public_key: "host-public-key",
+        },
+      ],
+    });
+    const connectionId = "conn-env-ticket";
+    const [daemonPeer, daemonSocket] = createMemoryWebSocketPair();
+    const [clientPeer, clientSocket] = createMemoryWebSocketPair();
+    const daemonFrames: unknown[] = [];
+    const clientMessages: unknown[] = [];
+    daemonPeer.addEventListener("message", (event) => {
+      daemonFrames.push(JSON.parse(String(event.data)));
+    });
+    clientPeer.addEventListener("message", (event) => {
+      clientMessages.push(JSON.parse(String(event.data)));
+    });
+    daemonSocket.serializeAttachment({
+      connectedAt: Date.now(),
+      connectionId: "daemon-env-ticket",
+      daemonId: "host-1",
+      daemonMetadata: { agentTypes: [], workspaceRoots: [] },
+      endpoint: AcpRemoteEndpointKind.Daemon,
+      version: 1,
+    });
+    clientSocket.serializeAttachment({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      clientId: "native-acp-client",
+      connectedAt: Date.now(),
+      connectionId,
+      endpoint: AcpRemoteEndpointKind.Client,
+      nativeClientAck: false,
+      transport: "native-acp",
+      version: 1,
+    });
+    const storage = new Map<string, unknown>();
+    const shard = new AcpRelayShard(
+      {
+        getWebSockets() {
+          return [daemonSocket, clientSocket] as unknown as WebSocket[];
+        },
+        storage: {
+          async delete(key: string) {
+            return storage.delete(key);
+          },
+          async get(key: string) {
+            return storage.get(key);
+          },
+          async put(key: string, value: unknown) {
+            storage.set(key, value);
+          },
+          async setAlarm() {},
+        },
+      } as DurableObjectState,
+      createEnv({
+        ACP_RELAY_DB: database as unknown as D1Database,
+        ACP_RELAY_TICKET_KID: "test-key",
+        ACP_RELAY_TICKET_RENEW_BEFORE_MS: "180000",
+        ACP_RELAY_TICKET_SECRET: "relay-ticket-secret",
+        ACP_RELAY_TICKET_TTL_MS: "120000",
+      }),
+    );
+
+    const response = await shard.fetch(
+      new Request(`https://relay.test/authorize?connectionId=${connectionId}`, {
+        body: JSON.stringify({ daemonId: "host-1" }),
+        headers: {
+          "content-type": "application/json",
+          "x-acp-verified-account-id": "acct-1",
+        },
+        method: "POST",
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    const result = (await response.json()) as {
+      ok?: boolean;
+      ticket?: {
+        payload?: {
+          expiresAt?: string;
+          issuedAt?: string;
+        };
+      };
+    };
+    expect(result.ok).toBe(true);
+    expect(
+      Date.parse(result.ticket?.payload?.expiresAt ?? "") -
+        Date.parse(result.ticket?.payload?.issuedAt ?? ""),
+    ).toBe(120_000);
+
+    await shard.webSocketMessage(
+      clientSocket as unknown as WebSocket,
+      JSON.stringify({
+        id: "auth",
+        jsonrpc: "2.0",
+        method: "authenticate",
+        params: { methodId: "acp-runtime-browser" },
+      }),
+    );
+    daemonFrames.length = 0;
+    clientMessages.length = 0;
+    await shard.webSocketMessage(
+      clientSocket as unknown as WebSocket,
+      JSON.stringify({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "session/list",
+        params: {},
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const renewFrame = daemonFrames.find((frame) => {
+      const candidate = frame as { frameType?: unknown };
+      return candidate.frameType === AcpRemoteFrameType.Renew;
+    }) as
+      | {
+          ticket?: {
+            payload?: {
+              expiresAt?: string;
+              issuedAt?: string;
+            };
+          };
+        }
+      | undefined;
+    expect(renewFrame).toBeTruthy();
+    expect(
+      Date.parse(renewFrame?.ticket?.payload?.expiresAt ?? "") -
+        Date.parse(renewFrame?.ticket?.payload?.issuedAt ?? ""),
+    ).toBe(120_000);
   });
 
   it("accepts account-session log uploads without D1 and emits Cloudflare log records", async () => {

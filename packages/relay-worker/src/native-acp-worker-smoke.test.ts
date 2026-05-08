@@ -303,6 +303,13 @@ function createSmokeEnv(
   const shard = new AcpRelayShard(
     {
       storage: {
+        async delete() {
+          return true;
+        },
+        async get() {
+          return undefined;
+        },
+        async put() {},
         async setAlarm() {},
       },
     } as DurableObjectState,

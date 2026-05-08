@@ -1,8 +1,11 @@
 import {
   ACP_REMOTE_PROTOCOL_VERSION,
+  AcpRemoteChannelKind,
   AcpRemoteEndpointKind,
   AcpRemoteFrameType,
+  type AcpRemoteDataFrame,
   type AcpRemoteScope,
+  type AcpRemoteSignedConnectionTicket,
   type AcpRemoteSignedDeviceRenewalProof,
 } from "../../../src/runtime/remote/protocol/index.js";
 import {
@@ -29,6 +32,8 @@ import {
   AcpRelayBroker,
   createRelayAuthorizationPage,
   createRelayAuthorizationResultPage,
+  type AcpRelayClientStateSnapshot,
+  type AcpRelayClientTransport,
   type DaemonMetadata,
 } from "./relay-core.js";
 
@@ -48,12 +53,16 @@ export type Env = {
   ACP_RELAY_SHARDS: DurableObjectNamespace;
   ACP_RELAY_TICKET_KID?: string;
   ACP_RELAY_TICKET_PRIVATE_KEY?: string;
+  ACP_RELAY_TICKET_RENEW_BEFORE_MS?: string;
   ACP_RELAY_TICKET_SECRET?: string;
+  ACP_RELAY_TICKET_TTL_MS?: string;
 };
 
 const UPGRADE_REQUIRED = "Expected WebSocket upgrade.";
 const MAX_LOG_UPLOAD_RECORDS = 100;
 const MAX_LOG_UPLOAD_BYTES = 512 * 1024;
+const RELAY_SOCKET_ATTACHMENT_VERSION = 1;
+const RELAY_CLIENT_STATE_STORAGE_PREFIX = "client-state:";
 const DEFAULT_AUTOMATIC_GRANT_SCOPES = [
   "acp:connect",
   "acp:session:create",
@@ -62,6 +71,22 @@ const DEFAULT_AUTOMATIC_GRANT_SCOPES = [
   "acp:turn:send",
   "acp:turn:cancel",
 ] as const satisfies readonly AcpRemoteScope[];
+
+type RelayWebSocketAttachment = {
+  accountId?: string;
+  authUrl?: string;
+  bootstrapComplete?: boolean;
+  clientId?: string;
+  connectedAt: number;
+  connectionId: string;
+  daemonId?: string;
+  daemonMetadata?: DaemonMetadata;
+  endpoint: AcpRemoteEndpointKind;
+  nativeClientAck?: boolean;
+  ticket?: AcpRemoteSignedConnectionTicket;
+  transport?: AcpRelayClientTransport;
+  version: typeof RELAY_SOCKET_ATTACHMENT_VERSION;
+};
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -243,11 +268,19 @@ export default {
 export class AcpRelayShard {
   private readonly broker: AcpRelayBroker;
   private readonly heartbeatIntervalMs: number | undefined;
+  private readonly restorePromise: Promise<void>;
+  private readonly createdAt: number;
+  private instanceId: string;
 
   constructor(
     private readonly state: DurableObjectState,
     private readonly env: Env,
   ) {
+    this.createdAt = Date.now();
+    this.instanceId = crypto.randomUUID();
+    console.log(
+      `[relay-do] instance created id=${this.instanceId} time=${new Date().toISOString()}`,
+    );
     this.heartbeatIntervalMs = readOptionalPositiveInteger(
       this.env.ACP_RELAY_HEARTBEAT_INTERVAL_MS,
     );
@@ -270,6 +303,9 @@ export class AcpRelayShard {
       maxConnectionsPerAccount: readOptionalPositiveInteger(
         this.env.ACP_RELAY_MAX_CONNECTIONS_PER_ACCOUNT,
       ),
+      ticketRenewBeforeMs: readOptionalPositiveInteger(
+        this.env.ACP_RELAY_TICKET_RENEW_BEFORE_MS,
+      ),
       ticketSigningKey: this.env.ACP_RELAY_TICKET_PRIVATE_KEY
         ? {
             kid: this.env.ACP_RELAY_TICKET_KID ?? "relay-production",
@@ -281,18 +317,42 @@ export class AcpRelayShard {
             secret: this.env.ACP_RELAY_TICKET_SECRET,
           }
         : undefined,
+      ticketTtlMs: readOptionalPositiveInteger(
+        this.env.ACP_RELAY_TICKET_TTL_MS,
+      ),
+      onClientRouteAuthorized: ({ connectionId, daemonId, ticket }) => {
+        this.updateClientSocketAttachmentByConnectionId(connectionId, {
+          bootstrapComplete: true,
+          daemonId,
+          ticket,
+        });
+      },
     });
+    this.restorePromise = this.restoreHibernatedWebSockets();
   }
 
   async alarm(): Promise<void> {
+    await this.restorePromise;
+    const now = Date.now();
+    const ageMs = now - this.createdAt;
+    console.log(
+      `[relay-do] alarm fired instance=${this.instanceId} age_ms=${ageMs} daemons=${this.broker.onlineHostIds().length}`,
+    );
     this.broker.closeUnresponsiveDaemons();
     this.broker.closeExpiredDisconnectedDaemons();
-    this.broker.closeExpiredDisconnectedClients();
+    const expiredClientIds = this.broker.closeExpiredDisconnectedClients();
+    await Promise.all(
+      expiredClientIds.map((connectionId) =>
+        this.deleteClientStateSnapshot(connectionId),
+      ),
+    );
+    await this.writeAllClientStateSnapshots();
     this.broker.pingDaemons();
     await this.scheduleHeartbeat();
   }
 
   async fetch(request: Request): Promise<Response> {
+    await this.restorePromise;
     const url = new URL(request.url);
     if (url.pathname === "/internal/reconcile-authorizations") {
       return this.reconcileAuthorizations(request);
@@ -324,15 +384,37 @@ export class AcpRelayShard {
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
-    server.accept();
+    const connectedAt = Date.now();
+    this.acceptRelayWebSocket(server, {
+      connectedAt,
+      connectionId,
+      daemonId,
+      endpoint,
+      version: RELAY_SOCKET_ATTACHMENT_VERSION,
+    });
+
+    console.log(
+      `[relay-do] ws connected endpoint=${endpoint} connectionId=${connectionId} daemonId=${daemonId ?? "none"} instance=${this.instanceId}`,
+    );
 
     if (endpoint === AcpRemoteEndpointKind.Daemon) {
       if (!daemonId) {
         server.close(1008, "Missing daemon id.");
       } else {
         const daemonMetadata = parseDaemonMetadataHeaders(request);
-        this.broker.registerDaemon(daemonId, server, daemonMetadata);
-        void this.scheduleHeartbeat();
+        this.updateSocketAttachment(server, {
+          daemonMetadata,
+        });
+        void (async () => {
+          try {
+            await this.broker.registerDaemon(daemonId, server, daemonMetadata);
+            await this.writeAllClientStateSnapshots();
+            await this.scheduleHeartbeat();
+          } catch (error) {
+            console.error("Failed to register ACP relay daemon route", error);
+            server.close(1011, "Failed to register daemon route.");
+          }
+        })();
       }
     } else {
       const agentCommand = url.searchParams.get("agentCommand");
@@ -342,16 +424,29 @@ export class AcpRelayShard {
         clientTransport === "remote-frame"
           ? (resolveVerifiedAccountId(request) ?? resolveAccountId(request, url))
           : await resolveAuthenticatedAccountId(request, url, this.env);
-      this.broker.registerClient({
+      const clientId = resolveClientId(request, url);
+      const authUrl = createAuthorizationUrl(request, connectionId).toString();
+      const nativeClientAck = url.searchParams.get("nativeClientAck") === "1";
+      const stateSnapshot = await this.readClientStateSnapshot(connectionId);
+      this.updateSocketAttachment(server, {
         accountId,
-        authUrl: createAuthorizationUrl(request, connectionId).toString(),
-        clientId: resolveClientId(request, url),
-        connectionId,
-        daemonId,
-        nativeClientAck: url.searchParams.get("nativeClientAck") === "1",
-        socket: server,
+        authUrl,
+        clientId,
+        nativeClientAck,
         transport: clientTransport,
       });
+      this.broker.registerClient({
+        accountId,
+        authUrl,
+        clientId,
+        connectionId,
+        daemonId,
+        nativeClientAck,
+        socket: server,
+        stateSnapshot,
+        transport: clientTransport,
+      });
+      await this.writeOrDeleteClientStateSnapshot(connectionId);
       if (clientTransport === "remote-frame") {
         if (!daemonId) {
           server.close(1008, "Missing daemon id.");
@@ -369,6 +464,12 @@ export class AcpRelayShard {
           if (!result.ok) {
             server.close(1008, result.reason);
           } else {
+            this.updateSocketAttachment(server, {
+              bootstrapComplete: true,
+              daemonId,
+              ticket: result.ticket,
+            });
+            await this.writeOrDeleteClientStateSnapshot(connectionId);
             server.send(
               JSON.stringify({
                 connectionId,
@@ -384,28 +485,327 @@ export class AcpRelayShard {
       }
     }
 
-    server.addEventListener("message", (event) => {
-      const text = normalizeMessageData(event.data);
-      if (!text) {
-        return;
-      }
-      if (endpoint === AcpRemoteEndpointKind.Daemon) {
-        this.broker.handleDaemonText(text);
-      } else {
-        void this.broker.handleClientText(connectionId, text);
-      }
-    });
-    server.addEventListener("close", () => {
-      this.removeSocket(endpoint, connectionId, daemonId, server);
-    });
-    server.addEventListener("error", () => {
-      this.removeSocket(endpoint, connectionId, daemonId, server);
-    });
+    if (!this.usesWebSocketHibernation()) {
+      server.addEventListener("message", (event) => {
+        void this.webSocketMessage(server, event.data);
+      });
+      server.addEventListener("close", (event) => {
+        const closeEvent = event as { code?: unknown; reason?: unknown } | undefined;
+        this.webSocketClose(
+          server,
+          typeof closeEvent?.code === "number" ? closeEvent.code : undefined,
+          typeof closeEvent?.reason === "string" ? closeEvent.reason : undefined,
+        );
+      });
+      server.addEventListener("error", (event) => {
+        this.webSocketError(server, event);
+      });
+    }
 
     return new Response(null, {
       status: 101,
       webSocket: client,
     } as ResponseInit & { webSocket: WebSocket });
+  }
+
+  async webSocketMessage(socket: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    await this.restorePromise;
+    const attachment = this.readSocketAttachment(socket);
+    if (!attachment) {
+      socket.close(1008, "Missing relay socket attachment.");
+      return;
+    }
+    const text = normalizeMessageData(message);
+    if (!text) {
+      return;
+    }
+    if (attachment.endpoint === AcpRemoteEndpointKind.Daemon) {
+      const connectionId = this.broker.handleDaemonText(text);
+      if (connectionId) {
+        await this.writeOrDeleteClientStateSnapshot(connectionId);
+      }
+      return;
+    }
+    await this.broker.handleClientText(attachment.connectionId, text);
+    await this.writeOrDeleteClientStateSnapshot(attachment.connectionId);
+  }
+
+  async webSocketClose(
+    socket: WebSocket,
+    code?: number,
+    reason?: string,
+  ): Promise<void> {
+    await this.restorePromise;
+    const attachment = this.readSocketAttachment(socket);
+    if (!attachment) {
+      return;
+    }
+    const durationMs = Date.now() - attachment.connectedAt;
+    console.log(
+      `[relay-do] ws close endpoint=${attachment.endpoint} connectionId=${attachment.connectionId} daemonId=${attachment.daemonId ?? "none"} code=${code ?? "-"} reason="${reason ?? ""}" duration_ms=${durationMs} instance=${this.instanceId}`,
+    );
+    this.removeSocket(
+      attachment.endpoint,
+      attachment.connectionId,
+      attachment.daemonId,
+      socket,
+    );
+    if (attachment.endpoint === AcpRemoteEndpointKind.Client) {
+      await this.writeOrDeleteClientStateSnapshot(attachment.connectionId);
+    } else {
+      await this.writeAllClientStateSnapshots();
+    }
+  }
+
+  async webSocketError(socket: WebSocket, error: unknown): Promise<void> {
+    await this.restorePromise;
+    const attachment = this.readSocketAttachment(socket);
+    if (!attachment) {
+      return;
+    }
+    const durationMs = Date.now() - attachment.connectedAt;
+    const message =
+      typeof error === "object" &&
+      error !== null &&
+      "message" in error &&
+      typeof error.message === "string"
+        ? error.message
+        : "";
+    console.log(
+      `[relay-do] ws error endpoint=${attachment.endpoint} connectionId=${attachment.connectionId} daemonId=${attachment.daemonId ?? "none"} message="${message}" duration_ms=${durationMs} instance=${this.instanceId}`,
+    );
+    this.removeSocket(
+      attachment.endpoint,
+      attachment.connectionId,
+      attachment.daemonId,
+      socket,
+    );
+    if (attachment.endpoint === AcpRemoteEndpointKind.Client) {
+      await this.writeOrDeleteClientStateSnapshot(attachment.connectionId);
+    } else {
+      await this.writeAllClientStateSnapshots();
+    }
+  }
+
+  private async restoreHibernatedWebSockets(): Promise<void> {
+    const sockets = this.state.getWebSockets?.() ?? [];
+    const restored = sockets
+      .map((socket) => ({
+        attachment: this.readSocketAttachment(socket),
+        socket,
+      }))
+      .filter(
+        (
+          entry,
+        ): entry is {
+          attachment: RelayWebSocketAttachment;
+          socket: WebSocket;
+        } => entry.attachment !== undefined,
+      );
+    for (const { attachment, socket } of restored) {
+      if (attachment.endpoint !== AcpRemoteEndpointKind.Daemon) {
+        continue;
+      }
+      if (!attachment.daemonId) {
+        socket.close(1008, "Missing daemon id.");
+        continue;
+      }
+      await this.broker.registerDaemon(
+        attachment.daemonId,
+        socket,
+        attachment.daemonMetadata,
+      );
+    }
+    for (const { attachment, socket } of restored) {
+      if (attachment.endpoint !== AcpRemoteEndpointKind.Client) {
+        continue;
+      }
+      if (!attachment.accountId || !attachment.authUrl) {
+        socket.close(1008, "Missing client route metadata.");
+        continue;
+      }
+      const stateSnapshot = await this.readClientStateSnapshot(
+        attachment.connectionId,
+      );
+      this.broker.registerClient({
+        accountId: attachment.accountId,
+        authUrl: attachment.authUrl,
+        bootstrapComplete:
+          attachment.bootstrapComplete ?? attachment.ticket !== undefined,
+        clientId: attachment.clientId,
+        connectionId: attachment.connectionId,
+        daemonId: attachment.daemonId,
+        nativeClientAck: attachment.nativeClientAck,
+        restoredHibernatedSocket: true,
+        socket,
+        stateSnapshot,
+        ticket: attachment.ticket,
+        transport: attachment.transport,
+      });
+    }
+    if (restored.some((entry) => entry.attachment.endpoint === AcpRemoteEndpointKind.Daemon)) {
+      await this.scheduleHeartbeat();
+    }
+  }
+
+  private acceptRelayWebSocket(
+    socket: WebSocket,
+    attachment: RelayWebSocketAttachment,
+  ): void {
+    if (this.usesWebSocketHibernation()) {
+      const tags = [
+        `endpoint:${attachment.endpoint}`,
+        `connection:${attachment.connectionId}`,
+        ...(attachment.daemonId ? [`daemon:${attachment.daemonId}`] : []),
+      ];
+      this.state.acceptWebSocket?.(socket, tags);
+    } else {
+      socket.accept();
+    }
+    socket.serializeAttachment?.(attachment);
+  }
+
+  private usesWebSocketHibernation(): boolean {
+    return typeof this.state.acceptWebSocket === "function";
+  }
+
+  private readSocketAttachment(
+    socket: WebSocket,
+  ): RelayWebSocketAttachment | undefined {
+    const value = asRecord(socket.deserializeAttachment?.());
+    if (!value) {
+      return undefined;
+    }
+    if (value.version !== RELAY_SOCKET_ATTACHMENT_VERSION) {
+      return undefined;
+    }
+    if (
+      value.endpoint !== AcpRemoteEndpointKind.Client &&
+      value.endpoint !== AcpRemoteEndpointKind.Daemon
+    ) {
+      return undefined;
+    }
+    const connectionId =
+      typeof value.connectionId === "string" ? value.connectionId : undefined;
+    const connectedAt =
+      typeof value.connectedAt === "number" ? value.connectedAt : undefined;
+    if (!connectionId || connectedAt === undefined) {
+      return undefined;
+    }
+    return {
+      accountId: readAttachmentString(value.accountId),
+      authUrl: readAttachmentString(value.authUrl),
+      bootstrapComplete:
+        typeof value.bootstrapComplete === "boolean"
+          ? value.bootstrapComplete
+          : undefined,
+      clientId: readAttachmentString(value.clientId),
+      connectedAt,
+      connectionId,
+      daemonId: readAttachmentString(value.daemonId),
+      daemonMetadata: isDaemonMetadata(value.daemonMetadata)
+        ? value.daemonMetadata
+        : undefined,
+      endpoint: value.endpoint,
+      nativeClientAck:
+        typeof value.nativeClientAck === "boolean"
+          ? value.nativeClientAck
+          : undefined,
+      ticket: isSignedConnectionTicket(value.ticket) ? value.ticket : undefined,
+      transport: isRelayClientTransport(value.transport)
+        ? value.transport
+        : undefined,
+      version: RELAY_SOCKET_ATTACHMENT_VERSION,
+    };
+  }
+
+  private updateSocketAttachment(
+    socket: WebSocket,
+    updates: Partial<RelayWebSocketAttachment>,
+  ): void {
+    const attachment = this.readSocketAttachment(socket);
+    if (!attachment) {
+      return;
+    }
+    socket.serializeAttachment?.({
+      ...attachment,
+      ...updates,
+      version: RELAY_SOCKET_ATTACHMENT_VERSION,
+    } satisfies RelayWebSocketAttachment);
+  }
+
+  private updateClientSocketAttachmentByConnectionId(
+    connectionId: string,
+    updates: Partial<RelayWebSocketAttachment>,
+  ): void {
+    for (const socket of this.state.getWebSockets?.() ?? []) {
+      const attachment = this.readSocketAttachment(socket);
+      if (
+        attachment?.endpoint !== AcpRemoteEndpointKind.Client ||
+        attachment.connectionId !== connectionId
+      ) {
+        continue;
+      }
+      this.updateSocketAttachment(socket, updates);
+    }
+  }
+
+  private async readClientStateSnapshot(
+    connectionId: string,
+  ): Promise<AcpRelayClientStateSnapshot | undefined> {
+    const storage = this.state.storage as DurableObjectStorage & {
+      get?<T = unknown>(key: string): Promise<T | undefined>;
+    };
+    if (typeof storage.get !== "function") {
+      return undefined;
+    }
+    const value = await storage.get(
+      clientStateStorageKey(connectionId),
+    );
+    return isClientStateSnapshot(value, connectionId) ? value : undefined;
+  }
+
+  private async writeOrDeleteClientStateSnapshot(
+    connectionId: string,
+  ): Promise<void> {
+    const snapshot = this.broker.clientStateSnapshot(connectionId);
+    if (!snapshot) {
+      await this.deleteClientStateSnapshot(connectionId);
+      return;
+    }
+    await this.writeClientStateSnapshot(snapshot);
+  }
+
+  private async writeAllClientStateSnapshots(): Promise<void> {
+    await Promise.all(
+      this.broker
+        .clientConnectionIds()
+        .map((connectionId) =>
+          this.writeOrDeleteClientStateSnapshot(connectionId),
+        ),
+    );
+  }
+
+  private async writeClientStateSnapshot(
+    snapshot: AcpRelayClientStateSnapshot,
+  ): Promise<void> {
+    const storage = this.state.storage as DurableObjectStorage & {
+      put?<T = unknown>(key: string, value: T): Promise<void>;
+    };
+    if (typeof storage.put !== "function") {
+      return;
+    }
+    await storage.put(clientStateStorageKey(snapshot.connectionId), snapshot);
+  }
+
+  private async deleteClientStateSnapshot(connectionId: string): Promise<void> {
+    const storage = this.state.storage as DurableObjectStorage & {
+      delete?(key: string): Promise<boolean>;
+    };
+    if (typeof storage.delete !== "function") {
+      return;
+    }
+    await storage.delete(clientStateStorageKey(connectionId));
   }
 
   private async authorize(request: Request, url: URL): Promise<Response> {
@@ -462,6 +862,14 @@ export class AcpRelayShard {
         sessionSelectionId,
         workspaceRoots,
       });
+      if (result.ok) {
+        this.updateClientSocketAttachmentByConnectionId(connectionId, {
+          bootstrapComplete: true,
+          daemonId: result.daemonId,
+          ticket: result.ticket,
+        });
+        await this.writeOrDeleteClientStateSnapshot(connectionId);
+      }
       return json(result, { status: result.ok ? 200 : 404 });
     }
 
@@ -481,6 +889,14 @@ export class AcpRelayShard {
     }
 
     const result = await this.broker.authorizeClient({ connectionId, daemonId });
+    if (result.ok) {
+      this.updateClientSocketAttachmentByConnectionId(connectionId, {
+        bootstrapComplete: true,
+        daemonId: result.daemonId,
+        ticket: result.ticket,
+      });
+      await this.writeOrDeleteClientStateSnapshot(connectionId);
+    }
     return html(createRelayAuthorizationResultPage(result), {
       status: result.ok ? 200 : 404,
     });
@@ -541,6 +957,13 @@ export class AcpRelayShard {
     const result = await this.broker.renewClientTicketWithDeviceProof(
       proof.value,
     );
+    if (result.ok) {
+      this.updateClientSocketAttachmentByConnectionId(result.connectionId, {
+        daemonId: result.daemonId,
+        ticket: result.ticket,
+      });
+      await this.writeOrDeleteClientStateSnapshot(result.connectionId);
+    }
     return json(result, { status: result.ok ? 200 : 401 });
   }
 
@@ -582,6 +1005,11 @@ export class AcpRelayShard {
     }
 
     const closedConnectionIds = await this.broker.reconcileAuthorizedRoutes();
+    await Promise.all(
+      closedConnectionIds.map((connectionId) =>
+        this.deleteClientStateSnapshot(connectionId),
+      ),
+    );
     return json({
       closedConnectionIds,
       ok: true,
@@ -681,12 +1109,22 @@ function parseDaemonMetadataHeaders(request: Request): DaemonMetadata | undefine
       typeof value.machine === "string" && value.machine.trim()
         ? value.machine
         : undefined;
-    if (agentTypes.length === 0 && workspaceRoots.length === 0) {
+    const runtimeInstanceId =
+      typeof value.runtimeInstanceId === "string" &&
+      value.runtimeInstanceId.trim()
+        ? value.runtimeInstanceId
+        : undefined;
+    if (
+      agentTypes.length === 0 &&
+      workspaceRoots.length === 0 &&
+      !runtimeInstanceId
+    ) {
       return undefined;
     }
     return {
       agentTypes,
       ...(machine ? { machine } : {}),
+      ...(runtimeInstanceId ? { runtimeInstanceId } : {}),
       workspaceRoots,
     };
   } catch {
@@ -1854,6 +2292,138 @@ function readScopes(
     return parseError("scopes must be a non-empty string array.");
   }
   return { ok: true, value: value as readonly AcpRemoteScope[] };
+}
+
+function readAttachmentString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function isRelayClientTransport(
+  value: unknown,
+): value is AcpRelayClientTransport {
+  return value === "native-acp" || value === "remote-frame";
+}
+
+function isDaemonMetadata(value: unknown): value is DaemonMetadata {
+  const record = asRecord(value);
+  if (!record || !Array.isArray(record.agentTypes) || !Array.isArray(record.workspaceRoots)) {
+    return false;
+  }
+  return (
+    record.agentTypes.every((entry) => {
+      const agent = asRecord(entry);
+      return (
+        agent !== undefined &&
+        typeof agent.label === "string" &&
+        (agent.command === undefined || typeof agent.command === "string") &&
+        (agent.id === undefined || typeof agent.id === "string") &&
+        (agent.type === undefined || typeof agent.type === "string")
+      );
+    }) &&
+    record.workspaceRoots.every((entry) => {
+      const root = asRecord(entry);
+      return (
+        root !== undefined &&
+        typeof root.path === "string" &&
+        (root.label === undefined || typeof root.label === "string")
+      );
+    }) &&
+    (record.machine === undefined || typeof record.machine === "string") &&
+    (record.runtimeInstanceId === undefined ||
+      typeof record.runtimeInstanceId === "string")
+  );
+}
+
+function isSignedConnectionTicket(
+  value: unknown,
+): value is AcpRemoteSignedConnectionTicket {
+  const record = asRecord(value);
+  const payload = asRecord(record?.payload);
+  return (
+    record !== undefined &&
+    typeof record.alg === "string" &&
+    typeof record.kid === "string" &&
+    typeof record.signature === "string" &&
+    payload !== undefined &&
+    typeof payload.accountId === "string" &&
+    typeof payload.connectionId === "string" &&
+    typeof payload.daemonId === "string" &&
+    typeof payload.expiresAt === "string" &&
+    typeof payload.issuedAt === "string" &&
+    typeof payload.jti === "string" &&
+    typeof payload.policyVersion === "number" &&
+    Array.isArray(payload.scopes)
+  );
+}
+
+function clientStateStorageKey(connectionId: string): string {
+  return `${RELAY_CLIENT_STATE_STORAGE_PREFIX}${connectionId}`;
+}
+
+function isClientStateSnapshot(
+  value: unknown,
+  connectionId: string,
+): value is AcpRelayClientStateSnapshot {
+  const record = asRecord(value);
+  if (!record || record.connectionId !== connectionId) {
+    return false;
+  }
+  return (
+    typeof record.bootstrapComplete === "boolean" &&
+    Array.isArray(record.bufferedClientPayloads) &&
+    record.bufferedClientPayloads.every(isDataFrame) &&
+    Array.isArray(record.clientPendingFrames) &&
+    record.clientPendingFrames.every(isDataFrame) &&
+    Array.isArray(record.daemonPendingFrames) &&
+    record.daemonPendingFrames.every(isDataFrame) &&
+    Array.isArray(record.daemonQueuedFrames) &&
+    record.daemonQueuedFrames.every(isDataFrame) &&
+    Array.isArray(record.daemonRequests) &&
+    record.daemonRequests.every(isJsonRpcRequestRecord) &&
+    Number.isSafeInteger(record.seq) &&
+    (record.daemonId === undefined || typeof record.daemonId === "string") &&
+    (record.lastDaemonSeq === undefined ||
+      Number.isSafeInteger(record.lastDaemonSeq)) &&
+    (record.ticket === undefined || isSignedConnectionTicket(record.ticket)) &&
+    (record.lastAuthorization === undefined ||
+      isRelayAuthorizationSelection(record.lastAuthorization))
+  );
+}
+
+function isDataFrame(value: unknown): value is AcpRemoteDataFrame {
+  const record = asRecord(value);
+  return (
+    record !== undefined &&
+    record.frameType === AcpRemoteFrameType.Data &&
+    typeof record.connectionId === "string" &&
+    typeof record.channelId === "string" &&
+    Object.values(AcpRemoteChannelKind).includes(
+      record.channelKind as AcpRemoteChannelKind,
+    ) &&
+    Number.isSafeInteger(record.seq)
+  );
+}
+
+function isJsonRpcRequestRecord(value: unknown): boolean {
+  const record = asRecord(value);
+  return (
+    record !== undefined &&
+    record.jsonrpc === "2.0" &&
+    typeof record.method === "string" &&
+    (typeof record.id === "string" || typeof record.id === "number")
+  );
+}
+
+function isRelayAuthorizationSelection(value: unknown): boolean {
+  const record = asRecord(value);
+  return (
+    record !== undefined &&
+    typeof record.daemonId === "string" &&
+    (record.workspaceRoots === undefined ||
+      (Array.isArray(record.workspaceRoots) &&
+        record.workspaceRoots.every((entry) => typeof entry === "string"))) &&
+    (record.agent === undefined || asRecord(record.agent) !== undefined)
+  );
 }
 
 function escapeHtml(value: string): string {

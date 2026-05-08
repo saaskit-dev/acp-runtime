@@ -14,6 +14,10 @@ async function main(argv: readonly string[]): Promise<void> {
     await runInternalBin("daemon/bin.js", rest);
     return;
   }
+  if (command === "auth") {
+    await runInternalBin("auth-bin.js", rest);
+    return;
+  }
   if (command === "bridge") {
     const bridgeArgs = rest[0] === "run" ? rest.slice(1) : rest;
     await runInternalBin("client/relay-bridge.js", bridgeArgs);
@@ -44,6 +48,9 @@ function printHelp(): void {
   process.stdout.write(
     [
       "Usage:",
+      "  acp-runtime auth login",
+      "  acp-runtime auth status",
+      "  acp-runtime auth logout",
       "  acp-runtime daemon install",
       "  acp-runtime daemon status",
       "  acp-runtime daemon run",

@@ -100,4 +100,62 @@ describe("relay log upload", () => {
       }),
     ).toBeTruthy();
   });
+
+  it("splits oversized batches before uploading", async () => {
+    const requests: Request[] = [];
+    const uploader = createAcpRelayLogUploader({
+      accountSession: "session-token",
+      batchSize: 100,
+      endpointUrl: "https://relay.test/api/logs",
+      async fetch(input, init) {
+        requests.push(new Request(input, init));
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+      source: "daemon",
+    });
+
+    for (let index = 0; index < 40; index += 1) {
+      uploader.writeText(`${index}:${"x".repeat(20_000)}`);
+    }
+    await uploader.flush();
+
+    expect(requests.length).toBeGreaterThan(1);
+    for (const request of requests) {
+      expect(Buffer.byteLength(await request.text(), "utf8")).toBeLessThan(
+        512 * 1024,
+      );
+    }
+  });
+
+  it("keeps queued records for retry after transient upload failure", async () => {
+    const requests: Request[] = [];
+    let fail = true;
+    const uploader = createAcpRelayLogUploader({
+      accountSession: "session-token",
+      endpointUrl: "https://relay.test/api/logs",
+      async fetch(input, init) {
+        requests.push(new Request(input, init));
+        if (fail) {
+          throw new Error("fetch failed");
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+      source: "bridge",
+    });
+
+    uploader.writeText("connected");
+    await uploader.flush();
+    fail = false;
+    await uploader.flush();
+
+    expect(requests).toHaveLength(2);
+    await expect(requests[1].json()).resolves.toMatchObject({
+      records: [
+        {
+          body: "connected",
+          kind: "text",
+        },
+      ],
+    });
+  });
 });

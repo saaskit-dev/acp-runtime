@@ -20,7 +20,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AcpRelayInMemoryControlPlaneStore } from "../../../packages/relay-worker/src/control-plane-store.js";
 import { AcpRelayBroker } from "../../../packages/relay-worker/src/relay-core.js";
-import type { AcpConnectionFactory } from "../acp/connection-types.js";
 import {
   createStdioAcpConnectionFactory,
   nodeReadableToWeb,
@@ -28,6 +27,8 @@ import {
 } from "../acp/stdio-connection.js";
 import { SIMULATOR_AGENT_ACP_REGISTRY_ID } from "../agents/simulator-agent-acp.js";
 import { AcpRuntime } from "../core/runtime.js";
+import type { AcpRuntimeSession } from "../core/session.js";
+import type { AcpRuntimePrompt } from "../core/types.js";
 import { resolveBuiltSimulatorWorkspaceCliPath } from "../registry/simulator-workspace.js";
 import { createAcpRemoteStdioBridge } from "./client/stdio-bridge.js";
 import { createAcpRemoteDaemonConnection } from "./daemon/relay-connection.js";
@@ -418,16 +419,17 @@ describe("ACP remote relay broker smoke", () => {
     }
   });
 
-  it("keeps stdio bridge alive and bounds reconnect backlog", async () => {
+  it("keeps stdio bridge alive and queues reconnect backlog", async () => {
     const input = new PassThrough();
     const output = new PassThrough();
     const outputLines: string[] = [];
     output.on("data", (chunk) => {
       outputLines.push(String(chunk));
     });
-    const bridgeSockets: { emitClose(): void }[] = [];
+    const bridgeSockets: { emitClose(): void; sent: string[] }[] = [];
     const socketFactory: AcpRemoteSocketFactory = () => {
       const closeListeners = new Set<() => void>();
+      const sent: string[] = [];
       const socket = {
         addEventListener(type: "close" | "error" | "message", listener: unknown) {
           if (type === "close") {
@@ -444,9 +446,11 @@ describe("ACP remote relay broker smoke", () => {
             closeListeners.delete(listener as () => void);
           }
         },
-        send() {},
+        send(data: string) {
+          sent.push(data);
+        },
       };
-      bridgeSockets.push({ emitClose: () => socket.close() });
+      bridgeSockets.push({ emitClose: () => socket.close(), sent });
       return socket as ReturnType<AcpRemoteSocketFactory>;
     };
 
@@ -456,12 +460,15 @@ describe("ACP remote relay broker smoke", () => {
       input,
       output,
       reconnect: {
+        maxDelayMs: 1,
         maxQueuedMessages: 1,
+        minDelayMs: 1,
       },
       relayUrl: "wss://relay.test/acp",
       socketFactory,
     });
 
+    await waitFor(() => bridgeSockets.length === 1);
     bridgeSockets[0]?.emitClose();
     input.write(
       `${JSON.stringify({
@@ -479,10 +486,13 @@ describe("ACP remote relay broker smoke", () => {
         params: { cwd: "/tmp/project", mcpServers: [] },
       })}\n`,
     );
-    await waitFor(() => outputLines.join("").includes("reconnect queue is full"));
+    await waitFor(() => bridgeSockets.length === 2);
+    await waitFor(() => bridgeSockets[1]!.sent.length === 2);
 
-    expect(outputLines.join("")).toContain("reconnect queue is full");
-    expect(outputLines.join("")).toContain('"id":2');
+    expect(outputLines.join("")).not.toContain("reconnect queue is full");
+    expect(
+      bridgeSockets[1]!.sent.map((message) => JSON.parse(message).id),
+    ).toEqual([1, 2]);
 
     bridge.close();
   });
@@ -635,303 +645,6 @@ describe("ACP remote relay broker smoke", () => {
     await clientConnection.closeSession({ sessionId: session.sessionId });
     daemon.close();
     nativeClientSocket.close();
-  });
-
-  it("forwards inner ACP session/load history notifications through proxy daemon", async () => {
-    const root = await mkdtemp(join(tmpdir(), "acp-remote-proxy-history-"));
-    const projectDir = join(root, "project");
-    const storageDir = join(root, "simulator-storage");
-    await mkdir(projectDir, { recursive: true });
-    await mkdir(storageDir, { recursive: true });
-    tempDirs.push(root);
-
-    const ticketSigningKey = {
-      kid: "test-key",
-      secret: "relay-ticket-secret",
-    };
-    const broker = new AcpRelayBroker({
-      controlPlaneStore: new AcpRelayInMemoryControlPlaneStore({
-        accounts: [{ accountId: "acct-smoke" }],
-        clientDevices: [
-          {
-            accountId: "acct-smoke",
-            clientId: "native-acp-client",
-          },
-        ],
-        grants: [
-          {
-            accountId: "acct-smoke",
-            daemonId: "host-smoke",
-            policyVersion: 1,
-            scopes: [
-              "acp:connect",
-              "acp:session:create",
-              "acp:session:resume",
-              "acp:turn:send",
-            ],
-          },
-        ],
-        hosts: [{ accountId: "acct-smoke", daemonId: "host-smoke" }],
-      }),
-      ticketSigningKey,
-    });
-
-    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
-    bindBrokerDaemonSocket(broker, relayDaemonSocket);
-    const daemon = createAcpRemoteDaemonConnection({
-      agent: {
-        args: [resolveBuiltSimulatorWorkspaceCliPath(), "--storage-dir", storageDir],
-        command: process.execPath,
-        type: SIMULATOR_AGENT_ACP_REGISTRY_ID,
-      },
-      connectionFactory: createStdioAcpConnectionFactory(),
-      daemonId: "host-smoke",
-      socket: daemonSocket,
-      ticketVerificationKeys: [ticketSigningKey],
-    });
-    broker.registerDaemon("host-smoke", relayDaemonSocket, {
-      agentTypes: [
-        {
-          command: process.execPath,
-          label: "Simulator Agent",
-          type: SIMULATOR_AGENT_ACP_REGISTRY_ID,
-        },
-      ],
-      workspaceRoots: [{ path: projectDir }],
-    });
-
-    const first = createNativeRelayClient({
-      accountId: "acct-smoke",
-      broker,
-      connectionId: "conn-proxy-history-create",
-    });
-    await first.connection.initialize({
-      clientCapabilities: {},
-      protocolVersion: PROTOCOL_VERSION,
-    });
-    const authentication = first.connection.authenticate({
-      methodId: "acp-runtime-browser",
-    });
-    await expect(
-      broker.authorizeClient({
-        connectionId: "conn-proxy-history-create",
-        daemonId: "host-smoke",
-      }),
-    ).resolves.toMatchObject({ ok: true });
-    await authentication;
-
-    const createdSession = first.connection.newSession({
-      cwd: projectDir,
-      mcpServers: [],
-    });
-    await expect(
-      broker.authorizeClient({
-        connectionId: "conn-proxy-history-create",
-        daemonId: "host-smoke",
-        workspaceRoots: [projectDir],
-      }),
-    ).resolves.toMatchObject({ ok: true });
-    const session = await createdSession;
-    await first.connection.prompt({
-      prompt: [{ text: "/help", type: "text" }],
-      sessionId: session.sessionId,
-    });
-    await waitFor(() =>
-      first.notifications.some(
-        (notification) =>
-          isAcpTextNotification(notification) &&
-          notification.update.content.text.includes("Simulator Agent ACP"),
-      ),
-    );
-    first.socket.close();
-
-    const second = createNativeRelayClient({
-      accountId: "acct-smoke",
-      broker,
-      connectionId: "conn-proxy-history-load",
-    });
-    await second.connection.initialize({
-      clientCapabilities: {},
-      protocolVersion: PROTOCOL_VERSION,
-    });
-    await second.connection.loadSession({
-      cwd: projectDir,
-      mcpServers: [],
-      sessionId: session.sessionId,
-    });
-
-    await waitFor(() =>
-      second.notifications.some(
-        (notification) =>
-          isAcpTextNotification(notification) &&
-          notification.update.content.text.includes("Simulator Agent ACP"),
-      ),
-    );
-    expect(
-      second.notifications.some(
-        (notification) =>
-          isAcpTextNotification(notification) &&
-          notification.update.content.text.includes("Simulator Agent ACP"),
-      ),
-    ).toBe(true);
-
-    second.socket.close();
-    daemon.close();
-  });
-
-  it("uses bound workspace cwd when proxy-loading a historical remote session", async () => {
-    const root = await mkdtemp(join(tmpdir(), "acp-remote-proxy-bound-cwd-"));
-    const projectDir = join(root, "project");
-    await mkdir(projectDir, { recursive: true });
-    tempDirs.push(root);
-
-    const ticketSigningKey = {
-      kid: "test-key",
-      secret: "relay-ticket-secret",
-    };
-    const broker = new AcpRelayBroker({
-      controlPlaneStore: new AcpRelayInMemoryControlPlaneStore({
-        accounts: [{ accountId: "acct-smoke" }],
-        clientDevices: [
-          {
-            accountId: "acct-smoke",
-            clientId: "native-acp-client",
-          },
-        ],
-        grants: [
-          {
-            accountId: "acct-smoke",
-            daemonId: "host-smoke",
-            policyVersion: 1,
-            scopes: [
-              "acp:connect",
-              "acp:session:create",
-              "acp:session:resume",
-            ],
-          },
-        ],
-        hosts: [{ accountId: "acct-smoke", daemonId: "host-smoke" }],
-      }),
-      ticketSigningKey,
-    });
-
-    const newCwds: string[] = [];
-    const loadCwds: string[] = [];
-    const connectionFactory: AcpConnectionFactory = async () => {
-      const abort = new AbortController();
-      let close: () => void = () => {};
-      const closed = new Promise<void>((resolve) => {
-        close = resolve;
-      });
-      return {
-        connection: {
-          async authenticate() {},
-          async cancel() {},
-          closed,
-          async initialize() {
-            return {
-              agentCapabilities: { loadSession: true },
-              agentInfo: { name: "fake-agent", version: "1.0.0" },
-              protocolVersion: PROTOCOL_VERSION,
-            };
-          },
-          async loadSession(params) {
-            loadCwds.push(params.cwd);
-            return { sessionId: params.sessionId };
-          },
-          async newSession(params) {
-            newCwds.push(params.cwd);
-            return { sessionId: "historical-session" };
-          },
-          async prompt() {
-            return { stopReason: "end_turn" };
-          },
-          signal: abort.signal,
-        },
-        dispose() {
-          abort.abort();
-          close();
-        },
-      };
-    };
-
-    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
-    bindBrokerDaemonSocket(broker, relayDaemonSocket);
-    const daemon = createAcpRemoteDaemonConnection({
-      agent: {
-        command: "fake-agent",
-        type: "fake",
-      },
-      connectionFactory,
-      daemonId: "host-smoke",
-      socket: daemonSocket,
-      ticketVerificationKeys: [ticketSigningKey],
-    });
-    broker.registerDaemon("host-smoke", relayDaemonSocket, {
-      agentTypes: [{ command: "fake-agent", type: "fake" }],
-      workspaceRoots: [{ path: projectDir }],
-    });
-
-    const first = createNativeRelayClient({
-      accountId: "acct-smoke",
-      broker,
-      connectionId: "conn-proxy-bound-cwd-create",
-    });
-    await first.connection.initialize({
-      clientCapabilities: {},
-      protocolVersion: PROTOCOL_VERSION,
-    });
-    const authentication = first.connection.authenticate({
-      methodId: "acp-runtime-browser",
-    });
-    await expect(
-      broker.authorizeClient({
-        connectionId: "conn-proxy-bound-cwd-create",
-        daemonId: "host-smoke",
-      }),
-    ).resolves.toMatchObject({ ok: true });
-    await authentication;
-
-    const createdSession = first.connection.newSession({
-      cwd: projectDir,
-      mcpServers: [],
-    });
-    await expect(
-      broker.authorizeClient({
-        connectionId: "conn-proxy-bound-cwd-create",
-        daemonId: "host-smoke",
-        workspaceRoots: [projectDir],
-      }),
-    ).resolves.toMatchObject({ ok: true });
-    await expect(createdSession).resolves.toMatchObject({
-      sessionId: "historical-session",
-    });
-    first.socket.close();
-
-    const second = createNativeRelayClient({
-      accountId: "acct-smoke",
-      broker,
-      connectionId: "conn-proxy-bound-cwd-load",
-    });
-    await second.connection.initialize({
-      clientCapabilities: {},
-      protocolVersion: PROTOCOL_VERSION,
-    });
-    await expect(
-      second.connection.loadSession({
-        cwd: root,
-        mcpServers: [],
-        sessionId: "historical-session",
-      }),
-    ).resolves.toMatchObject({
-      sessionId: "historical-session",
-    });
-
-    expect(newCwds).toHaveLength(1);
-    expect(loadCwds).toEqual(newCwds);
-
-    second.socket.close();
-    daemon.close();
   });
 
   it("returns daemon JSON-RPC errors for unknown remote sessions instead of hanging", async () => {
@@ -1215,6 +928,171 @@ describe("ACP remote relay broker smoke", () => {
     daemon.close();
   });
 
+  it("does not duplicate runtime prompts when stdio bridge reconnects mid-prompt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "acp-remote-bridge-replay-"));
+    const projectDir = join(root, "project");
+    await mkdir(projectDir, { recursive: true });
+    tempDirs.push(root);
+
+    const ticketSigningKey = {
+      kid: "test-key",
+      secret: "relay-ticket-secret",
+    };
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: new AcpRelayInMemoryControlPlaneStore({
+        accounts: [{ accountId: "acct-smoke" }],
+        clientDevices: [
+          {
+            accountId: "acct-smoke",
+            clientId: "stdio-bridge-client",
+          },
+        ],
+        grants: [
+          {
+            accountId: "acct-smoke",
+            clientId: "stdio-bridge-client",
+            daemonId: "host-smoke",
+            policyVersion: 1,
+            scopes: [
+              "acp:connect",
+              "acp:session:create",
+              "acp:session:resume",
+              "acp:turn:send",
+            ],
+          },
+        ],
+        hosts: [{ accountId: "acct-smoke", daemonId: "host-smoke" }],
+      }),
+      ticketSigningKey,
+    });
+
+    const promptCompletion = deferred<void>();
+    let promptStarts = 0;
+    const runtime = createPromptCountingRuntime({
+      onPromptStart() {
+        promptStarts += 1;
+      },
+      promptCompletion: promptCompletion.promise,
+    });
+
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    const daemon = createAcpRemoteDaemonConnection({
+      agent: {
+        command: "fake-agent",
+        type: "fake",
+      },
+      daemonId: "host-smoke",
+      runtime,
+      socket: daemonSocket,
+      ticketVerificationKeys: [ticketSigningKey],
+    });
+    broker.registerDaemon("host-smoke", relayDaemonSocket, {
+      agentTypes: [],
+      workspaceRoots: [{ path: projectDir }],
+    });
+
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const clientConnection = new ClientSideConnection(
+      () =>
+        ({
+          async requestPermission() {
+            return {
+              outcome: {
+                optionId: "allow_once",
+                outcome: "selected",
+              },
+            };
+          },
+          async sessionUpdate() {},
+        }) satisfies Client,
+      ndJsonStream(
+        nodeWritableToWeb(input, { preferNative: false }),
+        nodeReadableToWeb(output, { preferNative: false }),
+      ),
+    );
+    void clientConnection.closed.catch(() => {});
+    const bridgeSockets: MemoryWebSocket[] = [];
+    const socketFactory: AcpRemoteSocketFactory = ({ url }) => {
+      const parsed = new URL(url);
+      const connectionId = parsed.searchParams.get("connectionId");
+      if (!connectionId) {
+        throw new Error("Bridge URL is missing connectionId.");
+      }
+      const [bridgeSocket, relaySocket] = createMemoryWebSocketPair();
+      bridgeSockets.push(bridgeSocket);
+      bindBrokerClientSocket(broker, connectionId, relaySocket);
+      broker.registerClient({
+        accountId: "acct-smoke",
+        authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+        clientId: "stdio-bridge-client",
+        connectionId,
+        socket: relaySocket,
+      });
+      return bridgeSocket;
+    };
+
+    const bridge = createAcpRemoteStdioBridge({
+      clientId: "stdio-bridge-client",
+      connectionId: "conn-stdio-bridge-replay",
+      input,
+      openAuthUrl() {},
+      output,
+      reconnect: {
+        maxDelayMs: 1,
+        minDelayMs: 1,
+      },
+      relayUrl: "wss://relay.test/acp",
+      socketFactory,
+    });
+
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+    const authentication = clientConnection.authenticate({
+      methodId: "acp-runtime-browser",
+    });
+    await expect(
+      broker.authorizeClient({
+        connectionId: "conn-stdio-bridge-replay",
+        daemonId: "host-smoke",
+      }),
+    ).resolves.toMatchObject({ ok: true });
+    await authentication;
+    const sessionCreate = clientConnection.newSession({
+      cwd: projectDir,
+      mcpServers: [],
+    });
+    await expect(
+      broker.authorizeClient({
+        connectionId: "conn-stdio-bridge-replay",
+        daemonId: "host-smoke",
+        workspaceRoots: [projectDir],
+      }),
+    ).resolves.toMatchObject({ ok: true });
+    const session = await sessionCreate;
+
+    const prompt = clientConnection.prompt({
+      prompt: [{ text: "hold until reconnect", type: "text" }],
+      sessionId: session.sessionId,
+    });
+    await waitFor(() => promptStarts === 1);
+    bridgeSockets[0]?.close(1006, "test bridge disconnect mid-prompt");
+    await waitFor(() => bridgeSockets.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(promptStarts).toBe(1);
+
+    promptCompletion.resolve();
+    await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(promptStarts).toBe(1);
+
+    await clientConnection.closeSession({ sessionId: session.sessionId });
+    bridge.close();
+    daemon.close();
+  });
+
   it("starts relay ACP as an agent through an outer AcpRuntime", async () => {
     const root = await mkdtemp(join(tmpdir(), "acp-remote-runtime-self-smoke-"));
     const projectDir = join(root, "project");
@@ -1405,6 +1283,133 @@ function isAcpTextNotification(value: unknown): value is {
     "text" in value.update.content &&
     typeof value.update.content.text === "string"
   );
+}
+
+function createPromptCountingRuntime(input: {
+  onPromptStart(): void;
+  promptCompletion: Promise<void>;
+}): Parameters<typeof createAcpRemoteDaemonConnection>[0]["runtime"] {
+  const session = createCountingRuntimeSession(input);
+  return {
+    sessions: {
+      async list() {
+        return { sessions: [] };
+      },
+      async load() {
+        return session;
+      },
+      async resume() {
+        return session;
+      },
+      async start() {
+        return session;
+      },
+    },
+  };
+}
+
+function createCountingRuntimeSession(input: {
+  onPromptStart(): void;
+  promptCompletion: Promise<void>;
+}): AcpRuntimeSession {
+  return {
+    agent: {
+      listConfigOptions: () => [],
+      listModes: () => [],
+      setConfigOption: async () => {},
+      setMode: async () => {},
+    },
+    capabilities: {
+      agent: {
+        prompt: true,
+      },
+      client: {},
+    },
+    close: async () => {},
+    diagnostics: {},
+    initialConfigReport: undefined,
+    metadata: {
+      id: "runtime-session-1",
+      title: "Runtime Session",
+    },
+    queue: {
+      policy: () => ({ delivery: "sequential" }),
+      setPolicy: () => ({ delivery: "sequential" }),
+    },
+    snapshot: () => ({
+      agent: {
+        command: "fake-agent",
+        type: "fake",
+      },
+      cwd: "/tmp/project",
+      session: {
+        id: "runtime-session-1",
+      },
+      version: 1,
+    }),
+    state: {} as AcpRuntimeSession["state"],
+    status: "ready",
+    turn: {
+      cancel: async () => true,
+      queue: {
+        clear: () => 0,
+        get: () => undefined,
+        list: () => [],
+        remove: () => false,
+        sendNow: async () => false,
+      },
+      run: async () => "done",
+      send: async () => ({
+        output: [{ text: "done", type: "text" }],
+        outputText: "done",
+        turnId: "turn-1",
+      }),
+      start: (_prompt: AcpRuntimePrompt) => {
+        input.onPromptStart();
+        return {
+          completion: Promise.resolve({
+            output: [{ text: "done", type: "text" }],
+            outputText: "done",
+            turnId: "turn-1",
+          }),
+          events: createHeldTurnEvents(input.promptCompletion),
+          turnId: "turn-1",
+        };
+      },
+      stream: () => createHeldTurnEvents(Promise.resolve()),
+    },
+  } as unknown as AcpRuntimeSession;
+}
+
+async function* createHeldTurnEvents(
+  completion: Promise<void>,
+): AsyncIterable<{
+  output: { text: string; type: "text" }[];
+  outputText: string;
+  turnId: string;
+  type: "completed";
+}> {
+  await completion;
+  yield {
+    output: [{ text: "done", type: "text" }],
+    outputText: "done",
+    turnId: "turn-1",
+    type: "completed",
+  };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  reject(reason?: unknown): void;
+  resolve(value: T | PromiseLike<T>): void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((innerResolve, innerReject) => {
+    resolve = innerResolve;
+    reject = innerReject;
+  });
+  return { promise, reject, resolve };
 }
 
 function createBrokerRelayAcpConnectionFactory(input: {

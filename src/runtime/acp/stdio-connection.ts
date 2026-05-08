@@ -39,7 +39,7 @@ export type StdioFactoryOptions = {
 type NodeReadableLike = AsyncIterable<Buffer | Uint8Array | string> &
   Pick<Readable, "destroy" | "off" | "on">;
 
-type NodeWritableLike = Pick<Writable, "destroy" | "end" | "write">;
+type NodeWritableLike = Pick<Writable, "destroy" | "end" | "off" | "on" | "write">;
 
 type AgentProcess = ChildProcess & {
   stdin: Writable;
@@ -267,30 +267,111 @@ export function nodeWritableToWeb(
     }
   }
 
+  const pendingOperations = new Set<{
+    reject(error: Error): void;
+  }>();
+  let streamError: Error | undefined;
+  let removeErrorListener: (() => void) | undefined;
+
+  const failPendingOperations = (error: unknown) => {
+    const normalized = normalizeWritableStreamError(error);
+    streamError = streamError ?? normalized;
+    for (const operation of [...pendingOperations]) {
+      operation.reject(normalized);
+    }
+  };
+
   return new WritableStream<Uint8Array>({
+    start(controller) {
+      const onError = (error: unknown) => {
+        failPendingOperations(error);
+        try {
+          controller.error(streamError);
+        } catch {
+          // The controller may already be closed or errored.
+        }
+      };
+      stream.on("error", onError);
+      removeErrorListener = () => {
+        stream.off("error", onError);
+      };
+    },
     async write(chunk) {
+      if (streamError) {
+        throw streamError;
+      }
+      if (isWritableStreamClosed(stream)) {
+        throw createAcpConnectionClosedError();
+      }
       await new Promise<void>((resolve, reject) => {
-        stream.write(chunk, (error?: Error | null) => {
+        let settled = false;
+        const operation = {
+          reject(error: Error) {
+            finish(error);
+          },
+        };
+        const finish = (error?: unknown) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          pendingOperations.delete(operation);
           if (error) {
-            reject(error);
+            reject(normalizeWritableStreamError(error));
             return;
           }
           resolve();
-        });
+        };
+        pendingOperations.add(operation);
+        try {
+          stream.write(chunk, (error?: Error | null) => {
+            finish(error);
+          });
+        } catch (error) {
+          finish(error);
+        }
       });
     },
     async close() {
+      if (streamError) {
+        throw streamError;
+      }
+      if (isWritableStreamClosed(stream)) {
+        removeErrorListener?.();
+        return;
+      }
       await new Promise<void>((resolve, reject) => {
-        stream.end((error?: Error | null) => {
+        let settled = false;
+        const operation = {
+          reject(error: Error) {
+            finish(error);
+          },
+        };
+        const finish = (error?: unknown) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          pendingOperations.delete(operation);
           if (error) {
-            reject(error);
+            reject(normalizeWritableStreamError(error));
             return;
           }
           resolve();
-        });
+        };
+        pendingOperations.add(operation);
+        try {
+          stream.end((error?: Error | null) => {
+            finish(error);
+          });
+        } catch (error) {
+          finish(error);
+        }
       });
+      removeErrorListener?.();
     },
     abort(reason) {
+      removeErrorListener?.();
       stream.destroy(toError(reason));
     },
   });
@@ -905,6 +986,39 @@ function trimStderrTail(stderr: string | undefined): string | undefined {
 
 function isClosedConnectionError(error: unknown): error is Error {
   return error instanceof Error && error.message === "ACP connection closed";
+}
+
+function createAcpConnectionClosedError(cause?: unknown): Error {
+  return cause === undefined
+    ? new Error("ACP connection closed")
+    : new Error("ACP connection closed", { cause });
+}
+
+function normalizeWritableStreamError(error: unknown): Error {
+  const normalized = toError(error) ?? new Error("Writable stream failed.");
+  return isWritableStreamClosedError(normalized)
+    ? createAcpConnectionClosedError(normalized)
+    : normalized;
+}
+
+function isWritableStreamClosed(stream: NodeWritableLike): boolean {
+  const state = stream as {
+    destroyed?: boolean;
+    writableDestroyed?: boolean;
+    writableEnded?: boolean;
+  };
+  return Boolean(state.destroyed || state.writableDestroyed || state.writableEnded);
+}
+
+function isWritableStreamClosedError(error: Error): boolean {
+  const code = (error as { code?: unknown }).code;
+  return (
+    code === "EPIPE" ||
+    code === "ECONNRESET" ||
+    code === "ERR_STREAM_DESTROYED" ||
+    code === "ERR_STREAM_WRITE_AFTER_END" ||
+    error.message === "write after end"
+  );
 }
 
 async function waitForExitError(

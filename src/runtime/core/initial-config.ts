@@ -12,6 +12,7 @@ import type {
   AcpRuntimeInitialConfigReport,
   AcpRuntimeInitialConfigReportItem,
   AcpRuntimeInitialConfigValue,
+  AcpRuntimeSnapshot,
 } from "./types.js";
 
 type InitialConfigItem = {
@@ -90,6 +91,40 @@ export async function applyRuntimeInitialConfig(
   }
 
   return report;
+}
+
+export async function applyRuntimeSnapshotConfig(
+  driver: AcpSessionDriver,
+  snapshot: AcpRuntimeSnapshot | undefined,
+): Promise<void> {
+  if (!snapshot) {
+    return;
+  }
+  for (const [key, value] of Object.entries(snapshot.config ?? {})) {
+    const option = findSnapshotConfigOption(driver, key);
+    if (!option || sameConfigValue(option.value, value)) {
+      continue;
+    }
+    try {
+      await driver.setAgentConfigOption(
+        option.id,
+        normalizeRuntimeConfigValue(option, value),
+      );
+    } catch {
+      continue;
+    }
+  }
+  if (
+    snapshot.currentModeId &&
+    driver.metadata.currentModeId !== snapshot.currentModeId
+  ) {
+    try {
+      await driver.setAgentMode(snapshot.currentModeId);
+    } catch {
+      // Stored snapshots can outlive agent mode support changes. Keep session
+      // load best-effort so stale local metadata does not make recovery fail.
+    }
+  }
 }
 
 async function applyInitialMode(
@@ -207,6 +242,17 @@ function findConfigOption(
         options.find((option) => option.category === category),
       )
       .find(Boolean)
+  );
+}
+
+function findSnapshotConfigOption(
+  driver: AcpSessionDriver,
+  key: string,
+): AcpRuntimeAgentConfigOption | undefined {
+  const options = driver.listAgentConfigOptions();
+  return (
+    options.find((option) => option.id === key) ??
+    options.find((option) => option.category === key)
   );
 }
 

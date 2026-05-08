@@ -15,7 +15,9 @@ import {
   assertAcpRemoteFrame,
   createAcpRemoteDeviceKeyPair,
   createAcpRemoteDeviceRenewalSignature,
+  createAcpRemoteSignedConnectionTicket,
   createAcpJsonRpcWebSocketStream,
+  type AcpRemoteAckFrame,
   type AcpRemoteDataFrame,
   type AcpRemoteFrame,
   type AcpRemoteScope,
@@ -707,6 +709,275 @@ describe("AcpRelayBroker", () => {
     daemonSocket.close();
   });
 
+  it("restores bound session traffic from stored binding before authenticate", async () => {
+    const harness = createSessionBindingRestoreHarness({
+      connectionId: "conn-session-bound-before-auth",
+    });
+
+    await harness.sendPrompt("turn-before-auth");
+
+    await waitForSessionPromptForward(harness.daemonFrames);
+    expect(harness.clientMessages).not.toContainEqual(
+      expect.objectContaining({
+        error: expect.objectContaining({
+          message: expect.stringContaining("Authentication required"),
+        }),
+      }),
+    );
+  });
+
+  it("restores bound session traffic after bootstrap state was restored without a ticket", async () => {
+    const harness = createSessionBindingRestoreHarness({
+      bootstrapComplete: true,
+      connectionId: "conn-session-bound-restored-bootstrap",
+    });
+
+    await harness.sendPrompt("turn-restored-before-auth");
+
+    await waitForSessionPromptForward(harness.daemonFrames);
+    expect(harness.clientMessages).not.toContainEqual(
+      expect.objectContaining({
+        error: expect.objectContaining({
+          message: expect.stringContaining("Authentication required"),
+        }),
+      }),
+    );
+  });
+
+  it("queues restored session/load while the daemon is reconnecting", async () => {
+    const store = new AcpRelayInMemoryControlPlaneStore({
+      accounts: [{ accountId: "acct-1" }],
+      clientDevices: [{ accountId: "acct-1", clientId: "native-acp-client" }],
+      grants: [
+        {
+          accountId: "acct-1",
+          daemonId: "host-a",
+          policyVersion: 7,
+          scopes: ["acp:connect", "acp:session:resume"],
+          workspaceRoots: ["/tmp/persisted-project"],
+        },
+      ],
+      hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
+      sessionBindings: [
+        {
+          accountId: "acct-1",
+          agent: { id: "codex-acp" },
+          clientId: "native-acp-client",
+          daemonId: "host-a",
+          sessionId: "session-existing",
+          workspaceRoots: ["/tmp/persisted-project"],
+        },
+      ],
+    });
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: store,
+      daemonReconnectGraceMs: 1_000,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-session-load-daemon-reconnect";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [firstDaemonSocket, firstRelayDaemonSocket] =
+      createMemoryWebSocketPair();
+    const [secondDaemonSocket, secondRelayDaemonSocket] =
+      createMemoryWebSocketPair();
+    const clientMessages: unknown[] = [];
+    const secondDaemonFrames: AcpRemoteFrame[] = [];
+
+    nativeClientSocket.addEventListener("message", (event) => {
+      clientMessages.push(JSON.parse(String(event.data)));
+    });
+    secondDaemonSocket.addEventListener("message", (event) => {
+      secondDaemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    bindBrokerDaemonSocket(broker, firstRelayDaemonSocket);
+    bindBrokerDaemonSocket(broker, secondRelayDaemonSocket);
+
+    await broker.registerDaemon("host-a", firstRelayDaemonSocket, {
+      agentTypes: [{ id: "codex-acp", label: "Codex" }],
+      workspaceRoots: [{ path: "/tmp" }],
+    });
+    broker.removeDaemon("host-a", firstRelayDaemonSocket);
+    firstDaemonSocket.close();
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "load-during-reconnect",
+        jsonrpc: "2.0",
+        method: "session/load",
+        params: {
+          cwd: "/tmp/project",
+          mcpServers: [],
+          sessionId: "session-existing",
+        },
+      }),
+    );
+
+    expect(clientMessages).not.toContainEqual(
+      expect.objectContaining({
+        error: expect.objectContaining({
+          message: expect.stringContaining("Authentication required"),
+        }),
+      }),
+    );
+    expect(
+      broker
+        .clientStateSnapshot(connectionId)
+        ?.daemonQueuedFrames.some(
+          (frame) =>
+            isJsonRpcPayload(frame.payload) &&
+            frame.payload.method === "session/load",
+        ),
+    ).toBe(true);
+
+    await broker.registerDaemon("host-a", secondRelayDaemonSocket, {
+      agentTypes: [{ id: "codex-acp", label: "Codex" }],
+      workspaceRoots: [{ path: "/tmp" }],
+    });
+    await waitFor(() =>
+      secondDaemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          frame.payload.method === "session/load",
+      ),
+    );
+  });
+
+  it("queues restored session/load when a bound daemon is offline without reconnect state", async () => {
+    const store = new AcpRelayInMemoryControlPlaneStore({
+      accounts: [{ accountId: "acct-1" }],
+      clientDevices: [{ accountId: "acct-1", clientId: "native-acp-client" }],
+      grants: [
+        {
+          accountId: "acct-1",
+          daemonId: "host-a",
+          policyVersion: 7,
+          scopes: ["acp:connect", "acp:session:resume"],
+          workspaceRoots: ["/tmp/persisted-project"],
+        },
+      ],
+      hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
+      sessionBindings: [
+        {
+          accountId: "acct-1",
+          agent: { id: "codex-acp" },
+          clientId: "native-acp-client",
+          daemonId: "host-a",
+          sessionId: "session-existing",
+          workspaceRoots: ["/tmp/persisted-project"],
+        },
+      ],
+    });
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: store,
+      daemonReconnectGraceMs: 1_000,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-session-load-daemon-offline";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const clientMessages: unknown[] = [];
+    const daemonFrames: AcpRemoteFrame[] = [];
+
+    nativeClientSocket.addEventListener("message", (event) => {
+      clientMessages.push(JSON.parse(String(event.data)));
+    });
+    daemonSocket.addEventListener("message", (event) => {
+      daemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "load-while-offline",
+        jsonrpc: "2.0",
+        method: "session/load",
+        params: {
+          cwd: "/tmp/project",
+          mcpServers: [],
+          sessionId: "session-existing",
+        },
+      }),
+    );
+
+    expect(clientMessages).not.toContainEqual(
+      expect.objectContaining({
+        error: expect.objectContaining({
+          message: expect.stringContaining("Authentication required"),
+        }),
+      }),
+    );
+    expect(
+      broker
+        .clientStateSnapshot(connectionId)
+        ?.daemonQueuedFrames.some(
+          (frame) =>
+            isJsonRpcPayload(frame.payload) &&
+            frame.payload.method === "session/load",
+        ),
+    ).toBe(true);
+
+    await broker.registerDaemon("host-a", relayDaemonSocket, {
+      agentTypes: [{ id: "codex-acp", label: "Codex" }],
+      workspaceRoots: [{ path: "/tmp" }],
+    });
+    await waitFor(() =>
+      daemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          frame.payload.method === "session/load",
+      ),
+    );
+  });
+
+  it("restores bound session traffic when bootstrap is incomplete but a stale ticket exists without a daemon route", async () => {
+    const connectionId = "conn-session-bound-stale-ticket";
+    const ticket = await createAcpRemoteSignedConnectionTicket({
+      connectionId,
+      grant: {
+        accountId: "acct-1",
+        agent: { id: "codex-acp" },
+        clientId: "native-acp-client",
+        daemonId: "host-a",
+        policyVersion: 7,
+        scopes: ["acp:connect", "acp:turn:send"],
+        workspaceRoots: ["/tmp/persisted-project"],
+      },
+      key: ticketSigningKey,
+    });
+    const harness = createSessionBindingRestoreHarness({
+      bootstrapComplete: false,
+      connectionId,
+      ticket,
+    });
+
+    await harness.sendPrompt("turn-stale-ticket-before-route");
+
+    await waitForSessionPromptForward(harness.daemonFrames);
+    expect(harness.clientMessages).not.toContainEqual(
+      expect.objectContaining({
+        error: expect.objectContaining({
+          message: expect.stringContaining("select a host"),
+        }),
+      }),
+    );
+  });
+
   it("persists remote session bindings and restores later loads without client metadata", async () => {
     const store = createControlPlaneStore({
       scopes: [
@@ -1099,6 +1370,102 @@ describe("AcpRelayBroker", () => {
     await expect(broker.authorizableHostIds("conn-no-grant")).resolves.toEqual(
       [],
     );
+  });
+
+  it("uses one-hour tickets and a five-minute renewal window by default", async () => {
+    let now = new Date("2026-04-27T00:00:00.000Z");
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore({
+        scopes: ["acp:connect", "acp:session:list"],
+      }),
+      now: () => now,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-default-ticket-renew";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const frames: AcpRemoteFrame[] = [];
+    const clientMessages: unknown[] = [];
+    daemonSocket.addEventListener("message", (event) => {
+      frames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    nativeClientSocket.addEventListener("message", (event) => {
+      clientMessages.push(JSON.parse(String(event.data)));
+    });
+
+    await broker.registerDaemon("host-a", relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await waitFor(() =>
+      frames.some((frame) => frame.frameType === AcpRemoteFrameType.Hello),
+    );
+    const helloFrame = frames.find(
+      (frame) => frame.frameType === AcpRemoteFrameType.Hello,
+    );
+    if (
+      !helloFrame ||
+      helloFrame.frameType !== AcpRemoteFrameType.Hello ||
+      !helloFrame.ticket
+    ) {
+      throw new Error("Expected hello frame with ticket.");
+    }
+    expect(helloFrame.ticket.payload.expiresAt).toBe(
+      "2026-04-27T01:00:00.000Z",
+    );
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "auth",
+        jsonrpc: "2.0",
+        method: "authenticate",
+        params: {
+          methodId: "acp-runtime-browser",
+        },
+      }),
+    );
+    frames.length = 0;
+    clientMessages.length = 0;
+
+    now = new Date("2026-04-27T00:56:00.000Z");
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "session/list",
+      }),
+    );
+
+    await waitFor(
+      () => frames.some((frame) => frame.frameType === AcpRemoteFrameType.Renew),
+    );
+    const renewFrame = frames.find(
+      (frame) => frame.frameType === AcpRemoteFrameType.Renew,
+    );
+    if (renewFrame?.frameType !== AcpRemoteFrameType.Renew) {
+      throw new Error("Expected renew frame.");
+    }
+    expect(renewFrame.ticket.payload.issuedAt).toBe(
+      "2026-04-27T00:56:00.000Z",
+    );
+    expect(renewFrame.ticket.payload.expiresAt).toBe(
+      "2026-04-27T01:56:00.000Z",
+    );
+    expect(
+      frames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          (frame.payload as { id?: unknown }).id === 1,
+      ),
+    ).toBe(true);
+    expect(clientMessages).toEqual([]);
   });
 
   it("renews near-expiry tickets before forwarding bound ACP traffic", async () => {
@@ -1625,6 +1992,219 @@ describe("AcpRelayBroker", () => {
     );
   });
 
+  it("queues remote-frame daemon payloads instead of closing when the client ack window is full", async () => {
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: new AcpRelayInMemoryControlPlaneStore({
+        accounts: [{ accountId: "acct-1" }],
+        clientDevices: [{ accountId: "acct-1", clientId: "client-1" }],
+        grants: [
+          {
+            accountId: "acct-1",
+            clientId: "client-1",
+            daemonId: "host-a",
+            policyVersion: 7,
+            scopes: ["acp:connect"],
+          },
+        ],
+        hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
+      }),
+      maxBufferedFramesPerConnection: 2,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-client-window-queue";
+    const [remoteClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const daemonFrames: AcpRemoteFrame[] = [];
+    const clientFrames: AcpRemoteFrame[] = [];
+    daemonSocket.addEventListener("message", (event) => {
+      daemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    remoteClientSocket.addEventListener("message", (event) => {
+      clientFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    bindBrokerClientSocket(broker, connectionId, relayClientSocket);
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+
+    broker.registerDaemon("host-a", relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      clientId: "client-1",
+      connectionId,
+      daemonId: "host-a",
+      socket: relayClientSocket,
+      transport: "remote-frame",
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await waitFor(() =>
+      daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Data),
+    );
+    for (const frame of daemonFrames) {
+      if (frame.frameType === AcpRemoteFrameType.Data) {
+        daemonSocket.send(
+          JSON.stringify({
+            ack: frame.seq,
+            channelId: frame.channelId,
+            connectionId,
+            frameType: AcpRemoteFrameType.Ack,
+          }),
+        );
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    daemonFrames.length = 0;
+
+    for (const seq of [41, 42, 43]) {
+      daemonSocket.send(
+        JSON.stringify({
+          channelId: "terminal:1",
+          channelKind: AcpRemoteChannelKind.Terminal,
+          connectionId,
+          frameType: AcpRemoteFrameType.Data,
+          payload: {
+            operation: "start",
+            seq,
+            terminalId: "term-1",
+          },
+          seq,
+        } satisfies AcpRemoteDataFrame),
+      );
+    }
+
+    await waitFor(
+      () =>
+        clientFrames.filter((frame) => frame.frameType === AcpRemoteFrameType.Data)
+          .length === 2,
+    );
+    expect(
+      daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Close),
+    ).toBe(false);
+    expect(
+      daemonFrames
+        .filter((frame): frame is AcpRemoteAckFrame =>
+          frame.frameType === AcpRemoteFrameType.Ack,
+        )
+        .map((frame) => frame.ack),
+    ).toEqual([41, 42]);
+
+    const firstClientFrame = clientFrames.find(
+      (frame): frame is AcpRemoteDataFrame =>
+        frame.frameType === AcpRemoteFrameType.Data,
+    );
+    if (!firstClientFrame) {
+      throw new Error("Expected first client data frame.");
+    }
+    remoteClientSocket.send(
+      JSON.stringify({
+        ack: firstClientFrame.seq,
+        channelId: firstClientFrame.channelId,
+        connectionId,
+        frameType: AcpRemoteFrameType.Ack,
+      } satisfies AcpRemoteAckFrame),
+    );
+
+    await waitFor(() =>
+      clientFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data && frame.seq === 43,
+      ),
+    );
+    await waitFor(() =>
+      daemonFrames.some(
+        (frame) => frame.frameType === AcpRemoteFrameType.Ack && frame.ack === 43,
+      ),
+    );
+    expect(
+      daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Close),
+    ).toBe(false);
+  });
+
+  it("queues remote-frame client payloads while the daemon is reconnecting", async () => {
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: new AcpRelayInMemoryControlPlaneStore({
+        accounts: [{ accountId: "acct-1" }],
+        clientDevices: [{ accountId: "acct-1", clientId: "client-1" }],
+        grants: [
+          {
+            accountId: "acct-1",
+            clientId: "client-1",
+            daemonId: "host-a",
+            policyVersion: 7,
+            scopes: ["acp:connect", "fs:read"],
+          },
+        ],
+        hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
+      }),
+      daemonReconnectGraceMs: 100,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-remote-frame-daemon-reconnect";
+    const [remoteClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [, firstRelayDaemonSocket] = createMemoryWebSocketPair();
+    const [secondDaemonSocket, secondRelayDaemonSocket] =
+      createMemoryWebSocketPair();
+    const daemonFrames: AcpRemoteFrame[] = [];
+    let remoteClosed = false;
+    remoteClientSocket.addEventListener("close", () => {
+      remoteClosed = true;
+    });
+    secondDaemonSocket.addEventListener("message", (event) => {
+      daemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    bindBrokerClientSocket(broker, connectionId, relayClientSocket);
+
+    await broker.registerDaemon("host-a", firstRelayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      clientId: "client-1",
+      connectionId,
+      daemonId: "host-a",
+      socket: relayClientSocket,
+      transport: "remote-frame",
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+
+    broker.removeDaemon("host-a", firstRelayDaemonSocket);
+    remoteClientSocket.send(
+      JSON.stringify({
+        channelId: "fs:reconnect",
+        channelKind: AcpRemoteChannelKind.Filesystem,
+        connectionId,
+        frameType: AcpRemoteFrameType.Data,
+        payload: {
+          operation: "read",
+          path: "/tmp/project/README.md",
+        },
+        seq: 1,
+      } satisfies AcpRemoteDataFrame),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    expect(remoteClosed).toBe(false);
+    expect(
+      broker
+        .clientStateSnapshot(connectionId)
+        ?.daemonQueuedFrames.some(
+          (frame) => frame.channelId === "fs:reconnect",
+        ),
+    ).toBe(true);
+
+    await broker.registerDaemon("host-a", secondRelayDaemonSocket);
+    await waitFor(() =>
+      daemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          frame.channelId === "fs:reconnect",
+      ),
+    );
+    expect(remoteClosed).toBe(false);
+  });
+
   it("rechecks grants before forwarding bound ACP traffic", async () => {
     const store = createControlPlaneStore();
     const broker = new AcpRelayBroker({
@@ -1908,7 +2488,7 @@ describe("AcpRelayBroker", () => {
       nativeClosed = true;
     });
 
-    broker.registerDaemon("host-a", firstRelayDaemonSocket);
+    await broker.registerDaemon("host-a", firstRelayDaemonSocket);
     broker.registerClient({
       accountId: "acct-1",
       authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
@@ -1962,6 +2542,186 @@ describe("AcpRelayBroker", () => {
 
     await waitFor(() =>
       daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Data),
+    );
+    expect(nativeClosed).toBe(false);
+  });
+
+  it("queues bound ACP requests while the daemon is reconnecting", async () => {
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore({
+        scopes: [
+          "acp:connect",
+          "acp:session:create",
+          "acp:session:resume",
+          "acp:turn:send",
+        ],
+      }),
+      daemonReconnectGraceMs: 100,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-daemon-reconnect-queue";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [firstDaemonSocket, firstRelayDaemonSocket] =
+      createMemoryWebSocketPair();
+    const [secondDaemonSocket, secondRelayDaemonSocket] =
+      createMemoryWebSocketPair();
+    const clientMessages: unknown[] = [];
+    const firstDaemonFrames: AcpRemoteFrame[] = [];
+    const daemonFrames: AcpRemoteFrame[] = [];
+    let nativeClosed = false;
+    nativeClientSocket.addEventListener("message", (event) => {
+      clientMessages.push(JSON.parse(String(event.data)));
+    });
+    nativeClientSocket.addEventListener("close", () => {
+      nativeClosed = true;
+    });
+    secondDaemonSocket.addEventListener("message", (event) => {
+      daemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    firstDaemonSocket.addEventListener("message", (event) => {
+      firstDaemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    bindBrokerDaemonSocket(broker, firstRelayDaemonSocket);
+
+    await broker.registerDaemon("host-a", firstRelayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "auth",
+        jsonrpc: "2.0",
+        method: "authenticate",
+        params: {
+          methodId: "acp-runtime-browser",
+        },
+      }),
+    );
+
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "set-bypass",
+        jsonrpc: "2.0",
+        method: "session/set_config_option",
+        params: {
+          configId: "approval-policy",
+          sessionId: "session-1",
+          value: "yolo",
+        },
+      }),
+    );
+    await waitFor(() =>
+      firstDaemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          frame.payload.method === "session/set_config_option",
+      ),
+    );
+    const setConfigFrame = firstDaemonFrames.find(
+      (frame): frame is AcpRemoteDataFrame =>
+        frame.frameType === AcpRemoteFrameType.Data &&
+        isJsonRpcPayload(frame.payload) &&
+        frame.payload.method === "session/set_config_option",
+    );
+    if (!setConfigFrame) {
+      throw new Error("Expected set config frame.");
+    }
+    firstDaemonSocket.send(
+      JSON.stringify({
+        ack: setConfigFrame.seq,
+        channelId: setConfigFrame.channelId,
+        connectionId,
+        frameType: AcpRemoteFrameType.Ack,
+      } satisfies AcpRemoteAckFrame),
+    );
+    firstDaemonSocket.send(
+      JSON.stringify({
+        channelId: "acp",
+        channelKind: AcpRemoteChannelKind.Acp,
+        connectionId,
+        frameType: AcpRemoteFrameType.Data,
+        payload: {
+          id: "set-bypass",
+          jsonrpc: "2.0",
+          result: { configOptions: [] },
+        },
+        seq: 50,
+      } satisfies AcpRemoteDataFrame),
+    );
+    await waitFor(() =>
+      clientMessages.some(
+        (message) => isJsonRpcResponse(message) && message.id === "set-bypass",
+      ),
+    );
+    expect(
+      broker
+        .clientStateSnapshot(connectionId)
+        ?.sessionControlRequests?.some(
+          (request) => request.method === "session/set_config_option",
+        ),
+    ).toBe(true);
+    clientMessages.length = 0;
+
+    broker.removeDaemon("host-a", firstRelayDaemonSocket);
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "queued-turn",
+        jsonrpc: "2.0",
+        method: "session/prompt",
+        params: {
+          prompt: [{ content: "keep going", type: "text" }],
+          sessionId: "session-1",
+        },
+      }),
+    );
+
+    expect(nativeClosed).toBe(false);
+    expect(
+      clientMessages.some(
+        (message) =>
+          isJsonRpcResponse(message) &&
+          message.id === "queued-turn" &&
+          "error" in message,
+      ),
+    ).toBe(false);
+    expect(
+      broker
+        .clientStateSnapshot(connectionId)
+        ?.daemonQueuedFrames.some(
+          (frame) =>
+            isJsonRpcPayload(frame.payload) &&
+            frame.payload.method === "session/prompt",
+        ),
+    ).toBe(true);
+
+    await broker.registerDaemon("host-a", secondRelayDaemonSocket);
+    await waitFor(() =>
+      daemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          frame.payload.method === "session/prompt",
+      ),
+    );
+    const replayedMethods = daemonFrames.flatMap((frame) =>
+      frame.frameType === AcpRemoteFrameType.Data &&
+      isJsonRpcPayload(frame.payload)
+        ? [frame.payload.method]
+        : [],
+    );
+    expect(replayedMethods).toContain("session/set_config_option");
+    expect(replayedMethods.indexOf("session/set_config_option")).toBeLessThan(
+      replayedMethods.indexOf("session/prompt"),
     );
     expect(nativeClosed).toBe(false);
   });
@@ -2254,6 +3014,174 @@ describe("AcpRelayBroker", () => {
     );
   });
 
+  it("suppresses duplicate native ACP prompts while the daemon response is pending", async () => {
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore(),
+      ticketSigningKey,
+    });
+    const connectionId = "conn-native-prompt-dedupe-pending";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const daemonFrames: AcpRemoteFrame[] = [];
+    nativeClientSocket.addEventListener("message", () => {});
+    daemonSocket.addEventListener("message", (event) => {
+      daemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    bindBrokerClientSocket(broker, connectionId, relayClientSocket);
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+
+    broker.registerDaemon("host-a", relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      bootstrapComplete: true,
+      connectionId,
+      nativeClientAck: true,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    daemonFrames.length = 0;
+
+    const prompt = {
+      id: "prompt-1",
+      jsonrpc: "2.0",
+      method: "session/prompt",
+      params: {
+        prompt: [{ text: "hi", type: "text" }],
+        sessionId: "session-1",
+      },
+    };
+    await broker.handleClientText(connectionId, JSON.stringify(prompt));
+    await broker.handleClientText(connectionId, JSON.stringify(prompt));
+
+    await waitFor(() =>
+      daemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          frame.payload.method === "session/prompt",
+      ),
+    );
+    const promptFrames = daemonFrames.filter(
+      (frame) =>
+        frame.frameType === AcpRemoteFrameType.Data &&
+        isJsonRpcPayload(frame.payload) &&
+        frame.payload.method === "session/prompt",
+    );
+    expect(promptFrames).toHaveLength(1);
+  });
+
+  it("replays a pending native ACP response for duplicate prompt ids", async () => {
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore(),
+      ticketSigningKey,
+    });
+    const connectionId = "conn-native-prompt-dedupe-response";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const clientMessages: unknown[] = [];
+    const daemonFrames: AcpRemoteFrame[] = [];
+    nativeClientSocket.addEventListener("message", (event) => {
+      clientMessages.push(JSON.parse(String(event.data)));
+    });
+    daemonSocket.addEventListener("message", (event) => {
+      daemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    bindBrokerClientSocket(broker, connectionId, relayClientSocket);
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+
+    broker.registerDaemon("host-a", relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      bootstrapComplete: true,
+      connectionId,
+      nativeClientAck: true,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    daemonFrames.length = 0;
+
+    const prompt = {
+      id: "prompt-1",
+      jsonrpc: "2.0",
+      method: "session/prompt",
+      params: {
+        prompt: [{ text: "hi", type: "text" }],
+        sessionId: "session-1",
+      },
+    };
+    await broker.handleClientText(connectionId, JSON.stringify(prompt));
+    await waitFor(() =>
+      daemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          frame.payload.method === "session/prompt",
+      ),
+    );
+    const promptFrame = daemonFrames.find(
+      (frame): frame is AcpRemoteDataFrame =>
+        frame.frameType === AcpRemoteFrameType.Data &&
+        isJsonRpcPayload(frame.payload) &&
+        frame.payload.method === "session/prompt",
+    );
+    if (!promptFrame) {
+      throw new Error("Expected forwarded prompt frame.");
+    }
+    daemonSocket.send(
+      JSON.stringify({
+        channelId: "acp",
+        channelKind: AcpRemoteChannelKind.Acp,
+        connectionId,
+        frameType: AcpRemoteFrameType.Data,
+        payload: {
+          id: "prompt-1",
+          jsonrpc: "2.0",
+          result: { stopReason: "end_turn" },
+        },
+        seq: 42,
+      } satisfies AcpRemoteDataFrame),
+    );
+    await waitFor(() =>
+      clientMessages.some(
+        (message) => isJsonRpcResponse(message) && message.id === "prompt-1",
+      ),
+    );
+
+    await broker.handleClientText(connectionId, JSON.stringify(prompt));
+    await waitFor(() =>
+      clientMessages.filter(
+        (message) => isJsonRpcResponse(message) && message.id === "prompt-1",
+      ).length === 2,
+    );
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "acp-runtime/remote/client_ack",
+        params: { id: "prompt-1" },
+      }),
+    );
+    await broker.handleClientText(connectionId, JSON.stringify(prompt));
+    await waitFor(() =>
+      clientMessages.filter(
+        (message) => isJsonRpcResponse(message) && message.id === "prompt-1",
+      ).length === 3,
+    );
+    const promptFrames = daemonFrames.filter(
+      (frame) =>
+        frame.frameType === AcpRemoteFrameType.Data &&
+        isJsonRpcPayload(frame.payload) &&
+        frame.payload.method === "session/prompt",
+    );
+    expect(promptFrames).toHaveLength(1);
+  });
+
   it("expires disconnected client routes after reconnect grace", async () => {
     let now = new Date("2026-04-27T00:00:00.000Z");
     const broker = new AcpRelayBroker({
@@ -2313,6 +3241,97 @@ describe("AcpRelayBroker", () => {
     expect(broker.hasPendingClientReconnects()).toBe(false);
   });
 
+  it("keeps default disconnected client routes resumable beyond five minutes", async () => {
+    let now = new Date("2026-04-27T00:00:00.000Z");
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore({
+        scopes: ["acp:connect", "acp:session:list"],
+      }),
+      now: () => now,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-client-default-reconnect-grace";
+    const [, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const daemonFrames: AcpRemoteFrame[] = [];
+    daemonSocket.addEventListener("message", (event) => {
+      daemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+
+    await broker.registerDaemon("host-a", relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "auth",
+        jsonrpc: "2.0",
+        method: "authenticate",
+        params: {
+          methodId: "acp-runtime-browser",
+        },
+      }),
+    );
+    await waitFor(() =>
+      daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Hello),
+    );
+    daemonFrames.length = 0;
+
+    broker.removeClient(connectionId, relayClientSocket);
+    now = new Date("2026-04-27T00:10:00.000Z");
+
+    expect(broker.closeExpiredDisconnectedClients()).toEqual([]);
+    expect(broker.hasPendingClientReconnects()).toBe(true);
+
+    const [, resumedRelayClientSocket] = createMemoryWebSocketPair();
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: resumedRelayClientSocket,
+    });
+    expect(broker.hasPendingClientReconnects()).toBe(false);
+
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "session/list",
+      }),
+    );
+    await waitFor(() =>
+      daemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          (frame.payload as { id?: unknown }).id === 1,
+      ),
+    );
+    daemonFrames.length = 0;
+
+    broker.removeClient(connectionId, resumedRelayClientSocket);
+    now = new Date("2026-04-28T00:10:00.001Z");
+
+    expect(broker.closeExpiredDisconnectedClients()).toEqual([connectionId]);
+    await waitFor(() =>
+      daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Close),
+    );
+    expect(daemonFrames).toContainEqual(
+      expect.objectContaining({
+        code: "client_reconnect_timeout",
+        connectionId,
+        frameType: AcpRemoteFrameType.Close,
+      }),
+    );
+  });
+
   it("replays unacked daemon frames after daemon reconnect", async () => {
     let now = new Date("2026-04-27T00:00:00.000Z");
     const broker = new AcpRelayBroker({
@@ -2331,7 +3350,7 @@ describe("AcpRelayBroker", () => {
       replayedFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
     });
 
-    broker.registerDaemon("host-a", firstRelayDaemonSocket);
+    await broker.registerDaemon("host-a", firstRelayDaemonSocket);
     broker.registerClient({
       accountId: "acct-1",
       authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
@@ -2383,6 +3402,521 @@ describe("AcpRelayBroker", () => {
     );
   });
 
+  it("fails acked daemon requests with unknown status after daemon runtime restart", async () => {
+    let now = new Date("2026-04-27T00:00:00.000Z");
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore(),
+      daemonReconnectGraceMs: 100,
+      now: () => now,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-daemon-acked-request-replay";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [firstDaemonSocket, firstRelayDaemonSocket] =
+      createMemoryWebSocketPair();
+    const [secondDaemonSocket, secondRelayDaemonSocket] =
+      createMemoryWebSocketPair();
+    const clientMessages: unknown[] = [];
+    const firstDaemonFrames: AcpRemoteFrame[] = [];
+    const secondDaemonFrames: AcpRemoteFrame[] = [];
+    nativeClientSocket.addEventListener("message", (event) => {
+      clientMessages.push(JSON.parse(String(event.data)));
+    });
+    firstDaemonSocket.addEventListener("message", (event) => {
+      firstDaemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    secondDaemonSocket.addEventListener("message", (event) => {
+      secondDaemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    bindBrokerDaemonSocket(broker, firstRelayDaemonSocket);
+    bindBrokerDaemonSocket(broker, secondRelayDaemonSocket);
+
+    await broker.registerDaemon("host-a", firstRelayDaemonSocket, {
+      agentTypes: [],
+      runtimeInstanceId: "runtime-run-1",
+      workspaceRoots: [],
+    });
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      bootstrapComplete: true,
+      connectionId,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "turn-after-ack",
+        jsonrpc: "2.0",
+        method: "session/prompt",
+        params: {
+          prompt: [{ content: "continue after reconnect", type: "text" }],
+          sessionId: "session-1",
+        },
+      }),
+    );
+
+    await waitFor(() =>
+      firstDaemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          frame.payload.method === "session/prompt",
+      ),
+    );
+    const promptFrame = firstDaemonFrames.find(
+      (frame): frame is AcpRemoteDataFrame =>
+        frame.frameType === AcpRemoteFrameType.Data &&
+        isJsonRpcPayload(frame.payload) &&
+        frame.payload.method === "session/prompt",
+    );
+    if (!promptFrame) {
+      throw new Error("Expected daemon prompt frame.");
+    }
+    firstDaemonSocket.send(
+      JSON.stringify({
+        ack: promptFrame.seq,
+        channelId: promptFrame.channelId,
+        connectionId,
+        frameType: AcpRemoteFrameType.Ack,
+      } satisfies AcpRemoteAckFrame),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(
+      broker
+        .clientStateSnapshot(connectionId)
+        ?.daemonPendingFrames.some(
+          (frame) =>
+            isJsonRpcPayload(frame.payload) &&
+            frame.payload.method === "session/prompt",
+        ),
+    ).toBe(false);
+
+    broker.removeDaemon("host-a", firstRelayDaemonSocket);
+    now = new Date("2026-04-27T00:00:00.050Z");
+    await broker.registerDaemon("host-a", secondRelayDaemonSocket, {
+      agentTypes: [],
+      runtimeInstanceId: "runtime-run-2",
+      workspaceRoots: [],
+    });
+    await waitFor(() =>
+      secondDaemonFrames.some(
+        (frame) => frame.frameType === AcpRemoteFrameType.Hello,
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(
+      secondDaemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          frame.payload.method === "session/prompt" &&
+          "id" in frame.payload &&
+          frame.payload.id === "turn-after-ack",
+      ),
+    ).toBe(false);
+    expect(clientMessages).toContainEqual(
+      expect.objectContaining({
+        error: expect.objectContaining({
+          data: expect.objectContaining({
+            reason: "daemon_restarted",
+          }),
+          message: expect.stringContaining("status is unknown"),
+        }),
+        id: "turn-after-ack",
+        jsonrpc: "2.0",
+      }),
+    );
+  });
+
+  it("replays acked session/load after daemon runtime restart", async () => {
+    let now = new Date("2026-04-27T00:00:00.000Z");
+    const store = new AcpRelayInMemoryControlPlaneStore({
+      accounts: [{ accountId: "acct-1" }],
+      clientDevices: [{ accountId: "acct-1", clientId: "native-acp-client" }],
+      grants: [
+        {
+          accountId: "acct-1",
+          daemonId: "host-a",
+          policyVersion: 7,
+          scopes: ["acp:connect", "acp:session:resume"],
+          workspaceRoots: ["/tmp"],
+        },
+      ],
+      hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
+      sessionBindings: [
+        {
+          accountId: "acct-1",
+          agent: { id: "codex-acp" },
+          clientId: "native-acp-client",
+          daemonId: "host-a",
+          sessionId: "session-existing",
+          workspaceRoots: ["/tmp"],
+        },
+      ],
+    });
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: store,
+      daemonReconnectGraceMs: 100,
+      now: () => now,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-daemon-acked-load-replay";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [firstDaemonSocket, firstRelayDaemonSocket] =
+      createMemoryWebSocketPair();
+    const [secondDaemonSocket, secondRelayDaemonSocket] =
+      createMemoryWebSocketPair();
+    const clientMessages: unknown[] = [];
+    const firstDaemonFrames: AcpRemoteFrame[] = [];
+    const secondDaemonFrames: AcpRemoteFrame[] = [];
+    nativeClientSocket.addEventListener("message", (event) => {
+      clientMessages.push(JSON.parse(String(event.data)));
+    });
+    firstDaemonSocket.addEventListener("message", (event) => {
+      firstDaemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    secondDaemonSocket.addEventListener("message", (event) => {
+      secondDaemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    bindBrokerDaemonSocket(broker, firstRelayDaemonSocket);
+    bindBrokerDaemonSocket(broker, secondRelayDaemonSocket);
+
+    await broker.registerDaemon("host-a", firstRelayDaemonSocket, {
+      agentTypes: [],
+      runtimeInstanceId: "runtime-run-1",
+      workspaceRoots: [],
+    });
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      bootstrapComplete: true,
+      connectionId,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    expect(
+      broker.clientStateSnapshot(connectionId)?.daemonRuntimeInstanceId,
+    ).toBe("runtime-run-1");
+
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "load-after-ack",
+        jsonrpc: "2.0",
+        method: "session/load",
+        params: {
+          cwd: "/tmp/project",
+          mcpServers: [],
+          sessionId: "session-existing",
+        },
+      }),
+    );
+
+    await waitFor(() =>
+      firstDaemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          frame.payload.method === "session/load",
+      ),
+    );
+    const loadFrame = firstDaemonFrames.find(
+      (frame): frame is AcpRemoteDataFrame =>
+        frame.frameType === AcpRemoteFrameType.Data &&
+        isJsonRpcPayload(frame.payload) &&
+        frame.payload.method === "session/load",
+    );
+    if (!loadFrame) {
+      throw new Error("Expected daemon load frame.");
+    }
+    firstDaemonSocket.send(
+      JSON.stringify({
+        ack: loadFrame.seq,
+        channelId: loadFrame.channelId,
+        connectionId,
+        frameType: AcpRemoteFrameType.Ack,
+      } satisfies AcpRemoteAckFrame),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(
+      broker.clientStateSnapshot(connectionId)?.daemonRequests.some(
+        (request) => request.id === "load-after-ack",
+      ),
+    ).toBe(true);
+    expect(
+      broker
+        .clientStateSnapshot(connectionId)
+        ?.daemonPendingFrames.some(
+          (frame) =>
+            isJsonRpcPayload(frame.payload) &&
+            frame.payload.method === "session/load",
+        ),
+    ).toBe(false);
+
+    broker.removeDaemon("host-a", firstRelayDaemonSocket);
+    now = new Date("2026-04-27T00:00:00.050Z");
+    await broker.registerDaemon("host-a", secondRelayDaemonSocket, {
+      agentTypes: [],
+      runtimeInstanceId: "runtime-run-2",
+      workspaceRoots: [],
+    });
+
+    await waitFor(() =>
+      secondDaemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          frame.payload.method === "session/load" &&
+          "id" in frame.payload &&
+          frame.payload.id === "load-after-ack",
+      ),
+    );
+    expect(clientMessages).not.toContainEqual(
+      expect.objectContaining({
+        error: expect.objectContaining({
+          data: expect.objectContaining({
+            reason: "daemon_restarted",
+          }),
+        }),
+        id: "load-after-ack",
+        jsonrpc: "2.0",
+      }),
+    );
+  });
+
+  it("renews expired tickets before reopening routes after daemon reconnect", async () => {
+    let now = new Date("2026-04-27T00:00:00.000Z");
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore(),
+      daemonReconnectGraceMs: 60_000,
+      now: () => now,
+      ticketRenewBeforeMs: 1_000,
+      ticketSigningKey,
+      ticketTtlMs: 5_000,
+    });
+    const connectionId = "conn-daemon-reconnect-ticket-renew";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [firstDaemonSocket, firstRelayDaemonSocket] =
+      createMemoryWebSocketPair();
+    const [secondDaemonSocket, secondRelayDaemonSocket] =
+      createMemoryWebSocketPair();
+    const firstDaemonFrames: AcpRemoteFrame[] = [];
+    const secondDaemonFrames: AcpRemoteFrame[] = [];
+    let clientClosed = false;
+
+    nativeClientSocket.addEventListener("close", () => {
+      clientClosed = true;
+    });
+    firstDaemonSocket.addEventListener("message", (event) => {
+      firstDaemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    secondDaemonSocket.addEventListener("message", (event) => {
+      secondDaemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    bindBrokerDaemonSocket(broker, firstRelayDaemonSocket);
+    bindBrokerDaemonSocket(broker, secondRelayDaemonSocket);
+
+    await broker.registerDaemon("host-a", firstRelayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      nativeClientAck: true,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+
+    await waitFor(() =>
+      firstDaemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          frame.payload.method === "initialize",
+      ),
+    );
+    const bootstrapFrame = firstDaemonFrames.find(
+      (frame): frame is AcpRemoteDataFrame =>
+        frame.frameType === AcpRemoteFrameType.Data,
+    );
+    if (!bootstrapFrame) {
+      throw new Error("Expected daemon bootstrap frame.");
+    }
+    firstDaemonSocket.send(
+      JSON.stringify({
+        ack: bootstrapFrame.seq,
+        channelId: bootstrapFrame.channelId,
+        connectionId,
+        frameType: AcpRemoteFrameType.Ack,
+      } satisfies AcpRemoteAckFrame),
+    );
+
+    broker.removeDaemon("host-a", firstRelayDaemonSocket);
+    now = new Date("2026-04-27T00:00:06.000Z");
+    await broker.registerDaemon("host-a", secondRelayDaemonSocket);
+
+    await waitFor(() =>
+      secondDaemonFrames.some(
+        (frame) => frame.frameType === AcpRemoteFrameType.Hello,
+      ),
+    );
+    const helloFrame = secondDaemonFrames.find(
+      (frame) => frame.frameType === AcpRemoteFrameType.Hello,
+    );
+    if (
+      !helloFrame ||
+      helloFrame.frameType !== AcpRemoteFrameType.Hello ||
+      !helloFrame.ticket
+    ) {
+      throw new Error("Expected renewed daemon hello frame.");
+    }
+    expect(Date.parse(helloFrame.ticket.payload.expiresAt)).toBeGreaterThan(
+      now.getTime(),
+    );
+    expect(clientClosed).toBe(false);
+    expect(
+      secondDaemonFrames.filter(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          frame.payload.method === "initialize",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("queues client-to-daemon frames instead of closing when the daemon ack window is full", async () => {
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore({
+        scopes: [
+          "acp:connect",
+          "acp:session:create",
+          "acp:session:list",
+          "acp:turn:send",
+        ],
+      }),
+      maxBufferedFramesPerConnection: 2,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-daemon-window-queue";
+    const [, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const daemonFrames: AcpRemoteFrame[] = [];
+    daemonSocket.addEventListener("message", (event) => {
+      daemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    broker.registerDaemon("host-a", relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "auth",
+        jsonrpc: "2.0",
+        method: "authenticate",
+        params: {
+          methodId: "acp-runtime-browser",
+        },
+      }),
+    );
+
+    await waitFor(() =>
+      daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Data),
+    );
+    for (const frame of daemonFrames) {
+      if (frame.frameType === AcpRemoteFrameType.Data) {
+        daemonSocket.send(
+          JSON.stringify({
+            ack: frame.seq,
+            channelId: frame.channelId,
+            connectionId,
+            frameType: AcpRemoteFrameType.Ack,
+          }),
+        );
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    daemonFrames.length = 0;
+
+    for (let id = 1; id <= 3; id++) {
+      await broker.handleClientText(
+        connectionId,
+        JSON.stringify({
+          id,
+          jsonrpc: "2.0",
+          method: "session/list",
+          params: {},
+        }),
+      );
+    }
+
+    await waitFor(
+      () =>
+        daemonFrames.filter((frame) => frame.frameType === AcpRemoteFrameType.Data)
+          .length === 2,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(
+      daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Close),
+    ).toBe(false);
+    expect(
+      daemonFrames
+        .filter((frame): frame is AcpRemoteDataFrame =>
+          frame.frameType === AcpRemoteFrameType.Data,
+        )
+        .map((frame) =>
+          isJsonRpcPayload(frame.payload) && "id" in frame.payload
+            ? frame.payload.id
+            : undefined,
+        ),
+    ).toEqual([1, 2]);
+
+    const firstDataFrame = daemonFrames.find(
+      (frame): frame is AcpRemoteDataFrame =>
+        frame.frameType === AcpRemoteFrameType.Data,
+    );
+    if (!firstDataFrame) {
+      throw new Error("Expected first daemon data frame.");
+    }
+    daemonSocket.send(
+      JSON.stringify({
+        ack: firstDataFrame.seq,
+        channelId: firstDataFrame.channelId,
+        connectionId,
+        frameType: AcpRemoteFrameType.Ack,
+      }),
+    );
+
+    await waitFor(() =>
+      daemonFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcPayload(frame.payload) &&
+          "id" in frame.payload &&
+          frame.payload.id === 3,
+      ),
+    );
+    expect(
+      daemonFrames.some((frame) => frame.frameType === AcpRemoteFrameType.Close),
+    ).toBe(false);
+  });
+
   it("removes client routes when a daemon sends a close frame", async () => {
     const broker = new AcpRelayBroker({
       controlPlaneStore: createControlPlaneStore(),
@@ -2406,6 +3940,15 @@ describe("AcpRelayBroker", () => {
     await expect(
       broker.authorizeClient({ connectionId, daemonId: "host-a" }),
     ).resolves.toMatchObject({ ok: true });
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "bootstrap",
+        jsonrpc: "2.0",
+        method: "session/prompt",
+        params: { sessionId: "session-1" },
+      }),
+    );
 
     broker.handleDaemonText(
       JSON.stringify({
@@ -2470,7 +4013,7 @@ describe("AcpRelayBroker", () => {
     clientMessages.length = 0;
 
     broker.removeDaemon("host-a", firstRelayDaemonSocket);
-    broker.registerDaemon("host-a", secondRelayDaemonSocket);
+    await broker.registerDaemon("host-a", secondRelayDaemonSocket);
     broker.handleDaemonText(
       JSON.stringify({
         channelId: "acp",
@@ -2840,6 +4383,178 @@ describe("AcpRelayBroker", () => {
     await waitFor(() => nativeClosed);
   });
 
+  it("forwards native ACP client JSON-RPC responses to daemon requests", async () => {
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore(),
+      ticketSigningKey,
+    });
+    const connectionId = "conn-native-jsonrpc-response";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    let nativeClosed = false;
+    let forwardedResponse: AcpRemoteDataFrame | undefined;
+    nativeClientSocket.addEventListener("close", () => {
+      nativeClosed = true;
+    });
+    daemonSocket.addEventListener("message", (event) => {
+      const frame = assertAcpRemoteFrame(JSON.parse(String(event.data)));
+      if (
+        frame.frameType === AcpRemoteFrameType.Data &&
+        isJsonRpcResponse(frame.payload) &&
+        frame.payload.id === 0
+      ) {
+        forwardedResponse = frame;
+      }
+    });
+
+    bindBrokerClientSocket(broker, connectionId, relayClientSocket);
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    broker.registerDaemon("host-a", relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+    const clientConnection = createClientConnection(nativeClientSocket);
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+    const authentication = clientConnection.authenticate({
+      methodId: "acp-runtime-browser",
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await expect(authentication).resolves.toMatchObject({
+      _meta: {
+        "acp-runtime/remote/daemonId": "host-a",
+      },
+    });
+
+    broker.handleDaemonText(
+      JSON.stringify({
+        channelId: "acp",
+        channelKind: AcpRemoteChannelKind.Acp,
+        connectionId,
+        frameType: AcpRemoteFrameType.Data,
+        payload: {
+          id: 0,
+          jsonrpc: "2.0",
+          method: "session/request_permission",
+          params: {
+            options: [
+              {
+                kind: "allow_once",
+                name: "Allow once",
+                optionId: "allow_once",
+              },
+              {
+                kind: "reject_once",
+                name: "Reject",
+                optionId: "reject_once",
+              },
+            ],
+            sessionId: "session-1",
+            toolCall: {
+              kind: "execute",
+              status: "pending",
+              title: "Inspect auth proxy",
+              toolCallId: "tool-1",
+            },
+          },
+        },
+        seq: 1,
+      } satisfies AcpRemoteDataFrame),
+    );
+
+    await waitFor(() => forwardedResponse !== undefined);
+    expect(nativeClosed).toBe(false);
+    expect(forwardedResponse?.payload).toMatchObject({
+      id: 0,
+      jsonrpc: "2.0",
+      result: {
+        outcome: {
+          optionId: "allow_once",
+          outcome: "selected",
+        },
+      },
+    });
+  });
+
+  it("forwards native ACP client JSON-RPC responses with null ids", async () => {
+    const broker = new AcpRelayBroker({
+      controlPlaneStore: createControlPlaneStore(),
+      ticketSigningKey,
+    });
+    const connectionId = "conn-native-jsonrpc-null-response";
+    const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    let nativeClosed = false;
+    let forwardedResponse: AcpRemoteDataFrame | undefined;
+    nativeClientSocket.addEventListener("close", () => {
+      nativeClosed = true;
+    });
+    daemonSocket.addEventListener("message", (event) => {
+      const frame = assertAcpRemoteFrame(JSON.parse(String(event.data)));
+      if (
+        frame.frameType === AcpRemoteFrameType.Data &&
+        isJsonRpcResponse(frame.payload) &&
+        frame.payload.id === null
+      ) {
+        forwardedResponse = frame;
+      }
+    });
+
+    bindBrokerClientSocket(broker, connectionId, relayClientSocket);
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+    broker.registerDaemon("host-a", relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      socket: relayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        id: "auth",
+        jsonrpc: "2.0",
+        method: "authenticate",
+        params: {
+          methodId: "acp-runtime-browser",
+        },
+      }),
+    );
+
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        error: {
+          code: -32600,
+          message: "Invalid request",
+        },
+        id: null,
+        jsonrpc: "2.0",
+      }),
+    );
+
+    await waitFor(() => forwardedResponse !== undefined);
+    expect(nativeClosed).toBe(false);
+    expect(forwardedResponse?.payload).toMatchObject({
+      error: {
+        code: -32600,
+        message: "Invalid request",
+      },
+      id: null,
+      jsonrpc: "2.0",
+    });
+  });
+
   it("closes remote-frame client sending mismatched connectionId", async () => {
     const store = createControlPlaneStore();
     const broker = new AcpRelayBroker({
@@ -2938,7 +4653,7 @@ describe("AcpRelayBroker", () => {
     expect(daemonFrames[0].frameType).toBe(AcpRemoteFrameType.Hello);
   });
 
-  it("closes client when backpressure exceeds buffer limit for disconnected client", async () => {
+  it("queues disconnected client payloads instead of closing when buffer limit is reached", async () => {
     let now = new Date("2026-04-27T00:00:00.000Z");
     const broker = new AcpRelayBroker({
       clientReconnectGraceMs: 100,
@@ -2949,13 +4664,20 @@ describe("AcpRelayBroker", () => {
     });
     const connectionId = "conn-backpressure";
     const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+    const [resumedNativeSocket, resumedRelayClientSocket] =
+      createMemoryWebSocketPair();
     const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
     const rawDaemonMessages: unknown[] = [];
+    const resumedMessages: unknown[] = [];
     daemonSocket.addEventListener("message", (event) => {
       rawDaemonMessages.push(JSON.parse(String(event.data)));
     });
+    resumedNativeSocket.addEventListener("message", (event) => {
+      resumedMessages.push(JSON.parse(String(event.data)));
+    });
 
     bindBrokerClientSocket(broker, connectionId, relayClientSocket);
+    bindBrokerClientSocket(broker, connectionId, resumedRelayClientSocket);
     bindBrokerDaemonSocket(broker, relayDaemonSocket);
     broker.registerDaemon("host-a", relayDaemonSocket);
     broker.registerClient({
@@ -2996,14 +4718,31 @@ describe("AcpRelayBroker", () => {
       );
     }
 
-    await waitFor(() => rawDaemonMessages.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 5));
     expect(rawDaemonMessages).toMatchObject(
-      expect.arrayContaining([
-        expect.objectContaining({
-          code: "client_backpressure",
-          frameType: AcpRemoteFrameType.Close,
-        }),
+      expect.not.arrayContaining([
+        expect.objectContaining({ frameType: AcpRemoteFrameType.Close }),
       ]),
+    );
+    expect(rawDaemonMessages).toHaveLength(0);
+
+    now = new Date("2026-04-27T00:00:00.050Z");
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      nativeClientAck: true,
+      socket: resumedRelayClientSocket,
+    });
+
+    await waitFor(() => resumedMessages.length === 3);
+    expect(resumedMessages.map((message) => (message as { params?: { i?: number } }).params?.i))
+      .toEqual([0, 1, 2]);
+    await waitFor(() =>
+      rawDaemonMessages.filter(
+        (message) =>
+          (message as { frameType?: string }).frameType === AcpRemoteFrameType.Ack,
+      ).length === 3,
     );
   });
 
@@ -3082,6 +4821,102 @@ function createControlPlaneStore(input: {
   });
 }
 
+function createSessionBindingRestoreHarness(input: {
+  bootstrapComplete?: boolean;
+  connectionId: string;
+  ticket?: Awaited<ReturnType<typeof createAcpRemoteSignedConnectionTicket>>;
+}): {
+  clientMessages: unknown[];
+  daemonFrames: AcpRemoteFrame[];
+  sendPrompt(id: string): Promise<void>;
+} {
+  const store = new AcpRelayInMemoryControlPlaneStore({
+    accounts: [{ accountId: "acct-1" }],
+    clientDevices: [{ accountId: "acct-1", clientId: "native-acp-client" }],
+    grants: [
+      {
+        accountId: "acct-1",
+        daemonId: "host-a",
+        policyVersion: 7,
+        scopes: ["acp:connect", "acp:turn:send"],
+        workspaceRoots: ["/tmp/persisted-project"],
+      },
+    ],
+    hosts: [{ accountId: "acct-1", daemonId: "host-a" }],
+    sessionBindings: [
+      {
+        accountId: "acct-1",
+        agent: { id: "codex-acp" },
+        clientId: "native-acp-client",
+        daemonId: "host-a",
+        sessionId: "session-existing",
+        workspaceRoots: ["/tmp/persisted-project"],
+      },
+    ],
+  });
+  const broker = new AcpRelayBroker({
+    authWaitMs: 1_000,
+    controlPlaneStore: store,
+    ticketSigningKey,
+  });
+  const [nativeClientSocket, relayClientSocket] = createMemoryWebSocketPair();
+  const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+  const clientMessages: unknown[] = [];
+  const daemonFrames: AcpRemoteFrame[] = [];
+  nativeClientSocket.addEventListener("message", (event) => {
+    clientMessages.push(JSON.parse(String(event.data)));
+  });
+  daemonSocket.addEventListener("message", (event) => {
+    daemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+  });
+  bindBrokerDaemonSocket(broker, relayDaemonSocket);
+
+  broker.registerDaemon("host-a", relayDaemonSocket, {
+    agentTypes: [{ id: "codex-acp", label: "Codex" }],
+    workspaceRoots: [{ path: "/tmp" }],
+  });
+  broker.registerClient({
+    accountId: "acct-1",
+    authUrl: `https://relay.test/authorize?connectionId=${input.connectionId}`,
+    bootstrapComplete: input.bootstrapComplete,
+    connectionId: input.connectionId,
+    socket: relayClientSocket,
+    ticket: input.ticket,
+  });
+
+  return {
+    clientMessages,
+    daemonFrames,
+    sendPrompt(id: string) {
+      return broker.handleClientText(
+        input.connectionId,
+        JSON.stringify({
+          id,
+          jsonrpc: "2.0",
+          method: "session/prompt",
+          params: {
+            prompt: [{ text: "continue", type: "text" }],
+            sessionId: "session-existing",
+          },
+        }),
+      );
+    },
+  };
+}
+
+async function waitForSessionPromptForward(
+  daemonFrames: readonly AcpRemoteFrame[],
+): Promise<void> {
+  await waitFor(() =>
+    daemonFrames.some(
+      (frame) =>
+        frame.frameType === AcpRemoteFrameType.Data &&
+        isJsonRpcPayload(frame.payload) &&
+        frame.payload.method === "session/prompt",
+    ),
+  );
+}
+
 function createClientConnection(socket: MemoryWebSocket): ClientSideConnection {
   return new ClientSideConnection(
     () =>
@@ -3147,5 +4982,26 @@ function isJsonRpcPayload(
     value.jsonrpc === "2.0" &&
     "method" in value &&
     typeof value.method === "string"
+  );
+}
+
+function isJsonRpcResponse(
+  value: unknown,
+): value is {
+  error?: unknown;
+  id: string | number | null;
+  jsonrpc: "2.0";
+  result?: unknown;
+} {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "jsonrpc" in value &&
+    value.jsonrpc === "2.0" &&
+    "id" in value &&
+    (typeof value.id === "string" ||
+      typeof value.id === "number" ||
+      value.id === null) &&
+    ("result" in value || "error" in value)
   );
 }

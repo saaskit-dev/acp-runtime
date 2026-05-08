@@ -69,8 +69,10 @@ function log(
 function loadCachedAccountSession(): string | undefined {
   try {
     const data = JSON.parse(
-      readFileSync(join(homedir(), ".acp", "relay-session.json"), "utf8"),
-    ) as { token?: unknown };
+      readFileSync(join(homedir(), ".acp-runtime", "relay-session.json"), "utf8"),
+    ) as {
+      token?: unknown;
+    };
     return typeof data.token === "string" ? data.token : undefined;
   } catch {
     return undefined;

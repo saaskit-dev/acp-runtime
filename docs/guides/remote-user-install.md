@@ -18,9 +18,43 @@ npm install -g @saaskit-dev/acp-runtime
 
 This installs one command with remote subcommands:
 
+- `acp-runtime auth`: browser login and cached account-session management.
 - `acp-runtime daemon`: the local machine daemon that runs agents.
 - `acp-runtime bridge`: a generic stdio ACP bridge for clients that cannot connect
   to the relay WebSocket directly.
+
+Package install does not register a background daemon by itself. First-time
+service registration is explicit because it creates a long-running local
+process, may open browser login, and may need launchd or sudo privileges.
+
+## Sign In
+
+```bash
+acp-runtime auth login
+```
+
+This opens browser login and stores the account session at
+`~/.acp/relay-session.json`. If this is a fresh login and no daemon service is
+installed yet, it also installs the default macOS user daemon service. If a
+valid cached login already exists, it only reports that authentication is
+already complete. Use `--no-daemon` only when intentionally caching login
+without registering a background service. Check or clear that login with:
+
+```bash
+acp-runtime auth status
+acp-runtime auth logout
+```
+
+If the cached login is expired or belongs to a different relay deployment,
+refresh it explicitly. On macOS user mode, this also reinstalls the default user
+daemon service so the launchd plist and service process match the refreshed
+login and current CLI configuration. If the machine is already installed in
+system mode, the same command automatically runs the system reinstall path and
+macOS prompts for sudo:
+
+```bash
+acp-runtime auth login --force
+```
 
 ## Install Daemon
 
@@ -28,16 +62,14 @@ This installs one command with remote subcommands:
 acp-runtime daemon install
 ```
 
-The first run opens browser login if no cached session exists. After login, the
-relay automatically creates the account, daemon host record, default grant, and
-client device records as needed.
-
-If the cached login is expired or belongs to a different relay deployment,
-refresh it explicitly:
-
-```bash
-acp-runtime daemon install --force-login
-```
+If no cached session exists, daemon install still opens browser login for
+backward compatibility. In the normal fresh-login flow, `auth login` installs
+the default user daemon when no service exists, so `daemon install` is mainly for
+changing service options, switching service mode, or repairing an install. After
+login, the relay
+automatically creates the account, daemon host record, default grant, and client
+device records as needed. Use `acp-runtime auth login --force` to refresh an
+expired or mismatched cached session and reinstall the default user daemon.
 
 By default the daemon connects to `wss://relay.saaskit.app` and exposes the
 user's home directory as the workspace root. Use `--relay-url` or
@@ -48,6 +80,27 @@ runs at login and is restarted by launchd after both successful and failed
 exits. It also reconnects to the relay with backoff after transient network
 failures. `acp-runtime daemon stop` unloads the LaunchAgent so it stays stopped
 until `start` or `install` loads it again.
+
+If the daemon must start at system boot before the user logs in, install the
+optional system LaunchDaemon:
+
+```bash
+acp-runtime auth login
+acp-runtime daemon install --system
+```
+
+System install writes `/Library/LaunchDaemons/dev.saaskit.acp-runtime.daemon.plist`
+and runs the daemon as `SUDO_USER` by default, so it can read that user's cached
+`~/.acp/relay-session.json` and write logs under that user's home directory. Use
+`--user` or `--home-dir` only when overriding that detected default. After a
+service is installed, `status`, `start`, `stop`, and `uninstall` auto-detect the
+installed mode. `--system` is only needed to force system mode or resolve an
+unexpected conflict. Commands that modify the system service automatically
+re-run through `sudo`, so macOS prompts for a password when needed.
+
+Only one service mode should be installed on a machine. Installing `--system`
+removes the target user's LaunchAgent. Installing user mode refuses to proceed
+if a system LaunchDaemon is still installed, because removing it requires sudo.
 
 Useful daemon commands:
 
@@ -61,6 +114,39 @@ acp-runtime daemon run
 
 Use `run` for foreground debugging. Use `install` for the normal background
 service.
+
+## Upgrade Daemon
+
+If a daemon service is already installed, the running daemon watches its own
+executable path and exits when that file changes. Because launchd has
+`KeepAlive`, it restarts with the upgraded code after a normal global npm
+upgrade that replaces the same command path:
+
+```bash
+npm install -g @saaskit-dev/acp-runtime@latest
+acp-runtime daemon status
+```
+
+Run `daemon install` again only when installing for the first time, switching
+between user and system mode, changing workspace roots or relay options, or
+when the global npm command path itself changed and the plist must be rewritten:
+
+```bash
+acp-runtime daemon install
+```
+
+For the optional boot-time service, use:
+
+```bash
+npm install -g @saaskit-dev/acp-runtime@latest
+acp-runtime daemon install --system
+acp-runtime daemon status
+```
+
+`install` rewrites the plist and kickstarts launchd, so the next daemon process
+uses the newly installed global package path. `daemon start` only reloads an
+existing plist; use `install` after upgrades that change service configuration
+or command path.
 
 ## Configure Stdio Clients
 
@@ -101,7 +187,7 @@ the next `authenticate` opens a fresh authorization URL.
 ## Normal Flow
 
 1. Install package.
-2. Install daemon and sign in.
+2. Sign in; on fresh login, this installs the default user daemon on macOS if no service exists.
 3. Configure the ACP client or stdio bridge.
 4. Start a session from the client.
 5. The relay opens authorization UI where the user selects machine, agent, and

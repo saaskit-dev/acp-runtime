@@ -1,4 +1,4 @@
-import { basename, isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { realpath } from "node:fs/promises";
 
 import type {
@@ -27,7 +27,6 @@ import type {
   SetSessionConfigOptionResponse,
   SetSessionModeRequest,
   SetSessionModeResponse,
-  SessionConfigOption,
 } from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
 
@@ -98,7 +97,6 @@ export type AcpRemoteRuntimeAgentOptions = {
 };
 
 type ActiveRemoteSession = {
-  remoteConfigOptions: SessionConfigOption[];
   session: AcpRuntimeSession;
   terminalHandles: Map<string, Awaited<ReturnType<AgentSideConnection["createTerminal"]>>>;
   turnId?: string;
@@ -110,10 +108,10 @@ type SessionScopedParams = {
 };
 
 const REMOTE_SESSION_AGENT_META = "acp-runtime/remote/sessionAgent";
+const REMOTE_SESSION_MACHINE_META = "acp-runtime/remote/sessionMachine";
 const REMOTE_SESSION_WORKSPACE_ROOTS_META =
   "acp-runtime/remote/sessionWorkspaceRoots";
 const REMOTE_DAEMON_ID_META = "acp-runtime/remote/daemonId";
-const REMOTE_CONFIG_OPTION_PREFIX = "acp-runtime.remote.";
 
 export class AcpRemoteRuntimeAgent implements Agent {
   private clientCapabilities: ClientCapabilities = {};
@@ -159,17 +157,9 @@ export class AcpRemoteRuntimeAgent implements Agent {
       mcpServers: mapAcpMcpServersToRuntime(params.mcpServers),
       _traceContext: traceContext,
     });
-    const remoteConfigOptions = createRemoteConfigOptions({
-      agent: selection.agent ?? this.options.agent,
-      machine: this.options.remoteMachineName,
-      workspace: selection.workspaceRoots?.[0] ?? cwd,
-    });
-    this.storeActiveSession(session, remoteConfigOptions);
+    this.storeActiveSession(session);
     return addRemoteSessionMetadata(
-      addRemoteConfigOptions(
-        mapRuntimeSessionToAcpResponse(session.metadata),
-        remoteConfigOptions,
-      ),
+      mapRuntimeSessionToAcpResponse(session.metadata),
       this.createRemoteSessionMetadata(selection, cwd),
     );
   }
@@ -195,18 +185,10 @@ export class AcpRemoteRuntimeAgent implements Agent {
       sessionId: params.sessionId,
       traceContext,
     });
-    const remoteConfigOptions = createRemoteConfigOptions({
-      agent,
-      machine: this.options.remoteMachineName,
-      workspace: cwd,
-    });
-    this.storeActiveSession(session, remoteConfigOptions, [params.sessionId]);
+    this.storeActiveSession(session, [params.sessionId]);
     await this.replayHistory(params.sessionId, session);
     return addRemoteSessionMetadata(
-      addRemoteConfigOptions(
-        mapRuntimeSessionToAcpResponse(session.metadata),
-        remoteConfigOptions,
-      ),
+      mapRuntimeSessionToAcpResponse(session.metadata),
       this.createRemoteSessionMetadata({ agent }, cwd),
     );
   }
@@ -234,18 +216,10 @@ export class AcpRemoteRuntimeAgent implements Agent {
       sessionId: params.sessionId,
       traceContext,
     });
-    const remoteConfigOptions = createRemoteConfigOptions({
-      agent,
-      machine: this.options.remoteMachineName,
-      workspace: cwd,
-    });
-    this.storeActiveSession(session, remoteConfigOptions, [params.sessionId]);
+    this.storeActiveSession(session, [params.sessionId]);
     await this.replayHistory(params.sessionId, session);
     return addRemoteSessionMetadata(
-      addRemoteConfigOptions(
-        mapRuntimeSessionToAcpResponse(session.metadata),
-        remoteConfigOptions,
-      ),
+      mapRuntimeSessionToAcpResponse(session.metadata),
       this.createRemoteSessionMetadata({ agent }, cwd),
     );
   }
@@ -306,32 +280,14 @@ export class AcpRemoteRuntimeAgent implements Agent {
       params,
       "session/set_config_option",
     );
-    if (params.configId.startsWith(REMOTE_CONFIG_OPTION_PREFIX)) {
-      return {
-        configOptions: addRemoteConfigOptions(
-          {
-            configOptions:
-              mapRuntimeConfigOptionsToAcp(
-                active.session.metadata.agentConfigOptions,
-              ) ?? [],
-          },
-          active.remoteConfigOptions,
-        ).configOptions ?? [],
-      };
-    }
     const value: AcpRuntimeConfigValue =
       "type" in params && params.type === "boolean" ? params.value : params.value;
     await active.session.agent.setConfigOption(params.configId, value);
     return {
-      configOptions: addRemoteConfigOptions(
-        {
-          configOptions:
-            mapRuntimeConfigOptionsToAcp(
-              active.session.metadata.agentConfigOptions,
-            ) ?? [],
-        },
-        active.remoteConfigOptions,
-      ).configOptions ?? [],
+      configOptions:
+        mapRuntimeConfigOptionsToAcp(
+          active.session.metadata.agentConfigOptions,
+        ) ?? [],
     };
   }
 
@@ -419,6 +375,7 @@ export class AcpRemoteRuntimeAgent implements Agent {
         this.options.sessionAgent ??
         this.options.agent,
       daemonId: this.options.remoteDaemonId,
+      machine: this.options.remoteMachineName,
       workspaceRoots:
         selection.workspaceRoots ??
         this.options.workspaceRoots ??
@@ -477,14 +434,7 @@ export class AcpRemoteRuntimeAgent implements Agent {
       sessionId: params.sessionId,
       traceContext,
     });
-    const remoteConfigOptions = createRemoteConfigOptions({
-      agent,
-      machine: this.options.remoteMachineName,
-      workspace: cwd,
-    });
-    const active = this.storeActiveSession(session, remoteConfigOptions, [
-      params.sessionId,
-    ]);
+    const active = this.storeActiveSession(session, [params.sessionId]);
     await this.replayHistory(params.sessionId, session);
     return active;
   }
@@ -541,11 +491,9 @@ export class AcpRemoteRuntimeAgent implements Agent {
 
   private storeActiveSession(
     session: AcpRuntimeSession,
-    remoteConfigOptions: SessionConfigOption[],
     aliases: readonly string[] = [],
   ): ActiveRemoteSession {
     const active: ActiveRemoteSession = {
-      remoteConfigOptions,
       session,
       terminalHandles: new Map(),
     };
@@ -839,11 +787,15 @@ function addRemoteSessionMetadata<T extends object>(
 function createRemoteSessionMetadata(input: {
   agent?: AcpRuntimeAgentInput;
   daemonId?: string;
+  machine?: string;
   workspaceRoots?: readonly string[];
 }): Record<string, unknown> {
   const metadata: Record<string, unknown> = {};
   if (input.daemonId) {
     metadata[REMOTE_DAEMON_ID_META] = input.daemonId;
+  }
+  if (input.machine) {
+    metadata[REMOTE_SESSION_MACHINE_META] = input.machine;
   }
   const agent = serializeSessionAgent(input.agent);
   if (agent) {
@@ -877,78 +829,6 @@ function serializeSessionAgent(
     serialized.type = agent.type;
   }
   return serialized;
-}
-
-function addRemoteConfigOptions<
-  T extends { configOptions?: SessionConfigOption[] | null },
->(
-  response: T,
-  remoteConfigOptions: readonly SessionConfigOption[],
-): T & { configOptions: SessionConfigOption[] } {
-  return {
-    ...response,
-    configOptions: [
-      ...(response.configOptions ?? []),
-      ...remoteConfigOptions,
-    ],
-  };
-}
-
-function createRemoteConfigOptions(input: {
-  agent?: AcpRuntimeAgentInput;
-  machine?: string;
-  workspace?: string;
-}): SessionConfigOption[] {
-  return [
-    createReadonlyRemoteOption(
-      "machine",
-      "Remote Machine",
-      input.machine ?? "Unknown machine",
-      "Machine selected in ACP relay authorization.",
-    ),
-    createReadonlyRemoteOption(
-      "agent",
-      "Remote Agent",
-      formatAgent(input.agent),
-      "Agent selected in ACP relay authorization.",
-    ),
-    createReadonlyRemoteOption(
-      "workspace",
-      "Remote Workspace",
-      input.workspace ?? "No workspace preference",
-      "Workspace selected in ACP relay authorization.",
-    ),
-  ];
-}
-
-function createReadonlyRemoteOption(
-  key: string,
-  name: string,
-  value: string,
-  description: string,
-): SessionConfigOption {
-  return {
-    category: "remote",
-    currentValue: value,
-    description,
-    id: `${REMOTE_CONFIG_OPTION_PREFIX}${key}`,
-    name,
-    options: [{ name: value, value }],
-    type: "select",
-  };
-}
-
-function formatAgent(agent: AcpRuntimeAgentInput | undefined): string {
-  if (!agent) {
-    return "Default daemon agent";
-  }
-  if (typeof agent === "string") {
-    return agent;
-  }
-  if (agent.type) {
-    return agent.type;
-  }
-  return basename(agent.command);
 }
 
 function formatError(error: unknown): string {

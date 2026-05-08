@@ -74,7 +74,7 @@ describe("createAcpRemoteStdioBridge", () => {
     }
   });
 
-  it("bounds outbound requests while the relay is reconnecting", async () => {
+  it("queues outbound requests while the relay is reconnecting", async () => {
     const input = new PassThrough();
     const output = new PassThrough();
     let outputText = "";
@@ -89,10 +89,10 @@ describe("createAcpRemoteStdioBridge", () => {
       input,
       output,
       reconnect: {
-	        maxDelayMs: 1_000,
-	        maxQueuedMessages: 1,
-	        minDelayMs: 1_000,
-	      },
+        maxDelayMs: 1,
+        maxQueuedMessages: 1,
+        minDelayMs: 1,
+      },
       relayUrl: "ws://relay.test",
       socketFactory() {
         const socket = new TestSocket();
@@ -102,16 +102,7 @@ describe("createAcpRemoteStdioBridge", () => {
     });
 
     try {
-      input.write(
-        `${JSON.stringify({
-          id: 1,
-          jsonrpc: "2.0",
-          method: "initialize",
-          params: {},
-        })}\n`,
-      );
-      await waitFor(() => sockets[0]?.sent.length === 1);
-
+      await waitFor(() => sockets.length === 1);
       sockets[0]?.emitClose();
       input.write(
         `${JSON.stringify({
@@ -130,25 +121,183 @@ describe("createAcpRemoteStdioBridge", () => {
         })}\n`,
       );
 
-      await waitFor(() => outputText.includes("reconnect queue is full"));
+      await waitFor(() => sockets.length === 2);
+      await waitFor(() => sockets[1]!.sent.length === 2);
+      expect(outputText).not.toContain("reconnect queue is full");
+      expect(
+        sockets[1]!.sent.map((message) => JSON.parse(message).id),
+      ).toEqual([2, 3]);
+    } finally {
+      bridge.close();
+    }
+  });
 
-      const response = JSON.parse(outputText.trim()) as {
-        error?: { code?: unknown; message?: unknown };
-        id?: unknown;
-      };
-      expect(response).toMatchObject({
-        error: {
-          code: -32002,
-          message: "ACP relay is temporarily unavailable: reconnect queue is full.",
-        },
-        id: 3,
+  it("replays replayable in-flight requests after relay reconnect", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let outputText = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      outputText += chunk;
+    });
+    const sockets: TestSocket[] = [];
+    const bridge = createAcpRemoteStdioBridge({
+      clientId: "client-1",
+      connectionId: "connection-1",
+      input,
+      output,
+      reconnect: {
+        maxDelayMs: 1,
+        minDelayMs: 1,
+      },
+      relayUrl: "ws://relay.test",
+      socketFactory() {
+        const socket = new TestSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    try {
+      input.write(
+        `${JSON.stringify({
+          id: 4,
+          jsonrpc: "2.0",
+          method: "session/load",
+          params: { sessionId: "session-1" },
+        })}\n`,
+      );
+      await waitFor(() => sockets[0]?.sent.length === 1);
+      sockets[0]?.emitClose();
+
+      await waitFor(() => sockets.length === 2);
+      await waitFor(() => sockets[1]!.sent.length === 1);
+      expect(JSON.parse(sockets[1]!.sent[0])).toMatchObject({
+        id: 4,
+        method: "session/load",
+      });
+
+      sockets[1]?.emitMessage(
+        JSON.stringify({
+          id: 4,
+          jsonrpc: "2.0",
+          result: { sessionId: "session-1" },
+        }),
+      );
+
+      await waitFor(() => outputText.includes('"id":4'));
+      expect(JSON.parse(outputText.trim().split("\n")[0]!)).toMatchObject({
+        id: 4,
+        result: { sessionId: "session-1" },
       });
     } finally {
       bridge.close();
     }
   });
 
-	  it("acknowledges relay responses after writing them to stdio", async () => {
+  it("replays session/prompt after relay reconnect", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const sockets: TestSocket[] = [];
+    const bridge = createAcpRemoteStdioBridge({
+      clientId: "client-1",
+      connectionId: "connection-1",
+      input,
+      output,
+      reconnect: {
+        maxDelayMs: 1,
+        minDelayMs: 1,
+      },
+      relayUrl: "ws://relay.test",
+      socketFactory() {
+        const socket = new TestSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    try {
+      input.write(
+        `${JSON.stringify({
+          id: 5,
+          jsonrpc: "2.0",
+          method: "session/prompt",
+          params: {
+            prompt: [{ content: "hi", type: "text" }],
+            sessionId: "session-1",
+          },
+        })}\n`,
+      );
+      await waitFor(() => sockets[0]?.sent.length === 1);
+      sockets[0]?.emitClose();
+
+      await waitFor(() => sockets.length === 2);
+      await waitFor(() => sockets[1]!.sent.length === 1);
+      expect(JSON.parse(sockets[1]!.sent[0])).toMatchObject({
+        id: 5,
+        method: "session/prompt",
+      });
+    } finally {
+      bridge.close();
+    }
+  });
+
+  it("fails non-replayable in-flight requests when relay disconnects", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let outputText = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      outputText += chunk;
+    });
+    const sockets: TestSocket[] = [];
+    const bridge = createAcpRemoteStdioBridge({
+      clientId: "client-1",
+      connectionId: "connection-1",
+      input,
+      output,
+      reconnect: {
+        maxDelayMs: 1,
+        minDelayMs: 1,
+      },
+      relayUrl: "ws://relay.test",
+      socketFactory() {
+        const socket = new TestSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    try {
+      input.write(
+        `${JSON.stringify({
+          id: 6,
+          jsonrpc: "2.0",
+          method: "session/cancel",
+          params: {
+            sessionId: "session-1",
+          },
+        })}\n`,
+      );
+      await waitFor(() => sockets[0]?.sent.length === 1);
+      sockets[0]?.emitClose();
+
+      await waitFor(() => outputText.includes('"id":6'));
+      expect(JSON.parse(outputText.trim().split("\n")[0]!)).toMatchObject({
+        error: {
+          code: -32001,
+        },
+        id: 6,
+        jsonrpc: "2.0",
+      });
+      await waitFor(() => sockets.length === 2);
+      expect(sockets[1]!.sent).toHaveLength(0);
+    } finally {
+      bridge.close();
+    }
+  });
+
+  it("acknowledges relay responses after writing them to stdio", async () => {
     const input = new PassThrough();
     const output = new PassThrough();
     let outputText = "";
@@ -210,6 +359,137 @@ describe("createAcpRemoteStdioBridge", () => {
       );
       await new Promise((resolve) => setTimeout(resolve, 5));
       expect(outputText.trim().split("\n")).toHaveLength(1);
+    } finally {
+      bridge.close();
+    }
+  });
+
+  it("injects stable remote display config locally and intercepts its updates", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let outputText = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      outputText += chunk;
+    });
+    const sockets: TestSocket[] = [];
+    const bridge = createAcpRemoteStdioBridge({
+      clientId: "client-1",
+      connectionId: "connection-1",
+      input,
+      output,
+      relayUrl: "ws://relay.test",
+      socketFactory() {
+        const socket = new TestSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    try {
+      input.write(
+        `${JSON.stringify({
+          id: 10,
+          jsonrpc: "2.0",
+          method: "session/new",
+          params: { cwd: "/tmp/project", mcpServers: [] },
+        })}\n`,
+      );
+      await waitFor(() => sockets[0]?.sent.length === 1);
+
+      sockets[0]?.emitMessage(
+        JSON.stringify({
+          id: 10,
+          jsonrpc: "2.0",
+          result: {
+            _meta: {
+              "acp-runtime/remote/daemonId": "host-a",
+              "acp-runtime/remote/sessionAgent": { id: "claude-acp" },
+              "acp-runtime/remote/sessionMachine": "dev.local",
+              "acp-runtime/remote/sessionWorkspaceRoots": ["/Users/dev/07"],
+            },
+            configOptions: [
+              {
+                currentValue: "real",
+                id: "real-option",
+                name: "Real Option",
+                type: "string",
+              },
+            ],
+            sessionId: "session-1",
+          },
+        }),
+      );
+
+      await waitFor(() => outputText.includes('"id":10'));
+      const firstResponse = JSON.parse(outputText.trim().split("\n")[0]!) as {
+        result: {
+          configOptions: {
+            currentValue?: string;
+            id: string;
+            options?: { name: string; value: string }[];
+          }[];
+        };
+      };
+      expect(firstResponse.result.configOptions).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "real-option" }),
+          expect.objectContaining({
+            currentValue: "dev.local",
+            id: "acp-runtime.remote.context",
+            options: [
+              { name: "dev.local", value: "dev.local" },
+              { name: "claude-acp", value: "claude-acp" },
+              { name: "/Users/dev/07", value: "/Users/dev/07" },
+              { name: "session-1", value: "session-1" },
+            ],
+          }),
+        ]),
+      );
+
+      input.write(
+        `${JSON.stringify({
+          id: 11,
+          jsonrpc: "2.0",
+          method: "session/set_config_option",
+          params: {
+            configId: "acp-runtime.remote.context",
+            sessionId: "session-1",
+            value: "changed",
+          },
+        })}\n`,
+      );
+
+      await waitFor(() => outputText.includes('"id":11'));
+      expect(
+        sockets[0]!.sent.some((message) => {
+          try {
+            return JSON.parse(message).method === "session/set_config_option";
+          } catch {
+            return false;
+          }
+        }),
+      ).toBe(false);
+      const secondResponse = JSON.parse(outputText.trim().split("\n")[1]!) as {
+        result: {
+          configOptions: {
+            currentValue?: string;
+            id: string;
+            options?: { name: string; value: string }[];
+          }[];
+        };
+      };
+      expect(secondResponse.result.configOptions).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            currentValue: "dev.local",
+            id: "acp-runtime.remote.context",
+            options: expect.arrayContaining([
+              { name: "session-1", value: "session-1" },
+            ]),
+          }),
+        ]),
+      );
     } finally {
       bridge.close();
     }

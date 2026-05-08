@@ -196,6 +196,41 @@ describe("stdio stream bridges", () => {
     expect(new TextDecoder().decode(chunks[0])).toBe("ping");
     expect(writable.writableEnded).toBe(true);
   });
+
+  it("reports writes after the node writable has ended as closed ACP connections", async () => {
+    const writable = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    const stream = nodeWritableToWeb(writable, { preferNative: false });
+    const writer = stream.getWriter();
+
+    await new Promise<void>((resolve) => writable.end(resolve));
+
+    await expect(
+      writer.write(new TextEncoder().encode("late")),
+    ).rejects.toThrow("ACP connection closed");
+  });
+
+  it("suppresses closed writable error events while rejecting the pending write", async () => {
+    const closedError = Object.assign(new Error("write after end"), {
+      code: "ERR_STREAM_WRITE_AFTER_END",
+    });
+    let writable!: Writable;
+    writable = new Writable({
+      write(_chunk, _encoding, callback) {
+        writable.emit("error", closedError);
+        callback(closedError);
+      },
+    });
+    const stream = nodeWritableToWeb(writable, { preferNative: false });
+    const writer = stream.getWriter();
+
+    await expect(
+      writer.write(new TextEncoder().encode("late")),
+    ).rejects.toThrow("ACP connection closed");
+  });
 });
 
 describe("stdio process exit diagnostics", () => {

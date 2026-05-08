@@ -24,8 +24,11 @@ export const ACP_RELAY_LOG_UPLOAD_FLUSH_INTERVAL_MS_ENV_VAR =
   "ACP_RELAY_LOG_UPLOAD_FLUSH_INTERVAL_MS" as const;
 
 const DEFAULT_MAX_BATCH_SIZE = 50;
+const DEFAULT_MAX_PAYLOAD_BYTES = 512 * 1024;
+const DEFAULT_MAX_RECORD_BYTES = 64 * 1024;
 const DEFAULT_FLUSH_INTERVAL_MS = 1_000;
 const MAX_SAFE_JSON_DEPTH = 8;
+const MAX_SAFE_STRING_LENGTH = 16 * 1024;
 
 export type AcpRelayLogUploadRecordKind =
   | "otel_log"
@@ -247,6 +250,7 @@ class RelayLogUploader implements AcpRelayLogUploader {
   private readonly endpointUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly flushIntervalMs: number;
+  private readonly maxPayloadBytes = DEFAULT_MAX_PAYLOAD_BYTES;
   private readonly onError: (error: unknown) => void;
   private readonly source: string;
   private accepting = true;
@@ -348,12 +352,23 @@ class RelayLogUploader implements AcpRelayLogUploader {
       try {
         await this.post(records);
       } catch (error) {
+        this.queue.unshift(...records);
         this.onError(error);
+        if (this.accepting) {
+          this.scheduleFlush();
+        }
+        return;
       }
     }
   }
 
   private async post(records: readonly AcpRelayLogUploadRecord[]): Promise<void> {
+    if (records.length > 1 && this.payloadByteLength(records) > this.maxPayloadBytes) {
+      const midpoint = Math.ceil(records.length / 2);
+      await this.post(records.slice(0, midpoint));
+      await this.post(records.slice(midpoint));
+      return;
+    }
     const payload: AcpRelayLogUploadPayload = {
       context: this.context ? toJsonSafe(this.context) as Record<string, unknown> : undefined,
       records,
@@ -373,6 +388,22 @@ class RelayLogUploader implements AcpRelayLogUploader {
         `ACP relay log upload failed: ${response.status} ${response.statusText}`,
       );
     }
+  }
+
+  private payloadByteLength(
+    records: readonly AcpRelayLogUploadRecord[],
+  ): number {
+    return Buffer.byteLength(
+      JSON.stringify({
+        context: this.context
+          ? toJsonSafe(this.context) as Record<string, unknown>
+          : undefined,
+        records,
+        source: this.source,
+        version: 1,
+      } satisfies AcpRelayLogUploadPayload),
+      "utf8",
+    );
   }
 }
 
@@ -429,7 +460,7 @@ function sanitizeRecord(
   record: AcpRelayLogUploadRecord,
 ): AcpRelayLogUploadRecord {
   const traceFields = extractTraceFields(record.spanContext);
-  return {
+  const sanitized = {
     ...record,
     attributes: record.attributes
       ? toJsonSafe(record.attributes) as Record<string, unknown>
@@ -440,6 +471,36 @@ function sanitizeRecord(
     spanId: record.spanId ?? traceFields.spanId,
     traceId: record.traceId ?? traceFields.traceId,
   };
+  if (recordByteLength(sanitized) <= DEFAULT_MAX_RECORD_BYTES) {
+    return sanitized;
+  }
+  return {
+    attributes: sanitized.attributes,
+    body: truncateJsonValue(sanitized.body, DEFAULT_MAX_RECORD_BYTES / 2),
+    eventName: sanitized.eventName,
+    kind: sanitized.kind,
+    observedAt: sanitized.observedAt,
+    record: "[Truncated]",
+    severityNumber: sanitized.severityNumber,
+    severityText: sanitized.severityText,
+    spanId: sanitized.spanId,
+    traceId: sanitized.traceId,
+  };
+}
+
+function recordByteLength(record: AcpRelayLogUploadRecord): number {
+  return Buffer.byteLength(JSON.stringify(record), "utf8");
+}
+
+function truncateJsonValue(value: unknown, maxLength: number): unknown {
+  if (typeof value === "string") {
+    return truncateString(value, maxLength);
+  }
+  const serialized = JSON.stringify(value);
+  if (serialized.length <= maxLength) {
+    return value;
+  }
+  return `${serialized.slice(0, Math.max(0, maxLength - 15))}[Truncated]`;
 }
 
 function extractTraceFields(value: unknown): {
@@ -492,11 +553,13 @@ function toJsonSafe(value: unknown, depth = 0): unknown {
   }
   if (
     value === null ||
-    typeof value === "string" ||
     typeof value === "number" ||
     typeof value === "boolean"
   ) {
     return value;
+  }
+  if (typeof value === "string") {
+    return truncateString(value, MAX_SAFE_STRING_LENGTH);
   }
   if (typeof value === "bigint") {
     return value.toString();
@@ -525,4 +588,11 @@ function toJsonSafe(value: unknown, depth = 0): unknown {
     return output;
   }
   return String(value);
+}
+
+function truncateString(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, Math.max(0, maxLength - 15))}[Truncated]`;
 }

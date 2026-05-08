@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
-import { readFile, writeFile, mkdir } from "fs/promises";
+import { mkdir, readFile, rm, writeFile } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -11,15 +11,18 @@ export type DaemonSession = {
 };
 
 const SESSION_FILE_NAME = "relay-session.json";
-const SESSION_DIR = () => join(homedir(), ".acp");
-const SESSION_PATH = () => join(SESSION_DIR(), SESSION_FILE_NAME);
+const SESSION_DIR = (homeDir = homedir()) => join(homeDir, ".acp-runtime");
+const SESSION_PATH = (homeDir = homedir()) => join(SESSION_DIR(homeDir), SESSION_FILE_NAME);
 
-export function getSessionPath(): string {
-  return SESSION_PATH();
+export function getSessionPath(homeDir?: string): string {
+  return SESSION_PATH(homeDir);
 }
 
-export async function loadCachedSession(): Promise<DaemonSession | undefined> {
-  const path = SESSION_PATH();
+export async function loadCachedSession(homeDir?: string): Promise<DaemonSession | undefined> {
+  return readSessionFile(SESSION_PATH(homeDir));
+}
+
+async function readSessionFile(path: string): Promise<DaemonSession | undefined> {
   if (!existsSync(path)) {
     return undefined;
   }
@@ -35,12 +38,58 @@ export async function loadCachedSession(): Promise<DaemonSession | undefined> {
   }
 }
 
-export async function saveSession(session: DaemonSession): Promise<void> {
-  const dir = SESSION_DIR();
+export async function saveSession(session: DaemonSession, homeDir?: string): Promise<void> {
+  const dir = SESSION_DIR(homeDir);
   if (!existsSync(dir)) {
     await mkdir(dir, { recursive: true });
   }
-  await writeFile(SESSION_PATH(), JSON.stringify(session, null, 2), "utf-8");
+  await writeFile(SESSION_PATH(homeDir), JSON.stringify(session, null, 2), "utf-8");
+}
+
+export async function clearCachedSession(homeDir?: string): Promise<void> {
+  await rm(SESSION_PATH(homeDir), { force: true });
+}
+
+export type SessionValidationResult =
+  | { accountId: string; ok: true }
+  | { ok: false; reason: string; retryable?: boolean; status?: number };
+
+export async function validateRelaySession(input: {
+  relayUrl: string;
+  session: DaemonSession;
+}): Promise<SessionValidationResult> {
+  try {
+    const url = new URL(
+      "/api/session",
+      input.relayUrl.replace(/^ws(s?):\/\//, "http$1://"),
+    );
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${input.session.token}`,
+      },
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => undefined) as { error?: unknown } | undefined;
+      return {
+        ok: false,
+        reason: typeof body?.error === "string"
+          ? body.error
+          : `Relay rejected cached session with HTTP ${response.status}.`,
+        status: response.status,
+      };
+    }
+    const body = await response.json().catch(() => undefined) as { accountId?: unknown } | undefined;
+    const accountId = typeof body?.accountId === "string"
+      ? body.accountId
+      : input.session.accountId;
+    return { accountId, ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `Could not validate cached relay session: ${error instanceof Error ? error.message : String(error)}`,
+      retryable: true,
+    };
+  }
 }
 
 export async function loginViaOAuth(relayUrl: string): Promise<DaemonSession> {

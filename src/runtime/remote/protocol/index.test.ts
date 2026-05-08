@@ -10,6 +10,7 @@ import {
   assertAcpRemoteFrame,
   createAcpRemoteDeviceKeyPair,
   createAcpRemoteDeviceRenewalSignature,
+  createAcpRemoteConnectionTicket,
   createAcpRemoteSignedConnectionTicket,
   hasAcpRemoteScope,
   isAcpRemoteFrame,
@@ -76,6 +77,23 @@ describe("remote ACP protocol", () => {
     expect(() => requireAcpRemoteScopes(ticket, ["fs:write"])).toThrow(
       "missing scopes",
     );
+  });
+
+  it("creates one-hour connection tickets by default", () => {
+    const ticket = createAcpRemoteConnectionTicket({
+      connectionId: "conn-default-ttl",
+      grant: {
+        accountId: "acct-1",
+        clientId: "client-1",
+        daemonId: "host-1",
+        policyVersion: 1,
+        scopes: ["acp:connect"],
+      },
+      jti: "ticket-default-ttl",
+      now: new Date("2026-04-27T00:00:00.000Z"),
+    });
+
+    expect(ticket.expiresAt).toBe("2026-04-27T01:00:00.000Z");
   });
 
   it("signs and verifies connection tickets", async () => {

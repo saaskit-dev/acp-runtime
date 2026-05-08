@@ -108,30 +108,14 @@ describe("AcpRemoteRuntimeAgent", () => {
         command: "fake-agent",
         type: "fake",
       },
+      "acp-runtime/remote/sessionMachine": "dev-mac",
       "acp-runtime/remote/sessionWorkspaceRoots": ["/workspace"],
     });
-    expect(created.configOptions).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          category: "remote",
-          currentValue: "dev-mac",
-          id: "acp-runtime.remote.machine",
-          name: "Remote Machine",
-        }),
-        expect.objectContaining({
-          category: "remote",
-          currentValue: "fake",
-          id: "acp-runtime.remote.agent",
-          name: "Remote Agent",
-        }),
-        expect.objectContaining({
-          category: "remote",
-          currentValue: "/workspace",
-          id: "acp-runtime.remote.workspace",
-          name: "Remote Workspace",
-        }),
-      ]),
-    );
+    expect(
+      created.configOptions?.some((option) =>
+        option.id.startsWith("acp-runtime.remote."),
+      ) ?? false,
+    ).toBe(false);
 
     const response = await clientConnection.prompt({
       prompt: [{ text: "hello", type: "text" }],
@@ -647,22 +631,6 @@ describe("AcpRemoteRuntimeAgent", () => {
       value: true,
     });
     expect(configSet).toEqual({ id: "auto_approve", value: true });
-
-    configSet = undefined;
-    const remoteConfig = await clientConnection.setSessionConfigOption({
-      configId: "acp-runtime.remote.workspace",
-      sessionId: created.sessionId,
-      value: "/workspace",
-    });
-    expect(configSet).toBeUndefined();
-    expect(remoteConfig.configOptions).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          currentValue: "/workspace",
-          id: "acp-runtime.remote.workspace",
-        }),
-      ]),
-    );
   });
 
   it("forwards permission prompts to the remote client", async () => {

@@ -42,13 +42,10 @@ import {
   AcpRemoteRuntimeAgent,
   type AcpRemoteRuntimeAgentOptions,
 } from "./runtime-agent.js";
-import { AcpRemoteProxyAgent } from "./proxy-agent.js";
 import type { AcpRuntimeAgentInput } from "../../core/types.js";
-import type { AcpConnectionFactory } from "../../acp/connection-types.js";
 
 export type AcpRemoteDaemonConnectionOptions =
   Omit<AcpRemoteRuntimeAgentOptions, "runtime"> & {
-    connectionFactory?: AcpConnectionFactory;
     daemonId: string;
     debugLog?: (
       message: string,
@@ -57,8 +54,10 @@ export type AcpRemoteDaemonConnectionOptions =
     maxBufferedFramesPerConnection?: number;
     now?: () => Date;
     requiredPolicyVersion?: number;
-    runtime?: AcpRemoteRuntimeAgentOptions["runtime"];
+    requestJournal?: AcpRemoteDaemonRequestJournal;
+    runtime: AcpRemoteRuntimeAgentOptions["runtime"];
     socket: AcpWebSocketLike;
+    state?: AcpRemoteDaemonConnectionState;
     ticketVerificationKeys?: readonly [
       AcpRemoteTicketVerificationKey,
       ...AcpRemoteTicketVerificationKey[],
@@ -81,12 +80,54 @@ export type AcpRemoteDaemonConnectionHandle = {
   close(): void;
 };
 
+export type AcpRemoteDaemonRequestJournalEntry = {
+  connectionId: string;
+  id: string | number;
+  method?: string;
+  payload?: AnyMessage;
+  status: "completed" | "received";
+};
+
+export type AcpRemoteDaemonRequestJournal = {
+  lookup(
+    connectionId: string,
+    id: string | number,
+  ): Promise<AcpRemoteDaemonRequestJournalEntry | undefined>;
+  markCompleted(entry: {
+    connectionId: string;
+    id: string | number;
+    method?: string;
+    payload: AnyMessage;
+  }): Promise<void>;
+  markReceived(entry: {
+    connectionId: string;
+    id: string | number;
+    method?: string;
+  }): Promise<void>;
+};
+
 type ActiveRelayAcpConnection = {
   channel: RelayAcpChannel;
   connection: AgentSideConnection;
   lastInboundSeq?: number;
   outboundQueue: AcpRemoteDataFrame[];
   pendingOutboundFrames: Map<number, AcpRemoteDataFrame>;
+};
+
+export type AcpRemoteDaemonConnectionState = {
+  active: Map<string, ActiveRelayAcpConnection>;
+  daemonRequestContexts: Map<
+    string,
+    Map<string | number, AcpDaemonRequestDebugContext>
+  >;
+  outboundSeq: Map<string, number>;
+  relayRequestContexts: Map<
+    string,
+    Map<string | number, AcpDaemonRequestDebugContext>
+  >;
+  socket?: AcpWebSocketLike;
+  ticketChecks: Map<string, Promise<boolean>>;
+  tickets: Map<string, AcpRemoteConnectionTicket>;
 };
 
 type AcpDaemonRequestDebugContext = {
@@ -97,21 +138,30 @@ type AcpDaemonRequestDebugContext = {
 
 const DEFAULT_MAX_BUFFERED_FRAMES_PER_CONNECTION = 64;
 
+export function createAcpRemoteDaemonConnectionState(): AcpRemoteDaemonConnectionState {
+  return {
+    active: new Map(),
+    daemonRequestContexts: new Map(),
+    outboundSeq: new Map(),
+    relayRequestContexts: new Map(),
+    ticketChecks: new Map(),
+    tickets: new Map(),
+  };
+}
+
 export function createAcpRemoteDaemonConnection(
   options: AcpRemoteDaemonConnectionOptions,
 ): AcpRemoteDaemonConnectionHandle {
-  const active = new Map<string, ActiveRelayAcpConnection>();
-  const daemonRequestContexts = new Map<
-    string,
-    Map<string | number, AcpDaemonRequestDebugContext>
-  >();
-  const outboundSeq = new Map<string, number>();
-  const relayRequestContexts = new Map<
-    string,
-    Map<string | number, AcpDaemonRequestDebugContext>
-  >();
-  const tickets = new Map<string, AcpRemoteConnectionTicket>();
-  const ticketChecks = new Map<string, Promise<boolean>>();
+  const state = options.state ?? createAcpRemoteDaemonConnectionState();
+  state.socket = options.socket;
+  const {
+    active,
+    daemonRequestContexts,
+    outboundSeq,
+    relayRequestContexts,
+    ticketChecks,
+    tickets,
+  } = state;
   const ticketVerificationKeys = new Map<
     string,
     AcpRemoteTicketVerificationKey
@@ -124,6 +174,11 @@ export function createAcpRemoteDaemonConnection(
     options.maxBufferedFramesPerConnection ??
     DEFAULT_MAX_BUFFERED_FRAMES_PER_CONNECTION;
   const debugLog = options.debugLog ?? (() => {});
+  let disposed = false;
+
+  const sendSocket = (data: string) => {
+    state.socket?.send(data);
+  };
 
   const onMessage = (event: { data: unknown }) => {
     void handleMessage(event);
@@ -146,7 +201,7 @@ export function createAcpRemoteDaemonConnection(
         frameType: AcpRemoteFrameType.Pong,
         nonce: frame.nonce,
       };
-      options.socket.send(JSON.stringify(pong));
+      sendSocket(JSON.stringify(pong));
       return;
     }
 
@@ -230,6 +285,18 @@ export function createAcpRemoteDaemonConnection(
     if (!ticket || !authorizeAcpPayload(frame.connectionId, ticket, frame.payload)) {
       return;
     }
+    const request = readJournalableJsonRpcRequest(frame.payload);
+    if (request && options.requestJournal) {
+      const duplicate = await resolveDaemonRequestDuplicate(
+        frame.connectionId,
+        request,
+      );
+      if (duplicate) {
+        sendAcpPayloadDirect(frame.connectionId, duplicate);
+        sendRelayAck(frame.connectionId, frame.seq);
+        return;
+      }
+    }
 
     if (!entry) {
       const agent = resolveTicketAgent(ticket.agent);
@@ -241,20 +308,10 @@ export function createAcpRemoteDaemonConnection(
         workspaceRoots: ticket.workspaceRoots ?? options.workspaceRoots,
       };
       const channel = new RelayAcpChannel(frame.connectionId, sendAcpPayload);
-      let proxyAgent: AcpRemoteProxyAgent | undefined;
       const connection = new AgentSideConnection(
         (agentConnection) => {
-          if (options.connectionFactory) {
-            proxyAgent = new AcpRemoteProxyAgent(agentConnection, {
-              ...runtimeOptions,
-              connectionFactory: options.connectionFactory,
-            });
-            return proxyAgent;
-          }
           if (!options.runtime) {
-            throw new Error(
-              "ACP remote daemon requires connectionFactory for proxy mode or runtime for facade mode.",
-            );
+            throw new Error("ACP remote daemon requires a runtime.");
           }
           return new AcpRemoteRuntimeAgent(agentConnection, {
             ...runtimeOptions,
@@ -263,11 +320,6 @@ export function createAcpRemoteDaemonConnection(
         },
         channel.stream,
       );
-      if (proxyAgent) {
-        void connection.closed.finally(() => {
-          void proxyAgent?.close();
-        });
-      }
       entry = {
         channel,
         connection,
@@ -277,14 +329,54 @@ export function createAcpRemoteDaemonConnection(
       };
       active.set(frame.connectionId, entry);
       void connection.closed.finally(() => {
-        active.delete(frame.connectionId);
-        channel.close();
+        if (active.get(frame.connectionId) !== entry) {
+          return;
+        }
+        closeRemoteConnection(
+          frame.connectionId,
+          "acp_connection_closed",
+          "ACP connection closed.",
+        );
+      }).catch(() => {
+        // The relay has been notified by the finalizer above.
       });
     }
 
-    sendRelayAck(frame.connectionId, frame.seq);
+    if (request && options.requestJournal) {
+      try {
+        await options.requestJournal.markReceived({
+          connectionId: frame.connectionId,
+          id: request.id,
+          method: request.method,
+        });
+      } catch (error) {
+        sendAcpPayloadDirect(frame.connectionId, {
+          error: {
+            code: -32002,
+            message:
+              "Remote daemon could not persist request receipt before handing it to the runtime.",
+          },
+          id: request.id,
+          jsonrpc: "2.0",
+        });
+        closeRemoteConnection(
+          frame.connectionId,
+          "request_journal_failed",
+          error instanceof Error ? error.message : "Request journal failed.",
+        );
+        return;
+      }
+    }
+    if (!entry.channel.enqueue(frame.payload as AnyMessage)) {
+      closeRemoteConnection(
+        frame.connectionId,
+        "acp_connection_closed",
+        "ACP connection closed before receiving relay frame.",
+      );
+      return;
+    }
     entry.lastInboundSeq = frame.seq;
-    entry.channel.enqueue(frame.payload as AnyMessage);
+    sendRelayAck(frame.connectionId, frame.seq);
   };
 
   const validateTicketFrame = async (
@@ -333,6 +425,7 @@ export function createAcpRemoteDaemonConnection(
         },
       );
       tickets.set(frame.connectionId, ticket);
+      replayAcpOutboundFrames(frame.connectionId);
       return true;
     } catch (error) {
       closeRemoteConnection(
@@ -358,7 +451,7 @@ export function createAcpRemoteDaemonConnection(
     relayRequestContexts.delete(connectionId);
     tickets.delete(connectionId);
     outboundSeq.delete(connectionId);
-    options.socket.send(
+    sendSocket(
       JSON.stringify({
         code,
         connectionId,
@@ -385,7 +478,7 @@ export function createAcpRemoteDaemonConnection(
   };
 
   const sendRelayAck = (connectionId: string, ack: number) => {
-    options.socket.send(
+    sendSocket(
       JSON.stringify({
         ack,
         channelId: "acp",
@@ -407,7 +500,7 @@ export function createAcpRemoteDaemonConnection(
       root: request.root,
       workspaceRoots: options.workspaceRoots,
     });
-    options.socket.send(
+    sendSocket(
       JSON.stringify({
         channelId: "workspace",
         channelKind: AcpRemoteChannelKind.Filesystem,
@@ -469,6 +562,7 @@ export function createAcpRemoteDaemonConnection(
     if (!entry) {
       return;
     }
+    rememberDaemonRequestResponse(connectionId, payload);
     logDaemonAcpPayload(connectionId, payload);
     const seq = (outboundSeq.get(connectionId) ?? 0) + 1;
     outboundSeq.set(connectionId, seq);
@@ -480,11 +574,88 @@ export function createAcpRemoteDaemonConnection(
       payload,
       seq,
     };
-    if (entry.pendingOutboundFrames.size >= maxBufferedFramesPerConnection) {
+    if (
+      !state.socket ||
+      entry.pendingOutboundFrames.size >= maxBufferedFramesPerConnection
+    ) {
       entry.outboundQueue.push(frame);
       return;
     }
     sendQueuedAcpFrame(entry, frame);
+  };
+
+  const sendAcpPayloadDirect = (connectionId: string, payload: AnyMessage) => {
+    rememberDaemonRequestResponse(connectionId, payload);
+    logDaemonAcpPayload(connectionId, payload);
+    const seq = (outboundSeq.get(connectionId) ?? 0) + 1;
+    outboundSeq.set(connectionId, seq);
+    sendSocket(
+      JSON.stringify({
+        channelId: "acp",
+        channelKind: AcpRemoteChannelKind.Acp,
+        connectionId,
+        frameType: AcpRemoteFrameType.Data,
+        payload,
+        seq,
+      } satisfies AcpRemoteDataFrame),
+    );
+  };
+
+  const rememberDaemonRequestResponse = (
+    connectionId: string,
+    payload: AnyMessage,
+  ) => {
+    if (!options.requestJournal || !isJsonRpcResponseWithId(payload)) {
+      return;
+    }
+    const context = relayRequestContexts.get(connectionId)?.get(payload.id);
+    void options.requestJournal
+      .markCompleted({
+        connectionId,
+        id: payload.id,
+        method: context?.method,
+        payload,
+      })
+      .catch((error) => {
+        debugLog(
+          `Failed to persist remote daemon request response: ${error instanceof Error ? error.message : error}`,
+          {
+            connectionId,
+            jsonRpcId: payload.id,
+            method: context?.method,
+            severityText: "ERROR",
+          },
+        );
+      });
+  };
+
+  const resolveDaemonRequestDuplicate = async (
+    connectionId: string,
+    request: { id: string | number; method: string },
+  ): Promise<AnyMessage | undefined> => {
+    if (!options.requestJournal) {
+      return undefined;
+    }
+    const entry = await options.requestJournal.lookup(connectionId, request.id);
+    if (!entry) {
+      return undefined;
+    }
+    if (entry.status === "completed" && entry.payload) {
+      return entry.payload;
+    }
+    return {
+      error: {
+        code: -32003,
+        data: {
+          method: entry.method ?? request.method,
+          status: entry.status,
+        },
+        message:
+          "Remote daemon already delivered this request to the runtime before restart; the result is unknown and the request was not replayed.",
+      },
+      id: request.id,
+      jsonrpc: "2.0",
+    };
   };
 
   const sendQueuedAcpFrame = (
@@ -492,7 +663,20 @@ export function createAcpRemoteDaemonConnection(
     frame: AcpRemoteDataFrame,
   ) => {
     entry.pendingOutboundFrames.set(frame.seq, frame);
-    options.socket.send(JSON.stringify(frame));
+    sendSocket(JSON.stringify(frame));
+  };
+
+  const replayAcpOutboundFrames = (connectionId: string) => {
+    const entry = active.get(connectionId);
+    if (!entry || !state.socket) {
+      return;
+    }
+    for (const frame of [...entry.pendingOutboundFrames.values()].sort(
+      (left, right) => left.seq - right.seq,
+    )) {
+      sendSocket(JSON.stringify(frame));
+    }
+    flushAcpOutboundQueue(connectionId, entry);
   };
 
   const flushAcpOutboundQueue = (
@@ -513,6 +697,12 @@ export function createAcpRemoteDaemonConnection(
   };
 
   const onClose = () => {
+    if (state.socket === options.socket) {
+      state.socket = undefined;
+    }
+  };
+
+  const disposeState = () => {
     for (const entry of active.values()) {
       entry.channel.close();
     }
@@ -602,10 +792,17 @@ export function createAcpRemoteDaemonConnection(
 
   return {
     close() {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
       options.socket.removeEventListener?.("message", onMessage);
       options.socket.removeEventListener?.("close", onClose);
       options.socket.removeEventListener?.("error", onClose);
-      onClose();
+      if (state.socket === options.socket) {
+        state.socket = undefined;
+      }
+      disposeState();
       options.socket.close(1000, "ACP remote daemon connection closed.");
     },
   };
@@ -811,6 +1008,39 @@ async function safeRealpath(path: string): Promise<string> {
   }
 }
 
+function isJsonRpcResponseWithId(
+  payload: AnyMessage,
+): payload is AnyMessage & { id: string | number } {
+  if (typeof payload !== "object" || payload === null) {
+    return false;
+  }
+  const candidate = payload as {
+    id?: unknown;
+    jsonrpc?: unknown;
+    method?: unknown;
+  };
+  return (
+    candidate.jsonrpc === "2.0" &&
+    candidate.method === undefined &&
+    (typeof candidate.id === "string" || typeof candidate.id === "number")
+  );
+}
+
+function readJournalableJsonRpcRequest(
+  payload: unknown,
+): { id: string | number; method: string } | undefined {
+  if (!isJsonRpcRequest(payload)) {
+    return undefined;
+  }
+  if (typeof payload.id !== "string" && typeof payload.id !== "number") {
+    return undefined;
+  }
+  return {
+    id: payload.id,
+    method: payload.method,
+  };
+}
+
 class RelayAcpChannel {
   private closed = false;
   private controller: ReadableStreamDefaultController<AnyMessage> | undefined;
@@ -843,11 +1073,12 @@ class RelayAcpChannel {
     };
   }
 
-  enqueue(message: AnyMessage): void {
+  enqueue(message: AnyMessage): boolean {
     if (this.closed) {
-      return;
+      return false;
     }
     this.controller?.enqueue(message);
+    return true;
   }
 
   close(): void {

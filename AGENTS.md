@@ -113,6 +113,18 @@ For real agent checks:
 - Override with `ACP_RUNTIME_HOME_DIR`, `ACP_RUNTIME_CACHE_DIR`, or demo `--log-file` flags.
 - Use logs to inspect raw ACP JSON-RPC before changing compatibility behavior.
 
+## Remote Relay Durability
+
+- Treat relay in-memory state as a cache only. Any intermediate state required to continue after WebSocket reconnect, Cloudflare Durable Object hibernation, or relay process restart must be persisted in Durable Object storage.
+- Persist route/session continuity state such as client-to-daemon bindings, authorization/ticket/bootstrap state, frame sequence counters, last inbound sequence, unacknowledged frames, queued frames, session restore request metadata, and disconnect grace timestamps.
+- Persist successful per-session control state such as `session/set_mode` and `session/set_config_option`. Daemon reconnect replay must restore those controls before replaying pending or queued prompts.
+- Treat daemon ACK as transport receipt only, not business completion. Once a daemon-bound JSON-RPC request has been ACKed, do not replay it after daemon restart; if the daemon runtime instance changes before the JSON-RPC response, fail the client request with an explicit unknown/retryable error instead of hanging or duplicating the turn.
+- Use WebSocket attachments only for small socket routing metadata needed to restore hibernated sockets. Do not rely on attachments as the full source of truth for frame replay or ACK state.
+- Reconnection logic must be able to rebuild live sockets, event listeners, timers, and waiters from durable state. Do not persist runtime-only handles such as WebSocket objects, timer handles, event listeners, or pending Promise waiters.
+- If losing a relay state value can cause a hang, dropped token/output, duplicate execution, failed resume, or missing ACK/replay, make that state durable and cover it with reconnect or hibernation tests.
+- Default reconnect grace should cover normal laptop sleep and Cloudflare WebSocket churn; do not shorten client or daemon route grace without an explicit product/security reason and reconnect tests.
+- Connection ticket TTL and renewal windows must be relay-configurable. Ticket expiry must trigger renewal for bound routes instead of forcing clients through a fresh authorization when the grant is still valid.
+
 ## Process And Signal Handling
 
 - Stdio agent processes must be disposed on every failure path after spawn.

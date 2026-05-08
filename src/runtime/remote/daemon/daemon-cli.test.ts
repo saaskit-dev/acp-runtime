@@ -80,6 +80,25 @@ describe("remote daemon CLI connector", () => {
     });
   });
 
+  it("ignores service install options that are not relay connection config", () => {
+    expect(
+      parseAcpRemoteDaemonCliConfig({
+        argv: [
+          "--system",
+          "--user",
+          "dev",
+          "--home-dir",
+          "/Users/dev",
+          "--workspace-root",
+          "/Users/dev",
+        ],
+        env: {},
+      }),
+    ).toMatchObject({
+      relayUrl: "wss://relay.saaskit.app",
+    });
+  });
+
   it("defaults relay URL to the hosted relay", () => {
     expect(
       parseAcpRemoteDaemonCliConfig({

@@ -15,9 +15,39 @@ npm install -g @saaskit-dev/acp-runtime
 
 安装后会有一个命令和 remote 子命令：
 
+- `acp-runtime auth`：浏览器登录和本地 account session 缓存管理。
 - `acp-runtime daemon`：本机 daemon，负责运行 agent。
 - `acp-runtime bridge`：通用 stdio ACP bridge，给不能直连 relay WebSocket 的 client
   使用。
+
+npm 包安装本身不会自动注册后台 daemon。首次注册 service 是显式步骤，因为它会创建
+一个长期运行的本地进程，可能打开浏览器登录，也可能需要 launchd 或 sudo 权限。
+
+## 登录
+
+```bash
+acp-runtime auth login
+```
+
+这个命令会打开浏览器登录，把 account session 保存到
+`~/.acp/relay-session.json`。如果这是一次新的登录，并且机器上还没有 daemon service，
+它也会安装默认的 macOS user daemon service。如果本地已经有有效登录缓存，它只提示
+已经登录。只有想单纯缓存登录、不注册后台服务时才使用 `--no-daemon`。可以用下面的
+命令查看或清理登录状态：
+
+```bash
+acp-runtime auth status
+acp-runtime auth logout
+```
+
+如果本地登录缓存已经失效，或缓存属于另一个 relay 部署，可以强制重新登录。在 macOS
+user mode 下，这也会重装默认 user daemon service，确保 launchd plist 和 service 进程
+对应刷新后的登录和当前 CLI 配置。如果机器已经是 system mode，同一个命令会自动走
+system reinstall 路径，macOS 会提示输入 sudo 密码：
+
+```bash
+acp-runtime auth login --force
+```
 
 ## 安装 Daemon
 
@@ -25,14 +55,12 @@ npm install -g @saaskit-dev/acp-runtime
 acp-runtime daemon install
 ```
 
-第一次运行时，如果没有登录缓存，会打开浏览器登录。登录后，relay 会按需自动创建
-account、daemon host record、default grant 和 client device record。
-
-如果本地登录缓存已经失效，或缓存属于另一个 relay 部署，可以强制重新登录：
-
-```bash
-acp-runtime daemon install --force-login
-```
+为了兼容旧流程，如果没有登录缓存，daemon install 仍然会打开浏览器登录。正常新登录
+流程里，如果没有 service，`auth login` 会安装默认 user daemon，所以 `daemon install`
+主要用于修改 service 参数、切换 service mode 或修复安装。登录后，relay 会按需自动
+创建 account、daemon host record、default grant 和 client device record。安装或更新
+daemon 前，如果需要刷新过期或不匹配的缓存 session 并重装默认 user daemon，使用
+`acp-runtime auth login --force`。
 
 默认情况下 daemon 连接 `wss://relay.saaskit.app`，并把用户 home 目录作为 workspace
 root。只有需要覆盖默认值时才使用 `--relay-url` 或 `--workspace-root`。
@@ -41,6 +69,27 @@ root。只有需要覆盖默认值时才使用 `--relay-url` 或 `--workspace-ro
 启动，正常退出和异常退出后都会由 launchd 拉起；网络或 relay 短暂断开后，daemon
 自身也会用退避策略自动重连。`acp-runtime daemon stop` 会 unload LaunchAgent，所以会
 保持停止，直到再次执行 `start` 或 `install`。
+
+如果 daemon 必须在系统启动时、用户登录前就拉起，可以安装可选的 system
+LaunchDaemon：
+
+```bash
+acp-runtime auth login
+acp-runtime daemon install --system
+```
+
+system install 会写入
+`/Library/LaunchDaemons/dev.saaskit.acp-runtime.daemon.plist`，默认让 daemon 以
+`SUDO_USER` 身份运行，这样它可以读取该用户的 `~/.acp/relay-session.json` 登录缓存，
+并把日志写到该用户 home 下。只有需要覆盖自动检测结果时才使用 `--user` 或
+`--home-dir`。service 安装后，`status`、`start`、`stop` 和 `uninstall` 会自动判断当前
+安装模式。只有需要强制 system mode，或处理异常冲突时才需要 `--system`。会修改
+system service 的命令会自动通过 `sudo` 重新执行，所以需要权限时 macOS 会提示输入
+密码。
+
+一台机器应该只安装一种 service 模式。安装 `--system` 会移除目标用户的 LaunchAgent。
+安装 user mode 时，如果 system LaunchDaemon 仍然存在，会拒绝继续，因为移除它需要
+sudo。
 
 常用 daemon 命令：
 
@@ -53,6 +102,36 @@ acp-runtime daemon run
 ```
 
 `run` 用于前台调试；普通后台服务使用 `install`。
+
+## 升级 Daemon
+
+如果 daemon service 已经安装，运行中的 daemon 会监控自己的可执行文件路径；当该文件
+被 npm 全局升级替换后，daemon 会退出。由于 launchd 配了 `KeepAlive`，它会自动用升级
+后的代码重新拉起：
+
+```bash
+npm install -g @saaskit-dev/acp-runtime@latest
+acp-runtime daemon status
+```
+
+只有首次安装、切换 user/system 模式、修改 workspace root 或 relay 参数，或者全局
+npm 命令路径本身变化、需要重写 plist 时，才需要重新执行：
+
+```bash
+acp-runtime daemon install
+```
+
+如果使用开机级 system service，则使用：
+
+```bash
+npm install -g @saaskit-dev/acp-runtime@latest
+acp-runtime daemon install --system
+acp-runtime daemon status
+```
+
+`install` 会重写 plist 并 kickstart launchd，所以新的 daemon 进程会使用刚安装的全局
+包路径。`daemon start` 只加载已有 plist；升级后如果 service 配置或命令路径变化，应
+使用 `install`。
 
 ## 配置 Stdio Client
 
@@ -89,7 +168,7 @@ daemon route。若 client 离线太久导致 connection 已过期，或 grant �
 ## 正常流程
 
 1. 安装 npm 包。
-2. 安装 daemon 并登录。
+2. 登录；新登录时，如果没有 service，这个步骤会在 macOS 上安装默认 user daemon。
 3. 配置 ACP client 或 stdio bridge。
 4. 从 client 开启 session。
 5. relay 打开授权 UI，用户选择 machine、agent 和 workspace。

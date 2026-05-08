@@ -84,13 +84,21 @@ export function parseAcpRemoteDaemonCliConfig(input: {
   };
 }
 
-const EXTRA_ARG_KEYS = new Set(["--agent-command", "--workspace-root"]);
+const EXTRA_ARG_KEYS = new Set([
+  "--agent-command",
+  "--home-dir",
+  "--system",
+  "--user",
+  "--workspace-root",
+]);
 
 function parseNamedArgs(argv: readonly string[]): Partial<AcpRemoteDaemonCliConfig> {
   const values: Partial<AcpRemoteDaemonCliConfig> = {};
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     switch (arg) {
+      case "--system":
+        break;
       case "--account-id":
         values.accountId = readArgValue(argv, index, arg);
         index += 1;
