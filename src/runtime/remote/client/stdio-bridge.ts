@@ -940,12 +940,13 @@ function createRemoteDisplayConfigOption(
     readStringArray(meta[REMOTE_SESSION_WORKSPACE_ROOTS_META])?.[0] ??
     "No workspace preference";
   const entries = [
-    { name: machine, value: machine },
-    { name: agent, value: agent },
-    { name: workspace, value: workspace },
+    { description: machine, name: machine, value: machine },
+    { description: agent, name: agent, value: agent },
+    { description: workspace, name: workspace, value: workspace },
     ...(sessionId
       ? [
           {
+            description: sessionId,
             name: sessionId,
             value: sessionId,
           },

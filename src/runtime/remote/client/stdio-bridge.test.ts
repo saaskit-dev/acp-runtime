@@ -427,7 +427,7 @@ describe("createAcpRemoteStdioBridge", () => {
           configOptions: {
             currentValue?: string;
             id: string;
-            options?: { name: string; value: string }[];
+            options?: { description?: string; name: string; value: string }[];
           }[];
         };
       };
@@ -438,10 +438,26 @@ describe("createAcpRemoteStdioBridge", () => {
             currentValue: "dev.local",
             id: "acp-runtime.remote.context",
             options: [
-              { name: "dev.local", value: "dev.local" },
-              { name: "claude-acp", value: "claude-acp" },
-              { name: "/Users/dev/07", value: "/Users/dev/07" },
-              { name: "session-1", value: "session-1" },
+              {
+                description: "dev.local",
+                name: "dev.local",
+                value: "dev.local",
+              },
+              {
+                description: "claude-acp",
+                name: "claude-acp",
+                value: "claude-acp",
+              },
+              {
+                description: "/Users/dev/07",
+                name: "/Users/dev/07",
+                value: "/Users/dev/07",
+              },
+              {
+                description: "session-1",
+                name: "session-1",
+                value: "session-1",
+              },
             ],
           }),
         ]),
@@ -475,7 +491,7 @@ describe("createAcpRemoteStdioBridge", () => {
           configOptions: {
             currentValue?: string;
             id: string;
-            options?: { name: string; value: string }[];
+            options?: { description?: string; name: string; value: string }[];
           }[];
         };
       };
@@ -485,7 +501,11 @@ describe("createAcpRemoteStdioBridge", () => {
             currentValue: "dev.local",
             id: "acp-runtime.remote.context",
             options: expect.arrayContaining([
-              { name: "session-1", value: "session-1" },
+              {
+                description: "session-1",
+                name: "session-1",
+                value: "session-1",
+              },
             ]),
           }),
         ]),

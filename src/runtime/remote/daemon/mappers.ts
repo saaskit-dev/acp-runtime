@@ -588,6 +588,7 @@ function mapRuntimeConfigChoicesToAcp(option: AcpRuntimeAgentConfigOption) {
   if (!option.options?.length) {
     return [
       {
+        description: String(option.value),
         name: String(option.value),
         value: String(option.value),
       },
@@ -595,7 +596,7 @@ function mapRuntimeConfigChoicesToAcp(option: AcpRuntimeAgentConfigOption) {
   }
 
   return option.options.map((choice) => ({
-    description: choice.description,
+    description: choice.description ?? String(choice.value),
     name: choice.name,
     value: String(choice.value),
   }));
