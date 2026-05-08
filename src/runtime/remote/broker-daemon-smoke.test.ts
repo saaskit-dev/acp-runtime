@@ -928,7 +928,22 @@ describe("ACP remote relay broker smoke", () => {
     daemon.close();
   });
 
-  it("does not duplicate runtime prompts when stdio bridge reconnects mid-prompt", async () => {
+  it.each([
+    {
+      closeClientInput: false,
+      closeRelaySocket: true,
+      expectReconnect: true,
+      name: "transient bridge relay disconnect",
+    },
+    {
+      closeClientInput: true,
+      closeRelaySocket: false,
+      expectReconnect: false,
+      name: "ACP client process closes stdin",
+    },
+  ])(
+    "handles stdio bridge prompt chaos: $name",
+    async ({ closeClientInput, closeRelaySocket, expectReconnect }) => {
     const root = await mkdtemp(join(tmpdir(), "acp-remote-bridge-replay-"));
     const projectDir = join(root, "project");
     await mkdir(projectDir, { recursive: true });
@@ -1078,17 +1093,45 @@ describe("ACP remote relay broker smoke", () => {
       prompt: [{ text: "hold until reconnect", type: "text" }],
       sessionId: session.sessionId,
     });
+    void prompt.catch(() => {});
     await waitFor(() => promptStarts === 1);
-    bridgeSockets[0]?.close(1006, "test bridge disconnect mid-prompt");
-    await waitFor(() => bridgeSockets.length === 2);
+    if (closeRelaySocket) {
+      bridgeSockets[0]?.close(1006, "test bridge disconnect mid-prompt");
+    }
+    if (closeClientInput) {
+      input.end();
+    }
+    if (expectReconnect) {
+      await waitFor(() => bridgeSockets.length === 2);
+    }
     await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(bridgeSockets.length).toBe(expectReconnect ? 2 : 1);
     expect(promptStarts).toBe(1);
 
     promptCompletion.resolve();
-    await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+    if (expectReconnect) {
+      await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+    } else {
+      expect(broker.clientConnectionIds()).not.toContain(
+        "conn-stdio-bridge-replay",
+      );
+      await expect(
+        Promise.race([
+          prompt.then(
+            () => "resolved",
+            () => "rejected",
+          ),
+          new Promise<"pending">((resolve) =>
+            setTimeout(() => resolve("pending"), 20),
+          ),
+        ]),
+      ).resolves.toBe("pending");
+    }
     expect(promptStarts).toBe(1);
 
-    await clientConnection.closeSession({ sessionId: session.sessionId });
+    if (expectReconnect) {
+      await clientConnection.closeSession({ sessionId: session.sessionId });
+    }
     bridge.close();
     daemon.close();
   });
@@ -1205,6 +1248,13 @@ function bindBrokerClientSocket(
 ): void {
   socket.addEventListener("message", (event) => {
     void broker.handleClientText(connectionId, String(event.data));
+  });
+  socket.addEventListener("close", (event) => {
+    broker.removeClient(connectionId, socket, {
+      final:
+        event?.code === 1000 &&
+        event.reason === "ACP client connection closed.",
+    });
   });
 }
 

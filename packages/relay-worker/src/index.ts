@@ -549,6 +549,7 @@ export class AcpRelayShard {
       attachment.connectionId,
       attachment.daemonId,
       socket,
+      { code, reason },
     );
     if (attachment.endpoint === AcpRemoteEndpointKind.Client) {
       await this.writeOrDeleteClientStateSnapshot(attachment.connectionId);
@@ -579,6 +580,7 @@ export class AcpRelayShard {
       attachment.connectionId,
       attachment.daemonId,
       socket,
+      { final: false },
     );
     if (attachment.endpoint === AcpRemoteEndpointKind.Client) {
       await this.writeOrDeleteClientStateSnapshot(attachment.connectionId);
@@ -972,6 +974,7 @@ export class AcpRelayShard {
     connectionId: string,
     daemonId: string | undefined,
     socket: WebSocket,
+    close?: { code?: number; final?: boolean; reason?: string },
   ): void {
     if (endpoint === AcpRemoteEndpointKind.Daemon) {
       if (daemonId) {
@@ -980,7 +983,12 @@ export class AcpRelayShard {
       return;
     }
 
-    this.broker.removeClient(connectionId, socket);
+    this.broker.removeClient(connectionId, socket, {
+      final:
+        close?.final ??
+        (close?.code === 1000 &&
+          close.reason === "ACP client connection closed."),
+    });
   }
 
   private async scheduleHeartbeat(): Promise<void> {

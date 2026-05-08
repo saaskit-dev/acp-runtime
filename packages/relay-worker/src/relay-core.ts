@@ -660,13 +660,17 @@ export class AcpRelayBroker {
     }
   }
 
-  removeClient(connectionId: string, socket: RelaySocket): void {
+  removeClient(
+    connectionId: string,
+    socket: RelaySocket,
+    options: { final?: boolean } = {},
+  ): void {
     const client = this.clients.get(connectionId);
     if (!client || client.socket !== socket) {
       return;
     }
 
-    if (this.shouldKeepDisconnectedClient(client)) {
+    if (!options.final && this.shouldKeepDisconnectedClient(client)) {
       client.disconnectedAtMs = this.now().getTime();
       client.socket = undefined;
       this.logRelayLifecycle({

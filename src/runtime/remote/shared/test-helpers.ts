@@ -1,4 +1,7 @@
-export type MemoryWebSocketCloseListener = () => void;
+export type MemoryWebSocketCloseListener = (event?: {
+  code?: number;
+  reason?: string;
+}) => void;
 export type MemoryWebSocketMessageListener = (event: { data: unknown }) => void;
 
 export class MemoryWebSocket {
@@ -77,15 +80,16 @@ export class MemoryWebSocket {
     }
   }
 
-  close(): void {
+  close(code?: number, reason?: string): void {
     if (this.closed) {
       return;
     }
     this.closed = true;
+    const event = { code, reason };
     for (const listener of this.closeListeners) {
-      listener();
+      listener(event);
     }
-    this.peer?.close();
+    this.peer?.close(code, reason);
   }
 
   send(data: string): void {
