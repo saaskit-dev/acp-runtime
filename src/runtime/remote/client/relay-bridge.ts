@@ -13,6 +13,7 @@ import {
   createAcpRelayBridgeStdioConfig,
   createAcpRelayBridgeZedConfig,
   parseAcpRelayBridgeConfigArgs,
+  parseAcpRelayBridgeRunArgs,
 } from "./bridge-config.js";
 import { createAcpRemoteStdioBridge } from "./stdio-bridge.js";
 import type { AcpRemoteBridgeDebugContext } from "./stdio-bridge.js";
@@ -21,7 +22,6 @@ import {
   type AcpRelayLogUploader,
 } from "../relay-log-upload.js";
 
-const ACP_RELAY_URL_ENV = "ACP_RELAY_URL";
 const ACP_DAEMON_ID_ENV = "ACP_DAEMON_ID";
 const ACP_CLIENT_ID_ENV = "ACP_CLIENT_ID";
 const ACP_ACCOUNT_SESSION_ENV = "ACP_ACCOUNT_SESSION";
@@ -142,7 +142,7 @@ async function main(): Promise<void> {
         "ACP Runtime Bridge Config",
         "",
         `Command: ${stdioConfig.command}`,
-        `Relay URL: ${stdioConfig.env.ACP_RELAY_URL}`,
+        `Relay URL: ${options.relayUrl ?? ACP_REMOTE_DEFAULT_RELAY_URL}`,
         "",
         "Generic stdio ACP client:",
         JSON.stringify(stdioConfig, null, 2),
@@ -166,7 +166,10 @@ async function main(): Promise<void> {
     );
   }
 
-  const relayUrl = process.env[ACP_RELAY_URL_ENV] ?? ACP_REMOTE_DEFAULT_RELAY_URL;
+  const { relayUrl } = parseAcpRelayBridgeRunArgs({
+    argv,
+    env: process.env,
+  });
   const clientId = loadOrCreateClientId();
   const daemonId = process.env[ACP_DAEMON_ID_ENV];
   const accountSession =
@@ -228,7 +231,7 @@ function printHelp(): void {
   process.stdout.write(
     [
       "Usage:",
-      "  acp-runtime bridge run",
+      "  acp-runtime bridge run [--relay-url <ws-url>]",
       "  acp-runtime bridge config [--relay-url <ws-url>] [--command <path>] [--zed|--all]",
       "",
       "Runtime environment:",

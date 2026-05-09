@@ -17,15 +17,19 @@ export function createAcpRelayBridgeStdioConfig(
 ): {
   command: string;
   args?: readonly string[];
-  env: Record<string, string>;
+  env?: Record<string, string>;
 } {
-  const args = options.args ?? (options.command ? undefined : ["bridge", "run"]);
+  const baseArgs = options.args ?? (options.command ? undefined : ["bridge", "run"]);
+  const args =
+    baseArgs && options.relayUrl
+      ? [...baseArgs, "--relay-url", options.relayUrl]
+      : baseArgs;
+  const env =
+    !args && options.relayUrl ? { ACP_RELAY_URL: options.relayUrl } : undefined;
   return {
     ...(args ? { args } : {}),
     command: options.command ?? resolveInstalledAcpRuntimeCommand(),
-    env: {
-      ACP_RELAY_URL: options.relayUrl ?? ACP_REMOTE_DEFAULT_RELAY_URL,
-    },
+    ...(env ? { env } : {}),
   };
 }
 
@@ -35,7 +39,7 @@ export function createAcpRelayBridgeZedConfig(
   type: "custom";
   command: string;
   args?: readonly string[];
-  env: Record<string, string>;
+  env?: Record<string, string>;
 } {
   return {
     type: "custom",
@@ -47,7 +51,7 @@ export function parseAcpRelayBridgeConfigArgs(argv: readonly string[]): {
   args?: readonly string[];
   command?: string;
   format: AcpRelayBridgeConfigFormat;
-  relayUrl: string;
+  relayUrl?: string;
 } {
   let args: readonly string[] | undefined;
   let command: string | undefined;
@@ -91,7 +95,31 @@ export function parseAcpRelayBridgeConfigArgs(argv: readonly string[]): {
     args: args ?? (legacyCommand ? undefined : ["bridge", "run"]),
     command,
     format,
-    relayUrl: relayUrl ?? ACP_REMOTE_DEFAULT_RELAY_URL,
+    relayUrl,
+  };
+}
+
+export function parseAcpRelayBridgeRunArgs(input: {
+  argv: readonly string[];
+  env?: Record<string, string | undefined>;
+}): {
+  relayUrl: string;
+} {
+  const env = input.env ?? process.env;
+  let relayUrl: string | undefined;
+  for (let index = 0; index < input.argv.length; index += 1) {
+    const arg = input.argv[index];
+    switch (arg) {
+      case "--relay-url":
+        relayUrl = readArgValue(input.argv, index, arg);
+        index += 1;
+        break;
+      default:
+        throw new Error(`Unknown bridge run option: ${arg}`);
+    }
+  }
+  return {
+    relayUrl: relayUrl ?? env.ACP_RELAY_URL ?? ACP_REMOTE_DEFAULT_RELAY_URL,
   };
 }
 

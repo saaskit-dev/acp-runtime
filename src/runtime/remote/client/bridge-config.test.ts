@@ -4,6 +4,7 @@ import {
   createAcpRelayBridgeStdioConfig,
   createAcpRelayBridgeZedConfig,
   parseAcpRelayBridgeConfigArgs,
+  parseAcpRelayBridgeRunArgs,
 } from "./bridge-config.js";
 
 describe("ACP relay bridge config", () => {
@@ -15,26 +16,21 @@ describe("ACP relay bridge config", () => {
         relayUrl: "wss://relay.example.com",
       }),
     ).toEqual({
-      args: ["bridge", "run"],
+      args: ["bridge", "run", "--relay-url", "wss://relay.example.com"],
       command: "/usr/local/bin/acp-runtime",
-      env: {
-        ACP_RELAY_URL: "wss://relay.example.com",
-      },
     });
   });
 
-  it("defaults generic stdio client config to the hosted relay", () => {
-    expect(createAcpRelayBridgeStdioConfig({})).toMatchObject({
+  it("omits relay configuration when using the built-in hosted relay default", () => {
+    expect(createAcpRelayBridgeStdioConfig({})).toEqual({
       args: ["bridge", "run"],
-      env: {
-        ACP_RELAY_URL: "wss://relay.saaskit.app",
-      },
+      command: expect.any(String),
     });
     expect(parseAcpRelayBridgeConfigArgs([])).toEqual({
       args: ["bridge", "run"],
       command: undefined,
       format: "generic",
-      relayUrl: "wss://relay.saaskit.app",
+      relayUrl: undefined,
     });
   });
 
@@ -63,11 +59,8 @@ describe("ACP relay bridge config", () => {
       }),
     ).toEqual({
       type: "custom",
-      args: ["bridge", "run"],
+      args: ["bridge", "run", "--relay-url", "wss://relay.example.com"],
       command: "/opt/bin/acp-runtime",
-      env: {
-        ACP_RELAY_URL: "wss://relay.example.com",
-      },
     });
   });
 
@@ -81,6 +74,38 @@ describe("ACP relay bridge config", () => {
       args: undefined,
       command: "/opt/bin/acp-runtime-bridge",
       format: "generic",
+      relayUrl: undefined,
+    });
+  });
+
+  it("keeps relay url in env when legacy command configs cannot pass args", () => {
+    expect(
+      createAcpRelayBridgeStdioConfig({
+        command: "/opt/bin/acp-runtime-bridge",
+        relayUrl: "wss://relay.example.com",
+      }),
+    ).toEqual({
+      command: "/opt/bin/acp-runtime-bridge",
+      env: {
+        ACP_RELAY_URL: "wss://relay.example.com",
+      },
+    });
+  });
+
+  it("parses bridge run relay url from args, env, or the built-in default", () => {
+    expect(
+      parseAcpRelayBridgeRunArgs({
+        argv: ["--relay-url", "wss://relay.arg.example.com"],
+        env: { ACP_RELAY_URL: "wss://relay.env.example.com" },
+      }),
+    ).toEqual({ relayUrl: "wss://relay.arg.example.com" });
+    expect(
+      parseAcpRelayBridgeRunArgs({
+        argv: [],
+        env: { ACP_RELAY_URL: "wss://relay.env.example.com" },
+      }),
+    ).toEqual({ relayUrl: "wss://relay.env.example.com" });
+    expect(parseAcpRelayBridgeRunArgs({ argv: [], env: {} })).toEqual({
       relayUrl: "wss://relay.saaskit.app",
     });
   });
@@ -105,6 +130,9 @@ describe("ACP relay bridge config", () => {
 
   it("rejects incomplete config command arguments", () => {
     expect(() => parseAcpRelayBridgeConfigArgs(["--relay-url"])).toThrow(
+      "Missing value for --relay-url.",
+    );
+    expect(() => parseAcpRelayBridgeRunArgs({ argv: ["--relay-url"] })).toThrow(
       "Missing value for --relay-url.",
     );
   });

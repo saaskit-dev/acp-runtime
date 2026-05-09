@@ -87,6 +87,7 @@ export function createAcpRemoteStdioBridge(
     debugLog,
     relayUrl: String(options.relayUrl),
   });
+  const remoteDisplayConfigOptionsBySessionId = new Map<string, unknown>();
   let lastConfigOptions: unknown[] = [];
 
   const connect = () => {
@@ -132,7 +133,27 @@ export function createAcpRemoteStdioBridge(
           inFlightOutbound.delete(responseId);
         }
         sessionBindings.storeFromResponse(message, requestMethods);
-        const clientMessage = injectRemoteDisplayConfigOption(message);
+        const responseSessionId =
+          responseId !== undefined
+            ? requestSessionIds.get(responseId)
+            : undefined;
+        const clientMessage = injectRemoteDisplayConfigOption(
+          message,
+          responseSessionId
+            ? remoteDisplayConfigOptionsBySessionId.get(responseSessionId)
+            : undefined,
+        );
+        const clientSessionId =
+          readResultSessionId(clientMessage) ?? responseSessionId;
+        const remoteDisplayConfigOption = readRemoteConfigOption(
+          readConfigOptions(clientMessage),
+        );
+        if (clientSessionId && remoteDisplayConfigOption) {
+          remoteDisplayConfigOptionsBySessionId.set(
+            clientSessionId,
+            remoteDisplayConfigOption,
+          );
+        }
         lastConfigOptions = readConfigOptions(clientMessage) ?? lastConfigOptions;
         logRelayMessage(
           clientMessage,
@@ -903,15 +924,21 @@ function createRemoteConfigSetResponse(
   });
 }
 
-function injectRemoteDisplayConfigOption(message: string): string {
+function injectRemoteDisplayConfigOption(
+  message: string,
+  fallbackOption?: unknown,
+): string {
   const parsed = parseJson(message);
   const result = isRecord(parsed?.result) ? parsed.result : undefined;
   const meta = isRecord(result?._meta) ? result._meta : undefined;
-  if (!result || !meta) {
+  if (!result) {
     return message;
   }
-  const option = createRemoteDisplayConfigOption(meta, readString(result.sessionId));
-  if (!option) {
+  const option = meta
+    ? createRemoteDisplayConfigOption(meta, readString(result.sessionId))
+    : undefined;
+  const remoteOption = option ?? fallbackOption;
+  if (!remoteOption || !Array.isArray(result.configOptions)) {
     return message;
   }
   return JSON.stringify({
@@ -920,7 +947,7 @@ function injectRemoteDisplayConfigOption(message: string): string {
       ...result,
       configOptions: [
         ...readNonRemoteConfigOptions(result.configOptions),
-        option,
+        remoteOption,
       ],
     },
   });
@@ -981,11 +1008,21 @@ function readNonRemoteConfigOptions(value: unknown): unknown[] {
     : [];
 }
 
+function readRemoteConfigOption(value: unknown): unknown | undefined {
+  return Array.isArray(value) ? value.find(isRemoteConfigOption) : undefined;
+}
+
 function isRemoteConfigOption(value: unknown): boolean {
   return (
     isRecord(value) &&
     readString(value.id)?.startsWith(REMOTE_CONFIG_OPTION_PREFIX) === true
   );
+}
+
+function readResultSessionId(message: string): string | undefined {
+  const parsed = parseJson(message);
+  const result = isRecord(parsed?.result) ? parsed.result : undefined;
+  return readString(result?.sessionId);
 }
 
 function formatSessionAgent(agent: Record<string, unknown> | undefined): string {

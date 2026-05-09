@@ -510,6 +510,72 @@ describe("createAcpRemoteStdioBridge", () => {
           }),
         ]),
       );
+
+      input.write(
+        `${JSON.stringify({
+          id: 12,
+          jsonrpc: "2.0",
+          method: "session/set_config_option",
+          params: {
+            configId: "real-option",
+            sessionId: "session-1",
+            value: "changed-real",
+          },
+        })}\n`,
+      );
+
+      await waitFor(() =>
+        sockets[0]!.sent.some((message) => {
+          try {
+            const parsed = JSON.parse(message);
+            return (
+              parsed.id === 12 && parsed.method === "session/set_config_option"
+            );
+          } catch {
+            return false;
+          }
+        }),
+      );
+
+      sockets[0]?.emitMessage(
+        JSON.stringify({
+          id: 12,
+          jsonrpc: "2.0",
+          result: {
+            configOptions: [
+              {
+                currentValue: "changed-real",
+                id: "real-option",
+                name: "Real Option",
+                type: "string",
+              },
+            ],
+          },
+        }),
+      );
+
+      await waitFor(() => outputText.includes('"id":12'));
+      const thirdResponse = JSON.parse(outputText.trim().split("\n")[2]!) as {
+        result: {
+          configOptions: {
+            currentValue?: string;
+            id: string;
+            options?: { description?: string; name: string; value: string }[];
+          }[];
+        };
+      };
+      expect(thirdResponse.result.configOptions).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            currentValue: "changed-real",
+            id: "real-option",
+          }),
+          expect.objectContaining({
+            currentValue: "dev.local",
+            id: "acp-runtime.remote.context",
+          }),
+        ]),
+      );
     } finally {
       bridge.close();
     }
