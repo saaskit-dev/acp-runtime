@@ -753,6 +753,7 @@ describe("ACP remote daemon relay connection", () => {
     }>((resolve) => {
       resolvePrompt = resolve;
     });
+    let closeCalls = 0;
     const ticket = await createAcpRemoteSignedConnectionTicket({
       connectionId: "conn-in-flight",
       grant: {
@@ -790,7 +791,12 @@ describe("ACP remote daemon relay connection", () => {
             throw new Error("Unexpected remote resume.");
           },
           async start() {
-            return createFakeRuntimeSession({ promptCompletion });
+            return createFakeRuntimeSession({
+              onClose() {
+                closeCalls += 1;
+              },
+              promptCompletion,
+            });
           },
         },
       },
@@ -858,6 +864,7 @@ describe("ACP remote daemon relay connection", () => {
       }),
     );
     await waitFor(() => state.active.size === 1);
+    await waitFor(() => closeCalls === 1);
     expect(countAcpRemoteDaemonInFlightRuntimeRequests(state)).toBe(1);
 
     resolvePrompt?.({
@@ -1287,6 +1294,7 @@ function createUnusedRuntime(): Parameters<
 
 function createFakeRuntimeSession(
   options: {
+    onClose?: () => void | Promise<void>;
     promptCompletion?: Promise<{
       output: { text: string; type: "text" }[];
       outputText: string;
@@ -1308,7 +1316,9 @@ function createFakeRuntimeSession(
       },
       client: {},
     },
-    close: async () => {},
+    close: async () => {
+      await options.onClose?.();
+    },
     diagnostics: {},
     initialConfigReport: undefined,
     metadata: {

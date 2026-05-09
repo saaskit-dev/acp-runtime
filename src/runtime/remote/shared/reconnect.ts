@@ -47,11 +47,8 @@ export async function runAcpRemoteReconnectLoop<TConnection>(
   const backoff = createAcpRemoteReconnectBackoff(options);
 
   while (!options.isStopping()) {
-    let connected = false;
-    let connection: TConnection | undefined;
     try {
-      connection = await options.connect();
-      connected = true;
+      const connection = await options.connect();
       backoff.reset();
       options.onConnected?.(connection);
       await options.waitForDisconnect(connection);
@@ -71,11 +68,6 @@ export async function runAcpRemoteReconnectLoop<TConnection>(
     const delayMs = backoff.nextDelayMs();
     options.onRetry?.(delayMs);
     await delay(delayMs);
-
-    if (connected && connection === undefined) {
-      // Keeps the loop shape explicit for callers with side-effect-only connections.
-      continue;
-    }
   }
 }
 

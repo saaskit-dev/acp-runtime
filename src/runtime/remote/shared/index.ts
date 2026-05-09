@@ -32,6 +32,16 @@ export {
 } from "./frame-handler.js";
 
 export {
+  pathContains,
+  safeRealpath,
+  isRecord,
+  isStringRecord,
+  readStringArray,
+  readString,
+  formatError,
+} from "./fs-utils.js";
+
+export {
   MemoryWebSocket,
   createMemoryWebSocketPair,
   waitFor,

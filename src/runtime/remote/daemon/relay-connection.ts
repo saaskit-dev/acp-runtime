@@ -3,8 +3,8 @@ import {
   type AnyMessage,
   type Stream,
 } from "@agentclientprotocol/sdk";
-import { readdir, realpath } from "node:fs/promises";
-import { basename, isAbsolute, relative, resolve } from "node:path";
+import { readdir } from "node:fs/promises";
+import { basename, resolve } from "node:path";
 
 import {
   AcpRemoteEndpointKind,
@@ -34,6 +34,12 @@ import {
   requiredScopeForAcpPayload,
   isJsonRpcRequest,
 } from "../shared/frame-handler.js";
+import {
+  pathContains,
+  safeRealpath,
+  isRecord,
+  readString,
+} from "../shared/fs-utils.js";
 import {
   readAcpRemoteTraceContextFromJsonRpcMessage,
   type AcpRemoteTraceContext,
@@ -107,6 +113,7 @@ export type AcpRemoteDaemonRequestJournal = {
 };
 
 type ActiveRelayAcpConnection = {
+  agent: AcpRemoteRuntimeAgent;
   channel: RelayAcpChannel;
   closeAfterInFlight?: boolean;
   connection: AgentSideConnection;
@@ -231,8 +238,8 @@ export function createAcpRemoteDaemonConnection(
       return;
     }
 
-    if (frame.frameType === AcpRemoteFrameType.Hello) {
-      if (frame.endpoint !== AcpRemoteEndpointKind.Client) {
+    if (frame.frameType === AcpRemoteFrameType.Hello || frame.frameType === AcpRemoteFrameType.Renew) {
+      if (frame.frameType === AcpRemoteFrameType.Hello && frame.endpoint !== AcpRemoteEndpointKind.Client) {
         return;
       }
       const check = validateTicketFrame(frame);
@@ -243,17 +250,11 @@ export function createAcpRemoteDaemonConnection(
       return;
     }
 
-    if (frame.frameType === AcpRemoteFrameType.Renew) {
-      const check = validateTicketFrame(frame);
-      ticketChecks.set(frame.connectionId, check);
-      void check.finally(() => {
-        ticketChecks.delete(frame.connectionId);
-      });
-      return;
-    }
-
     if (frame.frameType === AcpRemoteFrameType.Close) {
       const entry = active.get(frame.connectionId);
+      if (entry && isFinalClientCloseFrame(frame)) {
+        await entry.agent.closeActiveSessions(frame.reason);
+      }
       if (hasInFlightRuntimeRequests(frame.connectionId)) {
         if (entry) {
           entry.closeAfterInFlight = true;
@@ -331,19 +332,25 @@ export function createAcpRemoteDaemonConnection(
         workspaceRoots: ticket.workspaceRoots ?? options.workspaceRoots,
       };
       const channel = new RelayAcpChannel(frame.connectionId, sendAcpPayload);
+      let runtimeAgent: AcpRemoteRuntimeAgent | undefined;
       const connection = new AgentSideConnection(
         (agentConnection) => {
           if (!options.runtime) {
             throw new Error("ACP remote daemon requires a runtime.");
           }
-          return new AcpRemoteRuntimeAgent(agentConnection, {
+          runtimeAgent = new AcpRemoteRuntimeAgent(agentConnection, {
             ...runtimeOptions,
             runtime: options.runtime,
           });
+          return runtimeAgent;
         },
         channel.stream,
       );
+      if (!runtimeAgent) {
+        throw new Error("ACP remote daemon failed to create runtime agent.");
+      }
       entry = {
+        agent: runtimeAgent,
         channel,
         closeAfterInFlight: false,
         connection,
@@ -712,6 +719,12 @@ export function createAcpRemoteDaemonConnection(
     active.delete(connectionId);
   };
 
+  const isFinalClientCloseFrame = (
+    frame: Extract<AcpRemoteFrame, { frameType: typeof AcpRemoteFrameType.Close }>,
+  ): boolean =>
+    frame.code === "client_closed" ||
+    frame.code === "client_reconnect_timeout";
+
   const resolveDaemonRequestDuplicate = async (
     connectionId: string,
     request: { id: string | number; method: string },
@@ -798,33 +811,40 @@ export function createAcpRemoteDaemonConnection(
     ticketChecks.clear();
   };
 
-  function logRelayAcpPayload(connectionId: string, payload: unknown): void {
+  function logAcpPayload(
+    direction: "relay_to_daemon" | "daemon_to_relay",
+    sourceMap: Map<string, Map<string | number, AcpDaemonRequestDebugContext>>,
+    targetMap: Map<string, Map<string | number, AcpDaemonRequestDebugContext>>,
+    connectionId: string,
+    payload: unknown,
+  ): void {
     const details = readAcpPayloadDebugDetails(payload);
     const responseContext =
       details.id !== undefined && details.isResponse
-        ? daemonRequestContexts.get(connectionId)?.get(details.id)
+        ? sourceMap.get(connectionId)?.get(details.id)
         : undefined;
     const method = details.method ?? responseContext?.method;
     const sessionId = details.sessionId ?? responseContext?.sessionId;
     const traceContext = details.traceContext ?? responseContext?.traceContext;
     if (details.id !== undefined && details.isResponse) {
-      daemonRequestContexts.get(connectionId)?.delete(details.id);
+      sourceMap.get(connectionId)?.delete(details.id);
     } else if (details.id !== undefined && details.method) {
-      requestContextMap(relayRequestContexts, connectionId).set(details.id, {
+      requestContextMap(targetMap, connectionId).set(details.id, {
         method: details.method,
         sessionId: details.sessionId,
         traceContext: details.traceContext,
       });
     }
+    const label = direction === "relay_to_daemon" ? "relay -> daemon" : "daemon -> relay";
     debugLog(
-      `relay -> daemon id=${formatJsonRpcId(details.id)} method=${
+      `${label} id=${formatJsonRpcId(details.id)} method=${
         method ?? "-"
       } error=${details.hasError ? "yes" : "no"}${
         sessionId ? ` sessionId=${sessionId}` : ""
       }${traceContext ? ` traceId=${traceContext.traceId}` : ""}`,
       compactDaemonDebugContext({
         connectionId,
-        direction: "relay_to_daemon",
+        direction,
         jsonRpcId: details.id,
         method,
         sessionId,
@@ -834,40 +854,12 @@ export function createAcpRemoteDaemonConnection(
     );
   }
 
+  function logRelayAcpPayload(connectionId: string, payload: unknown): void {
+    logAcpPayload("relay_to_daemon", daemonRequestContexts, relayRequestContexts, connectionId, payload);
+  }
+
   function logDaemonAcpPayload(connectionId: string, payload: unknown): void {
-    const details = readAcpPayloadDebugDetails(payload);
-    const responseContext =
-      details.id !== undefined && details.isResponse
-        ? relayRequestContexts.get(connectionId)?.get(details.id)
-        : undefined;
-    const method = details.method ?? responseContext?.method;
-    const sessionId = details.sessionId ?? responseContext?.sessionId;
-    const traceContext = details.traceContext ?? responseContext?.traceContext;
-    if (details.id !== undefined && details.isResponse) {
-      relayRequestContexts.get(connectionId)?.delete(details.id);
-    } else if (details.id !== undefined && details.method) {
-      requestContextMap(daemonRequestContexts, connectionId).set(details.id, {
-        method: details.method,
-        sessionId: details.sessionId,
-        traceContext: details.traceContext,
-      });
-    }
-    debugLog(
-      `daemon -> relay id=${formatJsonRpcId(details.id)} method=${
-        method ?? "-"
-      } error=${details.hasError ? "yes" : "no"}${
-        sessionId ? ` sessionId=${sessionId}` : ""
-      }${traceContext ? ` traceId=${traceContext.traceId}` : ""}`,
-      compactDaemonDebugContext({
-        connectionId,
-        direction: "daemon_to_relay",
-        jsonRpcId: details.id,
-        method,
-        sessionId,
-        ...traceContextToDebugFields(traceContext),
-        severityText: details.hasError ? "ERROR" : "INFO",
-      }),
-    );
+    logAcpPayload("daemon_to_relay", relayRequestContexts, daemonRequestContexts, connectionId, payload);
   }
 
   options.socket.addEventListener("message", onMessage);
@@ -972,14 +964,6 @@ function isJsonRpcId(id: unknown): id is string | number {
   return typeof id === "string" || typeof id === "number";
 }
 
-function readString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function resolveTicketAgent(
   agent: AcpRemoteConnectionTicket["agent"],
 ): AcpRuntimeAgentInput | undefined {
@@ -1073,22 +1057,6 @@ async function listWorkspaceDirectory(input: {
         ? error.message
         : `Unable to list workspace directory ${basename(requestedPath)}.`,
     };
-  }
-}
-
-function pathContains(root: string, candidate: string): boolean {
-  const relativePath = relative(root, candidate);
-  return (
-    relativePath === "" ||
-    (!relativePath.startsWith("..") && !isAbsolute(relativePath))
-  );
-}
-
-async function safeRealpath(path: string): Promise<string> {
-  try {
-    return await realpath(path);
-  } catch {
-    return path;
   }
 }
 

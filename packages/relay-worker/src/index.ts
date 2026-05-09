@@ -422,7 +422,7 @@ export class AcpRelayShard {
       const agentType = url.searchParams.get("agentType");
       const accountId =
         clientTransport === "remote-frame"
-          ? (resolveVerifiedAccountId(request) ?? resolveAccountId(request, url))
+          ? (resolveVerifiedAccountId(request) ?? resolveAccountId(request, url, "default")!)
           : await resolveAuthenticatedAccountId(request, url, this.env);
       const clientId = resolveClientId(request, url);
       const authUrl = createAuthorizationUrl(request, connectionId).toString();
@@ -1045,11 +1045,11 @@ function resolveClientId(
   );
 }
 
-function resolveAccountId(request: Request, url: URL): string {
+function resolveAccountId(request: Request, url: URL, fallback?: string): string | undefined {
   return (
     url.searchParams.get("accountId") ??
     request.headers.get("x-acp-account-id") ??
-    "default"
+    fallback
   );
 }
 
@@ -1070,18 +1070,14 @@ async function resolveAuthenticatedAccountId(
       return verification.session.accountId;
     }
   }
-  return resolveAccountId(request, url);
+  return resolveAccountId(request, url, "default")!;
 }
 
 function resolveRequestedAccountId(
   request: Request,
   url: URL,
 ): string | undefined {
-  return (
-    url.searchParams.get("accountId") ??
-    request.headers.get("x-acp-account-id") ??
-    undefined
-  );
+  return resolveAccountId(request, url);
 }
 
 function resolveVerifiedAccountId(request: Request): string | undefined {

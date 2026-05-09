@@ -1,5 +1,4 @@
-import { isAbsolute, relative, resolve } from "node:path";
-import { realpath } from "node:fs/promises";
+import { resolve } from "node:path";
 
 import { SeverityNumber } from "@opentelemetry/api-logs";
 import type {
@@ -56,6 +55,14 @@ import {
 } from "./mappers.js";
 import { emitRuntimeLog } from "../../observability/logging.js";
 import { traceContextFromMeta } from "../../observability/tracing.js";
+import {
+  pathContains,
+  safeRealpath,
+  isRecord,
+  isStringRecord,
+  readStringArray,
+  formatError,
+} from "../shared/fs-utils.js";
 
 type RemoteRuntimeSessions = {
   list(
@@ -266,6 +273,28 @@ export class AcpRemoteRuntimeAgent implements Agent {
     this.deleteSessionAliases(active);
     active.terminalHandles.clear();
     return {};
+  }
+
+  async closeActiveSessions(reason = "Remote ACP client disconnected."): Promise<void> {
+    const activeSessions = [...new Set(this.sessions.values())];
+    this.sessions.clear();
+    for (const active of activeSessions) {
+      active.terminalHandles.clear();
+      await active.session.close().catch((error) => {
+        emitRuntimeLog({
+          body: `Remote runtime session close failed after client disconnect: ${formatError(error)}`,
+          eventName: "acp.remote.session.close.failed",
+          exception: error,
+          severityNumber: SeverityNumber.ERROR,
+        });
+      });
+    }
+    if (activeSessions.length > 0) {
+      emitRuntimeLog({
+        body: reason,
+        eventName: "acp.remote.session.close.client_disconnected",
+      });
+    }
   }
 
   async setSessionMode(
@@ -705,22 +734,6 @@ export class AcpRemoteRuntimeAgent implements Agent {
   }
 }
 
-function pathContains(root: string, candidate: string): boolean {
-  const relativePath = relative(root, candidate);
-  return (
-    relativePath === "" ||
-    (!relativePath.startsWith("..") && !isAbsolute(relativePath))
-  );
-}
-
-async function safeRealpath(path: string): Promise<string> {
-  try {
-    return await realpath(path);
-  } catch {
-    return path;
-  }
-}
-
 function readSessionSelection(params: unknown): {
   agent?: AcpRuntimeAgentInput;
   workspaceRoots?: readonly string[];
@@ -760,27 +773,6 @@ function readSessionAgent(value: unknown): AcpRuntimeAgentInput | undefined {
     env: isStringRecord(value.env) ? value.env : undefined,
     type: typeof value.type === "string" ? value.type : undefined,
   };
-}
-
-function readStringArray(value: unknown): readonly string[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const strings = value.filter(
-    (entry): entry is string => typeof entry === "string" && entry.trim() !== "",
-  );
-  return strings.length ? strings : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function isStringRecord(value: unknown): value is Record<string, string> {
-  return (
-    isRecord(value) &&
-    Object.values(value).every((entry) => typeof entry === "string")
-  );
 }
 
 function addRemoteSessionMetadata<T extends object>(
@@ -845,18 +837,6 @@ function serializeSessionAgent(
   return serialized;
 }
 
-function formatError(error: unknown): string {
-  if (!(error instanceof Error)) {
-    return String(error);
-  }
-  const message = error.message;
-  const cause = readErrorCause(error);
-  if (!cause) {
-    return message;
-  }
-  return `${message} Caused by: ${formatError(cause)}`;
-}
-
 function emitRemotePromptFailureLog(input: {
   daemonId?: string;
   error: unknown;
@@ -876,13 +856,6 @@ function emitRemotePromptFailureLog(input: {
     exception: input.error,
     severityNumber: SeverityNumber.ERROR,
   });
-}
-
-function readErrorCause(error: Error): unknown {
-  if ("cause" in error) {
-    return error.cause;
-  }
-  return undefined;
 }
 
 export function createAcpRemoteRuntimeAgent(input: {
