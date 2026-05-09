@@ -15,6 +15,10 @@ import {
   type AcpRemoteTraceContext,
 } from "../shared/trace-context.js";
 import { createAcpRemoteReconnectBackoff } from "../shared/reconnect.js";
+import {
+  summarizeAcpRemotePayloadForLog,
+  type AcpRemotePayloadLogSummary,
+} from "../shared/payload-log-summary.js";
 
 export type AcpRemoteStdioBridgeOptions = Omit<
   ConnectAcpRemoteClientRelayOptions,
@@ -49,7 +53,7 @@ export type AcpRemoteBridgeDebugContext = {
   severityText?: "ERROR" | "INFO";
   traceId?: string;
   traceparent?: string;
-};
+} & AcpRemotePayloadLogSummary;
 
 export type AcpRemoteStdioBridgeHandle = {
   close(): void;
@@ -88,6 +92,7 @@ export function createAcpRemoteStdioBridge(
     relayUrl: String(options.relayUrl),
   });
   const remoteDisplayConfigOptionsBySessionId = new Map<string, unknown>();
+  const configOptionsBySessionId = new Map<string, unknown[]>();
   let lastConfigOptions: unknown[] = [];
 
   const connect = () => {
@@ -133,18 +138,20 @@ export function createAcpRemoteStdioBridge(
           inFlightOutbound.delete(responseId);
         }
         sessionBindings.storeFromResponse(message, requestMethods);
+        const notificationSessionId = readMessageSessionIdFromJson(message);
         const responseSessionId =
           responseId !== undefined
             ? requestSessionIds.get(responseId)
             : undefined;
+        const displaySessionId = responseSessionId ?? notificationSessionId;
         const clientMessage = injectRemoteDisplayConfigOption(
           message,
-          responseSessionId
-            ? remoteDisplayConfigOptionsBySessionId.get(responseSessionId)
+          displaySessionId
+            ? remoteDisplayConfigOptionsBySessionId.get(displaySessionId)
             : undefined,
         );
         const clientSessionId =
-          readResultSessionId(clientMessage) ?? responseSessionId;
+          readResultSessionId(clientMessage) ?? displaySessionId;
         const remoteDisplayConfigOption = readRemoteConfigOption(
           readConfigOptions(clientMessage),
         );
@@ -154,7 +161,13 @@ export function createAcpRemoteStdioBridge(
             remoteDisplayConfigOption,
           );
         }
-        lastConfigOptions = readConfigOptions(clientMessage) ?? lastConfigOptions;
+        const clientConfigOptions = readConfigOptions(clientMessage);
+        if (clientConfigOptions) {
+          lastConfigOptions = clientConfigOptions;
+          if (clientSessionId) {
+            configOptionsBySessionId.set(clientSessionId, clientConfigOptions);
+          }
+        }
         logRelayMessage(
           clientMessage,
           requestMethods,
@@ -407,9 +420,12 @@ export function createAcpRemoteStdioBridge(
           ? addSessionSelectionId(outbound, connectionId)
           : undefined;
         outbound = sessionSelection?.message ?? outbound;
+        const outboundSessionId = readMessageSessionIdFromJson(outbound);
         const remoteConfigResponse = createRemoteConfigSetResponse(
           outbound,
-          lastConfigOptions,
+          outboundSessionId
+            ? configOptionsBySessionId.get(outboundSessionId) ?? lastConfigOptions
+            : lastConfigOptions,
         );
         if (remoteConfigResponse) {
           writeOutput(output, `${remoteConfigResponse}\n`, () => close());
@@ -930,75 +946,64 @@ function injectRemoteDisplayConfigOption(
 ): string {
   const parsed = parseJson(message);
   const result = isRecord(parsed?.result) ? parsed.result : undefined;
-  const meta = isRecord(result?._meta) ? result._meta : undefined;
-  if (!result) {
+  const params = isRecord(parsed?.params) ? parsed.params : undefined;
+  const update = isRecord(params?.update) ? params.update : undefined;
+  if (!result && !update) {
     return message;
   }
+  const meta = isRecord(result?._meta) ? result._meta : undefined;
   const option = meta
-    ? createRemoteDisplayConfigOption(meta, readString(result.sessionId))
+    ? createRemoteDisplayConfigOption(meta, readString(result?.sessionId))
     : undefined;
   const remoteOption = option ?? fallbackOption;
-  if (!remoteOption || !Array.isArray(result.configOptions)) {
+  if (!remoteOption) {
     return message;
   }
-  return JSON.stringify({
-    ...parsed,
-    result: {
-      ...result,
-      configOptions: [
-        ...readNonRemoteConfigOptions(result.configOptions),
-        remoteOption,
-      ],
-    },
-  });
+  if (result && (Array.isArray(result.configOptions) || option)) {
+    return JSON.stringify({
+      ...parsed,
+      result: {
+        ...result,
+        configOptions: [
+          ...readNonRemoteConfigOptions(result.configOptions ?? []),
+          remoteOption,
+        ],
+      },
+    });
+  }
+  if (update && Array.isArray(update.configOptions)) {
+    return JSON.stringify({
+      ...parsed,
+      params: {
+        ...params,
+        update: {
+          ...update,
+          configOptions: [
+            ...readNonRemoteConfigOptions(update.configOptions),
+            remoteOption,
+          ],
+        },
+      },
+    });
+  }
+  return message;
 }
 
-function createRemoteDisplayConfigOption(
-  meta: Record<string, unknown>,
-  sessionId?: string,
-): Record<string, unknown> | undefined {
-  if (!readString(meta[REMOTE_DAEMON_ID_META])) {
-    return undefined;
-  }
-  const machine =
-    readString(meta[REMOTE_SESSION_MACHINE_META]) ?? "Unknown machine";
-  const agent = formatSessionAgent(readSessionAgent(meta[REMOTE_SESSION_AGENT_META]));
-  const workspace =
-    readStringArray(meta[REMOTE_SESSION_WORKSPACE_ROOTS_META])?.[0] ??
-    "No workspace preference";
-  const entries = [
-    { description: machine, name: machine, value: machine },
-    { description: agent, name: agent, value: agent },
-    { description: workspace, name: workspace, value: workspace },
-    ...(sessionId
-      ? [
-          {
-            description: sessionId,
-            name: sessionId,
-            value: sessionId,
-          },
-        ]
-      : []),
-  ];
-  const currentValue = entries[0]?.value ?? "remote-context";
-  return {
-    category: "remote",
-    currentValue,
-    description:
-      "Remote machine, agent, workspace, and session selected in ACP relay authorization.",
-    id: `${REMOTE_CONFIG_OPTION_PREFIX}context`,
-    name: "Remote Context",
-    options: entries,
-    type: "select",
-  };
+function readMessageSessionIdFromJson(message: string): string | undefined {
+  const parsed = parseJson(message);
+  return parsed ? readMessageSessionId(parsed) : undefined;
 }
 
 function readConfigOptions(message: string): unknown[] | undefined {
   const parsed = parseJson(message);
   const result = isRecord(parsed?.result) ? parsed.result : undefined;
+  const params = isRecord(parsed?.params) ? parsed.params : undefined;
+  const update = isRecord(params?.update) ? params.update : undefined;
   const configOptions = Array.isArray(result?.configOptions)
     ? result.configOptions
-    : [];
+    : Array.isArray(update?.configOptions)
+      ? update.configOptions
+      : [];
   return configOptions.length ? configOptions : undefined;
 }
 
@@ -1039,6 +1044,46 @@ function formatSessionAgent(agent: Record<string, unknown> | undefined): string 
   }
   const command = readString(agent.command);
   return command ? basename(command) : "Default daemon agent";
+}
+
+function createRemoteDisplayConfigOption(
+  meta: Record<string, unknown>,
+  sessionId?: string,
+): Record<string, unknown> | undefined {
+  if (!readString(meta[REMOTE_DAEMON_ID_META])) {
+    return undefined;
+  }
+  const machine =
+    readString(meta[REMOTE_SESSION_MACHINE_META]) ?? "Unknown machine";
+  const agent = formatSessionAgent(readSessionAgent(meta[REMOTE_SESSION_AGENT_META]));
+  const workspace =
+    readStringArray(meta[REMOTE_SESSION_WORKSPACE_ROOTS_META])?.[0] ??
+    "No workspace preference";
+  const entries = [
+    { description: machine, name: machine, value: machine },
+    { description: agent, name: agent, value: agent },
+    { description: workspace, name: workspace, value: workspace },
+    ...(sessionId
+      ? [
+          {
+            description: sessionId,
+            name: sessionId,
+            value: sessionId,
+          },
+        ]
+      : []),
+  ];
+  const currentValue = entries[0]?.value ?? "remote-context";
+  return {
+    category: "remote",
+    currentValue,
+    description:
+      "Remote machine, agent, workspace, and session selected in ACP relay authorization.",
+    id: `${REMOTE_CONFIG_OPTION_PREFIX}context`,
+    name: "Remote Context",
+    options: entries,
+    type: "select",
+  };
 }
 
 function readJsonRpcRequestId(message: string): string | number | undefined {
@@ -1122,6 +1167,7 @@ function logClientMessage(
   const id = parsed.id;
   const sessionId = readMessageSessionId(parsed);
   const traceContext = readAcpRemoteTraceContextFromJsonRpcMessage(parsed);
+  const payloadSummary = summarizeAcpRemotePayloadForLog(parsed);
   if (typeof method === "string" && isJsonRpcId(id)) {
     requestMethods.set(id, method);
     if (sessionId) {
@@ -1143,6 +1189,7 @@ function logClientMessage(
       eventName: "acp.remote.bridge.transport",
       jsonRpcId: isJsonRpcId(id) ? id : undefined,
       method: typeof method === "string" ? method : undefined,
+      ...payloadSummary,
       sessionId,
       ...traceContextToDebugFields(traceContext),
       severityText: "INFO",
@@ -1185,6 +1232,7 @@ function logRelayMessage(
     requestTraceContexts.delete(id);
   }
   const hasError = Object.prototype.hasOwnProperty.call(parsed, "error");
+  const payloadSummary = summarizeAcpRemotePayloadForLog(parsed);
   const errorMessage =
     hasError && typeof parsed.error?.message === "string"
       ? ` message=${parsed.error.message}`
@@ -1204,6 +1252,7 @@ function logRelayMessage(
       eventName: "acp.remote.bridge.transport",
       jsonRpcId: isJsonRpcId(id) ? id : undefined,
       method: method ?? (notificationMethod !== "-" ? notificationMethod : undefined),
+      ...payloadSummary,
       sessionId,
       ...traceContextToDebugFields(traceContext),
       severityText: hasError ? "ERROR" : "INFO",

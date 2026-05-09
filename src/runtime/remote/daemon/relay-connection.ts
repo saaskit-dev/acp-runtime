@@ -45,6 +45,10 @@ import {
   type AcpRemoteTraceContext,
 } from "../shared/trace-context.js";
 import {
+  summarizeAcpRemotePayloadForLog,
+  type AcpRemotePayloadLogSummary,
+} from "../shared/payload-log-summary.js";
+import {
   AcpRemoteRuntimeAgent,
   type AcpRemoteRuntimeAgentOptions,
 } from "./runtime-agent.js";
@@ -71,16 +75,18 @@ export type AcpRemoteDaemonConnectionOptions =
   };
 
 export type AcpRemoteDaemonDebugContext = {
+  ack?: number;
   connectionId?: string;
   direction?: "relay_to_daemon" | "daemon_to_relay";
   jsonRpcId?: string | number;
   method?: string;
+  seq?: number;
   sessionId?: string;
   spanId?: string;
   severityText?: "ERROR" | "INFO";
   traceId?: string;
   traceparent?: string;
-};
+} & AcpRemotePayloadLogSummary;
 
 export type AcpRemoteDaemonConnectionHandle = {
   close(): void;
@@ -305,7 +311,10 @@ export function createAcpRemoteDaemonConnection(
       sendRelayAck(frame.connectionId, frame.seq);
       return;
     }
-    logRelayAcpPayload(frame.connectionId, frame.payload);
+    logRelayAcpPayload(frame.connectionId, frame.payload, {
+      ack: frame.ack,
+      seq: frame.seq,
+    });
     if (!ticket || !authorizeAcpPayload(frame.connectionId, ticket, frame.payload)) {
       return;
     }
@@ -599,10 +608,10 @@ export function createAcpRemoteDaemonConnection(
     if (!entry) {
       return;
     }
-    rememberDaemonRequestResponse(connectionId, payload);
-    logDaemonAcpPayload(connectionId, payload);
     const seq = (outboundSeq.get(connectionId) ?? 0) + 1;
     outboundSeq.set(connectionId, seq);
+    rememberDaemonRequestResponse(connectionId, payload);
+    logDaemonAcpPayload(connectionId, payload, { seq });
     const frame: AcpRemoteDataFrame = {
       channelId: "acp",
       channelKind: AcpRemoteChannelKind.Acp,
@@ -623,10 +632,10 @@ export function createAcpRemoteDaemonConnection(
 
   const sendAcpPayloadDirect = (connectionId: string, payload: AnyMessage) => {
     forgetCompletedInFlightRuntimeRequest(connectionId, payload);
-    rememberDaemonRequestResponse(connectionId, payload);
-    logDaemonAcpPayload(connectionId, payload);
     const seq = (outboundSeq.get(connectionId) ?? 0) + 1;
     outboundSeq.set(connectionId, seq);
+    rememberDaemonRequestResponse(connectionId, payload);
+    logDaemonAcpPayload(connectionId, payload, { seq });
     sendSocket(
       JSON.stringify({
         channelId: "acp",
@@ -817,8 +826,10 @@ export function createAcpRemoteDaemonConnection(
     targetMap: Map<string, Map<string | number, AcpDaemonRequestDebugContext>>,
     connectionId: string,
     payload: unknown,
+    frameContext?: { ack?: number; seq?: number },
   ): void {
     const details = readAcpPayloadDebugDetails(payload);
+    const payloadSummary = summarizeAcpRemotePayloadForLog(payload);
     const responseContext =
       details.id !== undefined && details.isResponse
         ? sourceMap.get(connectionId)?.get(details.id)
@@ -845,8 +856,10 @@ export function createAcpRemoteDaemonConnection(
       compactDaemonDebugContext({
         connectionId,
         direction,
+        ...frameContext,
         jsonRpcId: details.id,
         method,
+        ...payloadSummary,
         sessionId,
         ...traceContextToDebugFields(traceContext),
         severityText: details.hasError ? "ERROR" : "INFO",
@@ -854,12 +867,34 @@ export function createAcpRemoteDaemonConnection(
     );
   }
 
-  function logRelayAcpPayload(connectionId: string, payload: unknown): void {
-    logAcpPayload("relay_to_daemon", daemonRequestContexts, relayRequestContexts, connectionId, payload);
+  function logRelayAcpPayload(
+    connectionId: string,
+    payload: unknown,
+    frameContext?: { ack?: number; seq?: number },
+  ): void {
+    logAcpPayload(
+      "relay_to_daemon",
+      daemonRequestContexts,
+      relayRequestContexts,
+      connectionId,
+      payload,
+      frameContext,
+    );
   }
 
-  function logDaemonAcpPayload(connectionId: string, payload: unknown): void {
-    logAcpPayload("daemon_to_relay", relayRequestContexts, daemonRequestContexts, connectionId, payload);
+  function logDaemonAcpPayload(
+    connectionId: string,
+    payload: unknown,
+    frameContext?: { ack?: number; seq?: number },
+  ): void {
+    logAcpPayload(
+      "daemon_to_relay",
+      relayRequestContexts,
+      daemonRequestContexts,
+      connectionId,
+      payload,
+      frameContext,
+    );
   }
 
   options.socket.addEventListener("message", onMessage);

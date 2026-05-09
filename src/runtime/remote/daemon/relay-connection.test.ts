@@ -96,6 +96,9 @@ describe("ACP remote daemon relay connection", () => {
     const debugContexts: {
       direction?: string;
       method?: string;
+      payloadBytes?: number;
+      payloadHash?: string;
+      seq?: number;
       traceId?: string;
     }[] = [];
     const ticket = await createAcpRemoteSignedConnectionTicket({
@@ -167,9 +170,17 @@ describe("ACP remote daemon relay connection", () => {
         (context) =>
           context.direction === "relay_to_daemon" &&
           context.method === "initialize" &&
+          context.seq === 1 &&
           context.traceId === "11111111111111111111111111111111",
       ),
     );
+    const context = debugContexts.find(
+      (entry) =>
+        entry.direction === "relay_to_daemon" &&
+        entry.method === "initialize",
+    );
+    expect(context?.payloadBytes).toBeGreaterThan(0);
+    expect(context?.payloadHash).toMatch(/^[0-9a-f]{16}$/);
     daemon.close();
   });
 
