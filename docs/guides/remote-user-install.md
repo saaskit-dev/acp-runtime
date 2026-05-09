@@ -23,6 +23,10 @@ from that source checkout, then runs `acp-runtime auth login`. On a fresh macOS
 login, that installs the default user daemon if no daemon service exists. From a
 local checkout, run the same script directly to build and install that checkout:
 
+The install follows the user's current npm global prefix; it does not require
+`n`. If the npm global bin directory is not on `PATH`, the script prints the
+absolute `acp-runtime` path and a `PATH` line to add to the shell profile.
+
 ```bash
 ./scripts/install.sh
 ```

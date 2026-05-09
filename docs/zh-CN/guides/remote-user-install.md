@@ -20,6 +20,10 @@ curl -fsSL https://raw.githubusercontent.com/saaskit-dev/acp-runtime/main/script
 安装默认 user daemon。本地 checkout 里也可以直接运行同一个脚本，它会构建并安装当前
 checkout：
 
+安装会跟随用户当前的 npm global prefix，不要求安装过 `n`。如果 npm global bin
+目录不在 `PATH` 里，脚本会输出 `acp-runtime` 的绝对路径，以及应该加到 shell profile
+里的 `PATH` 配置。
+
 ```bash
 ./scripts/install.sh
 ```

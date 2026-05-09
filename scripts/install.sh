@@ -8,6 +8,14 @@ RUN_LOGIN=1
 FORCE_LOGIN=0
 NO_DAEMON=0
 SYSTEM_DAEMON=0
+CLEANUP_DIRS=()
+
+cleanup() {
+  for dir in "${CLEANUP_DIRS[@]+"${CLEANUP_DIRS[@]}"}"; do
+    rm -rf "$dir"
+  done
+}
+trap cleanup EXIT
 
 usage() {
   cat <<'EOF'
@@ -97,9 +105,48 @@ require_command npm
 require_command node
 require_command git
 
+resolve_acp_runtime_bin() {
+  if command -v acp-runtime >/dev/null 2>&1; then
+    command -v acp-runtime
+    return 0
+  fi
+
+  npm_prefix="$(npm prefix -g)"
+  candidate="$npm_prefix/bin/acp-runtime"
+  if [ -x "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  return 1
+}
+
+print_path_hint() {
+  acp_bin="$1"
+  acp_bin_dir="$(dirname "$acp_bin")"
+  cat >&2 <<EOF
+acp-runtime was installed at:
+  $acp_bin
+
+That directory is not on PATH for this shell:
+  $acp_bin_dir
+
+Add it to your shell startup file, for example:
+  export PATH="$acp_bin_dir:\$PATH"
+EOF
+}
+
 script_path="${BASH_SOURCE[0]:-$0}"
 script_dir="$(cd "$(dirname "$script_path")" >/dev/null 2>&1 && pwd -P || pwd)"
 repo_root="$(cd "$script_dir/.." >/dev/null 2>&1 && pwd -P || pwd)"
+
+install_packed_source() {
+  source_dir="$1"
+  pack_dir="$(mktemp -d "${TMPDIR:-/tmp}/acp-runtime-pack.XXXXXX")"
+  CLEANUP_DIRS+=("$pack_dir")
+  tarball="$(cd "$source_dir" && npm pack --pack-destination "$pack_dir" --silent)"
+  npm install -g "$pack_dir/$tarball"
+}
 
 install_from_local_checkout() {
   [ -f "$repo_root/package.json" ] || return 1
@@ -111,12 +158,12 @@ install_from_local_checkout() {
   else
     (cd "$repo_root" && npm run build:lib)
   fi
-  npm install -g "$repo_root"
+  install_packed_source "$repo_root"
 }
 
 install_from_git_source() {
   tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/acp-runtime-install.XXXXXX")"
-  trap 'rm -rf "$tmp_dir"' EXIT
+  CLEANUP_DIRS+=("$tmp_dir")
   echo "Cloning acp-runtime source: $REPO_URL ($REPO_REF)"
   git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$tmp_dir/acp-runtime"
   echo "Installing acp-runtime from source..."
@@ -125,17 +172,20 @@ install_from_git_source() {
   else
     (cd "$tmp_dir/acp-runtime" && npm install && npm run build:lib)
   fi
-  npm install -g "$tmp_dir/acp-runtime"
+  install_packed_source "$tmp_dir/acp-runtime"
 }
 
 if ! install_from_local_checkout; then
   install_from_git_source
 fi
 
-if ! command -v acp-runtime >/dev/null 2>&1; then
-  echo "acp-runtime was installed, but it is not on PATH." >&2
-  echo "Check your npm global bin directory: npm bin -g" >&2
+if ! ACP_RUNTIME_BIN="$(resolve_acp_runtime_bin)"; then
+  echo "acp-runtime was installed, but the global bin could not be found." >&2
+  echo "npm global prefix: $(npm prefix -g)" >&2
   exit 1
+fi
+if ! command -v acp-runtime >/dev/null 2>&1; then
+  print_path_hint "$ACP_RUNTIME_BIN"
 fi
 
 auth_args=(auth login)
@@ -151,14 +201,14 @@ fi
 if [ "$RUN_LOGIN" -eq 1 ]; then
   if [ "$SYSTEM_DAEMON" -eq 1 ]; then
     auth_args+=(--no-daemon)
-    acp-runtime "${auth_args[@]}"
-    acp-runtime "${daemon_args[@]}"
+    "$ACP_RUNTIME_BIN" "${auth_args[@]}"
+    "$ACP_RUNTIME_BIN" "${daemon_args[@]}"
   else
     if [ "$NO_DAEMON" -eq 1 ]; then
       auth_args+=(--no-daemon)
     fi
-    acp-runtime "${auth_args[@]}"
+    "$ACP_RUNTIME_BIN" "${auth_args[@]}"
   fi
 fi
 
-echo "acp-runtime installed: $(command -v acp-runtime)"
+echo "acp-runtime installed: $ACP_RUNTIME_BIN"
