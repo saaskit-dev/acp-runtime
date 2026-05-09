@@ -3014,6 +3014,122 @@ describe("AcpRelayBroker", () => {
     );
   });
 
+  it("replays unacknowledged native ACP notifications after client reconnect", async () => {
+    let now = new Date("2026-04-27T00:00:00.000Z");
+    const broker = new AcpRelayBroker({
+      clientReconnectGraceMs: 100,
+      controlPlaneStore: createControlPlaneStore(),
+      now: () => now,
+      ticketSigningKey,
+    });
+    const connectionId = "conn-native-notification-replay";
+    const [firstNativeSocket, firstRelayClientSocket] = createMemoryWebSocketPair();
+    const [resumedNativeSocket, resumedRelayClientSocket] =
+      createMemoryWebSocketPair();
+    const [daemonSocket, relayDaemonSocket] = createMemoryWebSocketPair();
+    const firstMessages: unknown[] = [];
+    const resumedMessages: unknown[] = [];
+    const daemonFrames: AcpRemoteFrame[] = [];
+
+    firstNativeSocket.addEventListener("message", (event) => {
+      firstMessages.push(JSON.parse(String(event.data)));
+    });
+    resumedNativeSocket.addEventListener("message", (event) => {
+      resumedMessages.push(JSON.parse(String(event.data)));
+    });
+    daemonSocket.addEventListener("message", (event) => {
+      daemonFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+    bindBrokerClientSocket(broker, connectionId, firstRelayClientSocket);
+    bindBrokerClientSocket(broker, connectionId, resumedRelayClientSocket);
+    bindBrokerDaemonSocket(broker, relayDaemonSocket);
+
+    broker.registerDaemon("host-a", relayDaemonSocket);
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      nativeClientAck: true,
+      socket: firstRelayClientSocket,
+    });
+    await expect(
+      broker.authorizeClient({ connectionId, daemonId: "host-a" }),
+    ).resolves.toMatchObject({ ok: true });
+    daemonFrames.length = 0;
+
+    daemonSocket.send(
+      JSON.stringify({
+        channelId: "acp",
+        channelKind: AcpRemoteChannelKind.Acp,
+        connectionId,
+        frameType: AcpRemoteFrameType.Data,
+        payload: {
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "session-1",
+            update: {
+              content: { text: "hello", type: "text" },
+              sessionUpdate: "user_message_chunk",
+            },
+          },
+        },
+        seq: 42,
+      } satisfies AcpRemoteDataFrame),
+    );
+
+    await waitFor(() => firstMessages.length > 0);
+    expect(firstMessages[0]).toMatchObject({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        _meta: {
+          "acp-runtime/remote/clientAckSeq": 42,
+        },
+      },
+    });
+    expect(
+      daemonFrames.some(
+        (frame) => frame.frameType === AcpRemoteFrameType.Ack && frame.ack === 42,
+      ),
+    ).toBe(false);
+
+    broker.removeClient(connectionId, firstRelayClientSocket);
+    now = new Date("2026-04-27T00:00:00.050Z");
+    broker.registerClient({
+      accountId: "acct-1",
+      authUrl: `https://relay.test/authorize?connectionId=${connectionId}`,
+      connectionId,
+      nativeClientAck: true,
+      socket: resumedRelayClientSocket,
+    });
+
+    await waitFor(() => resumedMessages.length > 0);
+    expect(resumedMessages[0]).toMatchObject({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        _meta: {
+          "acp-runtime/remote/clientAckSeq": 42,
+        },
+      },
+    });
+
+    await broker.handleClientText(
+      connectionId,
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "acp-runtime/remote/client_ack",
+        params: { seq: 42 },
+      }),
+    );
+    await waitFor(() =>
+      daemonFrames.some(
+        (frame) => frame.frameType === AcpRemoteFrameType.Ack && frame.ack === 42,
+      ),
+    );
+  });
+
   it("suppresses duplicate native ACP prompts while the daemon response is pending", async () => {
     const broker = new AcpRelayBroker({
       controlPlaneStore: createControlPlaneStore(),

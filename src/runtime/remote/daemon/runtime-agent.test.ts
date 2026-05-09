@@ -123,13 +123,26 @@ describe("AcpRemoteRuntimeAgent", () => {
     ).toBe(false);
 
     const response = await clientConnection.prompt({
+      messageId: "client-message-1",
       prompt: [{ text: "hello", type: "text" }],
       sessionId: created.sessionId,
     });
 
     expect(response.stopReason).toBe("end_turn");
+    expect(response.userMessageId).toBe("client-message-1");
     expect(receivedPrompt).toEqual([{ text: "hello", type: "text" }]);
     expect(notifications).toEqual([
+      {
+        sessionId: "runtime-session-1",
+        update: {
+          content: {
+            text: "hello",
+            type: "text",
+          },
+          messageId: "client-message-1",
+          sessionUpdate: "user_message_chunk",
+        },
+      },
       {
         sessionId: "runtime-session-1",
         update: {

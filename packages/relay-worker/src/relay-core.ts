@@ -144,6 +144,7 @@ const DEFAULT_POLICY_VERSION = 1;
 const DEFAULT_TICKET_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_TICKET_RENEW_BEFORE_MS = 5 * 60 * 1000;
 const NATIVE_CLIENT_ACK_METHOD = "acp-runtime/remote/client_ack";
+const NATIVE_CLIENT_ACK_SEQ_META = "acp-runtime/remote/clientAckSeq";
 const DEFAULT_TICKET_SCOPES = [
   "acp:connect",
   "acp:session:create",
@@ -1447,11 +1448,7 @@ export class AcpRelayBroker {
       if (!client) {
         return frame.connectionId;
       }
-      const shouldDeferDaemonAck =
-        client.transport === "native-acp" &&
-        client.nativeClientAck &&
-        frame.channelKind === AcpRemoteChannelKind.Acp &&
-        isJsonRpcResponsePayload(frame.payload);
+      const shouldDeferDaemonAck = shouldDeferNativeClientAck(client, frame);
       const shouldHoldDaemonAckForClientReconnect =
         !client.socket && this.shouldKeepDisconnectedClient(client);
       const shouldHoldDaemonAckForClientBackpressure =
@@ -1496,7 +1493,7 @@ export class AcpRelayBroker {
 
       const payloadText =
         client.transport === "native-acp"
-          ? JSON.stringify(frame.payload)
+          ? JSON.stringify(nativeAcpPayloadForClient(client, frame))
           : JSON.stringify(frame);
       if (shouldDeferDaemonAck) {
         client.clientPendingFrames.set(frame.seq, frame);
@@ -3172,6 +3169,32 @@ export class AcpRelayBroker {
     client: RelayClient,
     message: RelayJsonRpcNotification,
   ): void {
+    const seq = readNativeClientAckSeq(message);
+    if (seq !== undefined) {
+      const frame = client.clientPendingFrames.get(seq);
+      if (!frame) {
+        return;
+      }
+      client.clientPendingFrames.delete(seq);
+      const details = readRelayTransportPayloadDetails(frame.payload, client);
+      this.logRelayLifecycle({
+        accountId: client.accountId,
+        clientId: client.clientId,
+        connectionId: frame.connectionId,
+        daemonId: client.daemonId,
+        eventName: "acp.relay.client_ack.received",
+        jsonRpcId: details.id,
+        method: details.method,
+        nativeClientAck: client.nativeClientAck,
+        pendingClientFrames: client.clientPendingFrames.size,
+        seq: frame.seq,
+        sessionId: details.sessionId,
+        traceContext: details.traceContext,
+        transport: client.transport,
+      });
+      this.sendDaemonAck(client, frame);
+      return;
+    }
     const id = readNativeClientAckId(message);
     if (id === undefined) {
       return;
@@ -3247,7 +3270,9 @@ export class AcpRelayBroker {
         continue;
       }
       const payload =
-        client.transport === "native-acp" ? frame.payload : frame;
+        client.transport === "native-acp"
+          ? nativeAcpPayloadForClient(client, frame)
+          : frame;
       if (client.transport === "remote-frame") {
         client.clientPendingFrames.set(frame.seq, frame);
       }
@@ -3292,7 +3317,9 @@ export class AcpRelayBroker {
         transport: client.transport,
       });
       const payload =
-        client.transport === "native-acp" ? frame.payload : frame;
+        client.transport === "native-acp"
+          ? nativeAcpPayloadForClient(client, frame)
+          : frame;
       client.socket.send(JSON.stringify(payload));
     }
   }
@@ -4746,12 +4773,69 @@ function isNativeClientAck(
   );
 }
 
+function shouldDeferNativeClientAck(
+  client: RelayClient,
+  frame: AcpRemoteDataFrame,
+): boolean {
+  return (
+    client.transport === "native-acp" &&
+    client.nativeClientAck &&
+    frame.channelKind === AcpRemoteChannelKind.Acp &&
+    (isJsonRpcResponsePayload(frame.payload) ||
+      isNativeAckableJsonRpcPayload(frame.payload))
+  );
+}
+
+function nativeAcpPayloadForClient(
+  client: RelayClient,
+  frame: AcpRemoteDataFrame,
+): unknown {
+  if (
+    client.transport !== "native-acp" ||
+    !client.nativeClientAck ||
+    frame.channelKind !== AcpRemoteChannelKind.Acp ||
+    isJsonRpcResponsePayload(frame.payload) ||
+    !isNativeAckableJsonRpcPayload(frame.payload)
+  ) {
+    return frame.payload;
+  }
+  const payload = frame.payload;
+  const params = isRecord(payload.params) ? { ...payload.params } : {};
+  const meta = isRecord(params._meta) ? { ...params._meta } : {};
+  return {
+    ...payload,
+    params: {
+      ...params,
+      _meta: {
+        ...meta,
+        [NATIVE_CLIENT_ACK_SEQ_META]: frame.seq,
+      },
+    },
+  };
+}
+
+function isNativeAckableJsonRpcPayload(
+  value: unknown,
+): value is RelayJsonRpcNotification | RelayJsonRpcRequest {
+  return isRelayJsonRpcMessage(value) && !isJsonRpcResponsePayload(value);
+}
+
 function readNativeClientAckId(
   message: RelayJsonRpcNotification,
 ): string | number | undefined {
   const params = isRecord(message.params) ? message.params : undefined;
   const id = params?.id;
   return typeof id === "string" || typeof id === "number" ? id : undefined;
+}
+
+function readNativeClientAckSeq(
+  message: RelayJsonRpcNotification,
+): number | undefined {
+  const params = isRecord(message.params) ? message.params : undefined;
+  const seq = params?.seq;
+  return typeof seq === "number" && Number.isSafeInteger(seq) && seq > 0
+    ? seq
+    : undefined;
 }
 
 function isSessionNewRequest(

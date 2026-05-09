@@ -130,7 +130,7 @@ export function createAcpRemoteStdioBridge(
         const responseId = readJsonRpcResponseId(message);
         if (isDuplicateDeliveredResponse(responseId)) {
           if (responseId !== undefined) {
-            sendNativeClientAck(responseId);
+            sendNativeClientAck({ id: responseId });
           }
           return;
         }
@@ -168,15 +168,20 @@ export function createAcpRemoteStdioBridge(
             configOptionsBySessionId.set(clientSessionId, clientConfigOptions);
           }
         }
+        const nativeClientAckSeq = readNativeClientAckSeq(clientMessage);
+        const outputMessage =
+          nativeClientAckSeq !== undefined
+            ? stripNativeClientAckSeq(clientMessage)
+            : clientMessage;
         logRelayMessage(
-          clientMessage,
+          outputMessage,
           requestMethods,
           requestSessionIds,
           requestTraceContexts,
           connectionId,
           debugLog,
         );
-        authUrl = readRelayAuthUrl(clientMessage) ?? authUrl;
+        authUrl = readRelayAuthUrl(outputMessage) ?? authUrl;
         if (authUrl && options.autoAuthorize && !authorizePromise) {
           debugLog("auto-authorize relay browser authentication");
           authorizePromise = authorizeRelay({
@@ -184,10 +189,13 @@ export function createAcpRemoteStdioBridge(
             ...options.autoAuthorize,
           });
         }
-        writeOutput(output, `${clientMessage}\n`, () => close(), () => {
+        writeOutput(output, `${outputMessage}\n`, () => close(), () => {
+          if (nativeClientAckSeq !== undefined) {
+            sendNativeClientAck({ seq: nativeClientAckSeq });
+          }
           if (responseId !== undefined) {
             deliveredResponseIds.add(responseId);
-            sendNativeClientAck(responseId);
+            sendNativeClientAck({ id: responseId });
           }
         });
       },
@@ -331,18 +339,23 @@ export function createAcpRemoteStdioBridge(
     return false;
   };
 
-  const sendNativeClientAck = (id: string | number) => {
+  const sendNativeClientAck = (ack: { id?: string | number; seq?: number }) => {
     connection?.send(JSON.stringify({
       jsonrpc: "2.0",
       method: NATIVE_CLIENT_ACK_METHOD,
-      params: { id },
+      params: ack,
     }));
-    debugLog(`relay response acknowledged id=${formatJsonRpcId(id)}`, {
-      connectionId,
-      eventName: "acp.remote.bridge.client_ack_sent",
-      jsonRpcId: id,
-      severityText: "INFO",
-    });
+    debugLog(
+      ack.id !== undefined
+        ? `relay response acknowledged id=${formatJsonRpcId(ack.id)}`
+        : `relay notification acknowledged seq=${ack.seq ?? "-"}`,
+      {
+        connectionId,
+        eventName: "acp.remote.bridge.client_ack_sent",
+        jsonRpcId: ack.id,
+        severityText: "INFO",
+      },
+    );
   };
 
   const trackInFlightOutbound = (message: string) => {
@@ -502,6 +515,7 @@ const REMOTE_SESSION_SELECTION_ID_META =
 const REMOTE_SESSION_WORKSPACE_ROOTS_META =
   "acp-runtime/remote/sessionWorkspaceRoots";
 const NATIVE_CLIENT_ACK_METHOD = "acp-runtime/remote/client_ack";
+const NATIVE_CLIENT_ACK_SEQ_META = "acp-runtime/remote/clientAckSeq";
 const REMOTE_CONFIG_OPTION_PREFIX = "acp-runtime.remote.";
 
 function openUrl(url: string): void {
@@ -1005,6 +1019,35 @@ function readConfigOptions(message: string): unknown[] | undefined {
       ? update.configOptions
       : [];
   return configOptions.length ? configOptions : undefined;
+}
+
+function readNativeClientAckSeq(message: string): number | undefined {
+  const parsed = parseJson(message);
+  const params = isRecord(parsed?.params) ? parsed.params : undefined;
+  const meta = isRecord(params?._meta) ? params._meta : undefined;
+  const seq = meta?.[NATIVE_CLIENT_ACK_SEQ_META];
+  return typeof seq === "number" && Number.isSafeInteger(seq) && seq > 0
+    ? seq
+    : undefined;
+}
+
+function stripNativeClientAckSeq(message: string): string {
+  const parsed = parseJson(message);
+  const params = isRecord(parsed?.params) ? { ...parsed.params } : undefined;
+  const meta = isRecord(params?._meta) ? { ...params._meta } : undefined;
+  if (!parsed || !params || !meta) {
+    return message;
+  }
+  delete meta[NATIVE_CLIENT_ACK_SEQ_META];
+  if (Object.keys(meta).length > 0) {
+    params._meta = meta;
+  } else {
+    delete params._meta;
+  }
+  return JSON.stringify({
+    ...parsed,
+    params,
+  });
 }
 
 function readNonRemoteConfigOptions(value: unknown): unknown[] {

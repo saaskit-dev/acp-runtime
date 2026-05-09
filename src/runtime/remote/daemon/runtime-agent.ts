@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 
 import { SeverityNumber } from "@opentelemetry/api-logs";
@@ -41,6 +42,7 @@ import type {
 } from "../../core/types.js";
 import {
   mapAcpMcpServersToRuntime,
+  mapAcpPromptToUserMessageNotifications,
   mapAcpPermissionOutcomeToRuntimeDecision,
   mapAcpPromptToRuntimePrompt,
   mapRemotePermissionRequestToAcp,
@@ -326,6 +328,14 @@ export class AcpRemoteRuntimeAgent implements Agent {
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     const traceContext = traceContextFromParams(params);
     const active = await this.getOrRestoreSession(params, "session/prompt");
+    const userMessageId = params.messageId ?? randomUUID();
+    for (const notification of mapAcpPromptToUserMessageNotifications(
+      params.sessionId,
+      params.prompt,
+      userMessageId,
+    )) {
+      await this.connection.sessionUpdate(notification);
+    }
     const turn = active.session.turn.start(
       mapAcpPromptToRuntimePrompt(params.prompt),
     );
@@ -351,7 +361,7 @@ export class AcpRemoteRuntimeAgent implements Agent {
         } else if (event.type === "cancelled") {
           return {
             stopReason: "cancelled",
-            userMessageId: params.messageId ?? undefined,
+            userMessageId,
           };
         } else if (event.type === "failed") {
           emitRemotePromptFailureLog({
@@ -376,7 +386,7 @@ export class AcpRemoteRuntimeAgent implements Agent {
       }
 
       return mapRuntimeTurnCompletionToAcp(completion, {
-        userMessageId: params.messageId,
+        userMessageId,
       });
     } finally {
       if (active.turnId === turn.turnId) {

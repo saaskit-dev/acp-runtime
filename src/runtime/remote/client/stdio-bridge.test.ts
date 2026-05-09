@@ -435,6 +435,65 @@ describe("createAcpRemoteStdioBridge", () => {
     }
   });
 
+  it("acknowledges relay notifications after writing them to stdio", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let outputText = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      outputText += chunk;
+    });
+    const sockets: TestSocket[] = [];
+    const bridge = createAcpRemoteStdioBridge({
+      clientId: "client-1",
+      connectionId: "connection-1",
+      input,
+      output,
+      relayUrl: "ws://relay.test",
+      socketFactory() {
+        const socket = new TestSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    try {
+      sockets[0]?.emitMessage(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            _meta: {
+              "acp-runtime/remote/clientAckSeq": 42,
+            },
+            sessionId: "session-1",
+            update: {
+              content: { text: "hello", type: "text" },
+              sessionUpdate: "user_message_chunk",
+            },
+          },
+        }),
+      );
+
+      await waitFor(() =>
+        sockets[0]?.sent.some((message) =>
+          message.includes("acp-runtime/remote/client_ack"),
+        ) ?? false,
+      );
+      const outputMessage = JSON.parse(outputText.trim()) as {
+        params?: { _meta?: unknown };
+      };
+      expect(outputMessage.params?._meta).toBeUndefined();
+      expect(JSON.parse(sockets[0]!.sent.at(-1)!)).toMatchObject({
+        jsonrpc: "2.0",
+        method: "acp-runtime/remote/client_ack",
+        params: { seq: 42 },
+      });
+    } finally {
+      bridge.close();
+    }
+  });
+
   it("injects stable remote display config locally and intercepts its updates", async () => {
     const input = new PassThrough();
     const output = new PassThrough();
@@ -766,6 +825,13 @@ describe("createAcpRemoteStdioBridge", () => {
     const input = new PassThrough();
     const output = new PassThrough();
     let outputText = "";
+    const debugContexts: {
+      configOptionCount?: number;
+      configOptionHasRemoteContext?: boolean;
+      configOptionIds?: string;
+      direction?: string;
+      method?: string;
+    }[] = [];
     output.setEncoding("utf8");
     output.on("data", (chunk: string) => {
       outputText += chunk;
@@ -774,6 +840,11 @@ describe("createAcpRemoteStdioBridge", () => {
     const bridge = createAcpRemoteStdioBridge({
       clientId: "client-1",
       connectionId: "connection-1",
+      debugLog(_message, context) {
+        if (context) {
+          debugContexts.push(context);
+        }
+      },
       input,
       output,
       relayUrl: "ws://relay.test",
@@ -826,6 +897,15 @@ describe("createAcpRemoteStdioBridge", () => {
           id: "acp-runtime.remote.context",
         }),
       ]);
+      expect(debugContexts).toContainEqual(
+        expect.objectContaining({
+          configOptionCount: 1,
+          configOptionHasRemoteContext: true,
+          configOptionIds: "acp-runtime.remote.context",
+          direction: "relay_to_client",
+          method: "session/load",
+        }),
+      );
     } finally {
       bridge.close();
     }

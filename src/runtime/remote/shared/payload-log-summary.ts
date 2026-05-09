@@ -1,18 +1,24 @@
 import { createHash } from "node:crypto";
 
 export type AcpRemotePayloadLogSummary = {
+  configOptionCount?: number;
+  configOptionHasRemoteContext?: boolean;
+  configOptionIds?: string;
   payloadBytes?: number;
   payloadHash?: string;
   payloadPreview?: string;
   payloadPreviewTruncated?: boolean;
   promptBlockCount?: number;
+  promptMessageId?: string;
   promptTextChars?: number;
   promptTextHash?: string;
   promptTextPreview?: string;
   promptTextPreviewTruncated?: boolean;
   responseHasError?: boolean;
+  responseUserMessageId?: string;
   stopReason?: string;
   updateKind?: string;
+  updateMessageId?: string;
   updateTextChars?: number;
   updateTextHash?: string;
   updateTextPreview?: string;
@@ -52,9 +58,12 @@ export function summarizeAcpRemotePayloadForLog(
     ? true
     : undefined;
   summary.stopReason = readString(result?.stopReason);
+  summary.responseUserMessageId = readString(result?.userMessageId);
+  Object.assign(summary, summarizeConfigOptions(payload));
 
   if (payload.method === "session/prompt") {
     const prompt = params?.prompt;
+    summary.promptMessageId = readString(params?.messageId);
     const promptText = collectText(prompt).join("\n");
     summary.promptBlockCount = Array.isArray(prompt)
       ? prompt.length
@@ -83,6 +92,7 @@ export function summarizeAcpRemotePayloadForLog(
       readString(update?.sessionUpdate) ??
       readString(update?.kind) ??
       readString(update?.type);
+    summary.updateMessageId = readString(update?.messageId);
     const updateText = collectText(update ?? params?.update).join("\n");
     if (updateText) {
       summary.updateTextChars = updateText.length;
@@ -101,6 +111,33 @@ export function summarizeAcpRemotePayloadForLog(
   }
 
   return summary;
+}
+
+function summarizeConfigOptions(
+  payload: Record<string, unknown>,
+): Pick<
+  AcpRemotePayloadLogSummary,
+  "configOptionCount" | "configOptionHasRemoteContext" | "configOptionIds"
+> {
+  const params = isRecord(payload.params) ? payload.params : undefined;
+  const result = isRecord(payload.result) ? payload.result : undefined;
+  const update = isRecord(params?.update) ? params.update : undefined;
+  const configOptions = Array.isArray(result?.configOptions)
+    ? result.configOptions
+    : Array.isArray(update?.configOptions)
+      ? update.configOptions
+      : undefined;
+  if (!configOptions) {
+    return {};
+  }
+  const ids = configOptions.map(readConfigOptionId).filter(isString);
+  return {
+    configOptionCount: configOptions.length,
+    configOptionHasRemoteContext: ids.some((id) =>
+      id.startsWith("acp-runtime.remote.context"),
+    ),
+    configOptionIds: ids.join(","),
+  };
 }
 
 function serializePayload(payload: unknown): string {
@@ -169,6 +206,14 @@ function readPayloadPreviewMode(): "off" | "summary" | "full" {
 
 function readString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function readConfigOptionId(value: unknown): string | undefined {
+  return isRecord(value) ? readString(value.id) : undefined;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

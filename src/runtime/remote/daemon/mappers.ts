@@ -260,6 +260,21 @@ export function mapRuntimeTurnCompletionToAcp(
   };
 }
 
+export function mapAcpPromptToUserMessageNotifications(
+  sessionId: string,
+  prompt: readonly ContentBlock[],
+  messageId: string,
+): SessionNotification[] {
+  return prompt.map((content) => ({
+    sessionId,
+    update: {
+      content,
+      messageId,
+      sessionUpdate: "user_message_chunk",
+    },
+  }));
+}
+
 export function mapRuntimeTurnEventToAcpNotifications(
   sessionId: string,
   event: AcpRuntimeTurnEvent,
