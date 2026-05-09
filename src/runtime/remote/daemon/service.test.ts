@@ -14,6 +14,7 @@ describe("remote daemon user service", () => {
       env: {
         PATH: "/opt/homebrew/bin:/usr/bin:/bin",
       },
+      homeDir: "/Users/dev",
       label: "dev.saaskit.acp-runtime.daemon",
       nodePath: "/usr/local/bin/node",
       relayUrl: "wss://relay.example.com",
