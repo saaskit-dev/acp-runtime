@@ -42,7 +42,7 @@
     "demo:runtime:claude": "node dist/examples/runtime-sdk-demo.js claude-acp",
     "predemo:runtime": "pnpm run build",
     "demo:runtime": "node dist/examples/runtime-sdk-demo.js",
-    "test": "pnpm --filter @saaskit-dev/simulator-agent-acp test && vitest run",
+    "test": "pnpm --filter @saaskit-dev/simulator-agent-acp build && pnpm --filter @saaskit-dev/simulator-agent-acp test && vitest run",
     "test:watch": "vitest",
     "remote:prod-smoke": "node scripts/remote-prod-smoke.mjs",
     "lint": "tsc --noEmit -p tsconfig.json && pnpm run build:lib && tsc --noEmit -p tsconfig.examples.json && tsc --noEmit -p tsconfig.harness.json",
