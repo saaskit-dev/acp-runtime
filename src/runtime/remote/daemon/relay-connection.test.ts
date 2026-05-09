@@ -34,6 +34,7 @@ import {
   type AcpRemoteSignedConnectionTicket,
 } from "../protocol/index.js";
 import {
+  countAcpRemoteDaemonInFlightRuntimeRequests,
   createAcpRemoteDaemonConnection,
   createAcpRemoteDaemonConnectionState,
   type AcpRemoteDaemonRequestJournal,
@@ -734,6 +735,144 @@ describe("ACP remote daemon relay connection", () => {
     daemon.close();
   });
 
+  it("tracks in-flight runtime requests until the daemon sends the response", async () => {
+    const state = createAcpRemoteDaemonConnectionState();
+    const [daemonSocket, relaySocket] = createMemoryWebSocketPair();
+    const outboundFrames: AcpRemoteFrame[] = [];
+    let resolvePrompt:
+      | ((value: {
+          output: { text: string; type: "text" }[];
+          outputText: string;
+          turnId: string;
+        }) => void)
+      | undefined;
+    const promptCompletion = new Promise<{
+      output: { text: string; type: "text" }[];
+      outputText: string;
+      turnId: string;
+    }>((resolve) => {
+      resolvePrompt = resolve;
+    });
+    const ticket = await createAcpRemoteSignedConnectionTicket({
+      connectionId: "conn-in-flight",
+      grant: {
+        accountId: "acct-smoke",
+        clientDeviceId: "client-smoke",
+        daemonId: "host-smoke",
+        policyVersion: 1,
+        scopes: ["acp:connect", "acp:session:create", "acp:turn:send"],
+      },
+      jti: "ticket-in-flight",
+      key: relayTicketKey,
+      now: new Date("2026-04-27T00:00:00.000Z"),
+      ttlMs: 60_000,
+    });
+    relaySocket.addEventListener("message", (event) => {
+      outboundFrames.push(assertAcpRemoteFrame(JSON.parse(String(event.data))));
+    });
+
+    const daemon = createAcpRemoteDaemonConnection({
+      agent: {
+        command: "fake-agent",
+        type: "fake",
+      },
+      daemonId: "host-smoke",
+      now: () => new Date("2026-04-27T00:00:30.000Z"),
+      runtime: {
+        sessions: {
+          async list() {
+            return { sessions: [] };
+          },
+          async load() {
+            throw new Error("Unexpected remote load.");
+          },
+          async resume() {
+            throw new Error("Unexpected remote resume.");
+          },
+          async start() {
+            return createFakeRuntimeSession({ promptCompletion });
+          },
+        },
+      },
+      socket: daemonSocket,
+      state,
+      ticketVerificationKeys: [relayTicketKey],
+    });
+
+    relaySocket.send(createRelayHelloFrame("conn-in-flight", ticket));
+    relaySocket.send(createRelayAcpFrame("conn-in-flight", 1, {
+      id: 1,
+      jsonrpc: "2.0",
+      method: "initialize",
+      params: {
+        clientCapabilities: {},
+        protocolVersion: PROTOCOL_VERSION,
+      },
+    }));
+    await waitFor(() =>
+      outboundFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcResultPayload(frame.payload, 1),
+      ),
+    );
+    ackLatestDataFrame(relaySocket, outboundFrames, "conn-in-flight");
+
+    relaySocket.send(createRelayAcpFrame("conn-in-flight", 2, {
+      id: 2,
+      jsonrpc: "2.0",
+      method: "session/new",
+      params: {
+        cwd: "/tmp/project",
+        mcpServers: [],
+      },
+    }));
+    await waitFor(() =>
+      outboundFrames.some(
+        (frame) =>
+          frame.frameType === AcpRemoteFrameType.Data &&
+          isJsonRpcResultPayload(frame.payload, 2),
+      ),
+    );
+    ackLatestDataFrame(relaySocket, outboundFrames, "conn-in-flight");
+
+    relaySocket.send(createRelayAcpFrame("conn-in-flight", 3, {
+      id: 3,
+      jsonrpc: "2.0",
+      method: "session/prompt",
+      params: {
+        prompt: [{ text: "slow", type: "text" }],
+        sessionId: "runtime-session-1",
+      },
+    }));
+
+    await waitFor(
+      () => countAcpRemoteDaemonInFlightRuntimeRequests(state) === 1,
+    );
+    relaySocket.send(
+      JSON.stringify({
+        code: "client_closed",
+        connectionId: "conn-in-flight",
+        frameType: AcpRemoteFrameType.Close,
+        reason: "client disconnected while prompt is running",
+      }),
+    );
+    await waitFor(() => state.active.size === 1);
+    expect(countAcpRemoteDaemonInFlightRuntimeRequests(state)).toBe(1);
+
+    resolvePrompt?.({
+      output: [{ text: "done", type: "text" }],
+      outputText: "done",
+      turnId: "turn-1",
+    });
+    await waitFor(
+      () => countAcpRemoteDaemonInFlightRuntimeRequests(state) === 0,
+    );
+    await waitFor(() => state.active.size === 0);
+
+    daemon.close();
+  });
+
   it("keeps active sessions across daemon relay socket reconnects", async () => {
     const state = createAcpRemoteDaemonConnectionState();
     const [firstDaemonSocket, firstRelaySocket] = createMemoryWebSocketPair();
@@ -1146,7 +1285,16 @@ function createUnusedRuntime(): Parameters<
   };
 }
 
-function createFakeRuntimeSession(options: { textEventCount?: number } = {}): AcpRuntimeSession {
+function createFakeRuntimeSession(
+  options: {
+    promptCompletion?: Promise<{
+      output: { text: string; type: "text" }[];
+      outputText: string;
+      turnId: string;
+    }>;
+    textEventCount?: number;
+  } = {},
+): AcpRuntimeSession {
   return {
     agent: {
       listConfigOptions: () => [],
@@ -1200,15 +1348,15 @@ function createFakeRuntimeSession(options: { textEventCount?: number } = {}): Ac
         turnId: "turn-1",
       }),
       start: (_prompt: AcpRuntimePrompt) => ({
-        completion: Promise.resolve({
+        completion: options.promptCompletion ?? Promise.resolve({
           output: [{ text: "hello from runtime", type: "text" }],
           outputText: "hello from runtime",
           turnId: "turn-1",
         }),
-        events: createTurnEvents(options.textEventCount),
+        events: createTurnEvents(options.textEventCount, options.promptCompletion),
         turnId: "turn-1",
       }),
-      stream: () => createTurnEvents(options.textEventCount),
+      stream: () => createTurnEvents(options.textEventCount, options.promptCompletion),
     },
   } as unknown as AcpRuntimeSession;
 }
@@ -1363,7 +1511,14 @@ function bindNativeRelaySockets(input: {
   });
 }
 
-async function* createTurnEvents(textEventCount = 1) {
+async function* createTurnEvents(
+  textEventCount = 1,
+  completion?: Promise<{
+    output: { text: string; type: "text" }[];
+    outputText: string;
+    turnId: string;
+  }>,
+) {
   yield {
     turnId: "turn-1",
     type: AcpRuntimeTurnEventType.Started,
@@ -1375,10 +1530,16 @@ async function* createTurnEvents(textEventCount = 1) {
       type: AcpRuntimeTurnEventType.Text,
     };
   }
+  const completed = await (completion ??
+    Promise.resolve({
+      output: [{ text: "hello from runtime", type: "text" }],
+      outputText: "hello from runtime",
+      turnId: "turn-1",
+    }));
   yield {
-    output: [{ text: "hello from runtime", type: "text" }],
-    outputText: "hello from runtime",
-    turnId: "turn-1",
+    output: completed.output,
+    outputText: completed.outputText,
+    turnId: completed.turnId,
     type: AcpRuntimeTurnEventType.Completed,
   };
 }

@@ -92,8 +92,43 @@ export async function validateRelaySession(input: {
   }
 }
 
-export async function loginViaOAuth(relayUrl: string): Promise<DaemonSession> {
+export type OAuthLoginOptions = {
+  openBrowser?: (url: string) => Promise<void>;
+  timeoutMs?: number;
+};
+
+export async function loginViaOAuth(
+  relayUrl: string,
+  options: OAuthLoginOptions = {},
+): Promise<DaemonSession> {
   return new Promise((resolve, reject) => {
+    let completed = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (completed) {
+        return false;
+      }
+      completed = true;
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      try {
+        server.close();
+      } catch {
+        // Server may not have reached the listening state on early bind errors.
+      }
+      return true;
+    };
+    const resolveLogin = (session: DaemonSession) => {
+      if (cleanup()) {
+        resolve(session);
+      }
+    };
+    const rejectLogin = (error: Error) => {
+      if (cleanup()) {
+        reject(error);
+      }
+    };
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
       const addr = server.address();
       const localPort = typeof addr === "object" && addr ? addr.port : 0;
@@ -105,7 +140,7 @@ export async function loginViaOAuth(relayUrl: string): Promise<DaemonSession> {
         if (!token || !accountId) {
           res.writeHead(400, { "Content-Type": "text/html" });
           res.end("<h1>Login failed</h1><p>Missing token in callback.</p>");
-          reject(new Error("OAuth callback missing token."));
+          rejectLogin(new Error("OAuth callback missing token."));
           return;
         }
 
@@ -120,8 +155,7 @@ export async function loginViaOAuth(relayUrl: string): Promise<DaemonSession> {
           savedAt: Date.now(),
           token,
         };
-        server.close();
-        resolve(session);
+        resolveLogin(session);
         return;
       }
 
@@ -133,7 +167,7 @@ export async function loginViaOAuth(relayUrl: string): Promise<DaemonSession> {
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
       if (typeof addr === "string" || !addr) {
-        reject(new Error("Failed to bind local OAuth server."));
+        rejectLogin(new Error("Failed to bind local OAuth server."));
         return;
       }
       const port = addr.port;
@@ -144,19 +178,21 @@ export async function loginViaOAuth(relayUrl: string): Promise<DaemonSession> {
       loginUrl.searchParams.set("returnTo", callbackUrl);
 
       process.stderr.write(`Opening browser for login: ${loginUrl.toString()}\n`);
-      openBrowser(loginUrl.toString()).catch((err) => {
+      (options.openBrowser ?? openBrowser)(loginUrl.toString()).catch((err) => {
         process.stderr.write(
           `Could not open browser automatically: ${err instanceof Error ? err.message : err}\n` +
           `Please open this URL manually: ${loginUrl.toString()}\n`,
         );
       });
     });
+    server.on("error", (error) => {
+      rejectLogin(error instanceof Error ? error : new Error(String(error)));
+    });
 
     // Timeout after 5 minutes
-    setTimeout(() => {
-      server.close();
-      reject(new Error("OAuth login timed out after 5 minutes."));
-    }, 5 * 60 * 1000);
+    timeout = setTimeout(() => {
+      rejectLogin(new Error("OAuth login timed out after 5 minutes."));
+    }, options.timeoutMs ?? 5 * 60 * 1000);
   });
 }
 

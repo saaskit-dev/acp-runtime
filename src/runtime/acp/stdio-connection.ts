@@ -58,6 +58,27 @@ type StdioOperationTracker = {
   summary(): string | undefined;
 };
 
+type StdioProcessLifecycleContext = {
+  agent: AcpRuntimeAgent;
+  cwd: string;
+  pid?: number;
+  startedAt: number;
+  traceContext?: import("@opentelemetry/api").Context;
+};
+
+type StdioProcessLifecycleLogInput = StdioProcessLifecycleContext & {
+  body: string;
+  eventName: string;
+  exitCode?: number | null;
+  exitClassification?: string;
+  exitKillCalled?: boolean;
+  exitSignal?: NodeJS.Signals | null;
+  operationSummary?: string;
+  severityNumber?: SeverityNumber;
+  signal?: NodeJS.Signals;
+  stderrTail?: string;
+};
+
 export function createStdioAcpConnectionFactory(
   options: StdioFactoryOptions = {},
 ): AcpConnectionFactory {
@@ -75,6 +96,19 @@ export function createStdioAcpConnectionFactory(
     });
     await waitForSpawn(spawnedChild);
     const child = requireAgentStdio(spawnedChild);
+    const processStartedAt = Date.now();
+    const lifecycleContext = {
+      agent: input.agent,
+      cwd: input.cwd,
+      pid: child.pid ?? undefined,
+      startedAt: processStartedAt,
+      traceContext: input.traceContext,
+    };
+    emitStdioProcessLifecycleLog({
+      ...lifecycleContext,
+      body: "ACP stdio process spawned.",
+      eventName: "acp.stdio.process.spawned",
+    });
 
     const stderrChunks: string[] = [];
     if (child.stderr) {
@@ -107,10 +141,34 @@ export function createStdioAcpConnectionFactory(
         command: input.agent.command,
         cwd: input.cwd,
         pid: child.pid ?? undefined,
+        startedAt: processStartedAt,
       },
       stderrChunks,
       () => disposing,
       () => operationTracker.summary(),
+      (code, signal, expected) => {
+        const stderrTail = trimStderrTail(stderrChunks.join("").trim());
+        emitStdioProcessLifecycleLog({
+          ...lifecycleContext,
+          body: expected
+            ? "ACP stdio process exited during expected cleanup."
+            : "ACP stdio process exited unexpectedly.",
+          eventName: expected
+            ? "acp.stdio.process.exit.expected"
+            : "acp.stdio.process.exit.unexpected",
+          exitClassification: classifyStdioProcessExit({
+            expected,
+            killCalled: child.killed,
+            signal,
+          }),
+          exitCode: code,
+          exitKillCalled: child.killed,
+          exitSignal: signal,
+          operationSummary: operationTracker.summary(),
+          severityNumber: expected ? SeverityNumber.DEBUG : SeverityNumber.ERROR,
+          stderrTail,
+        });
+      },
     );
     void onExit.catch((error) => {
       emitRuntimeSuppressedError({
@@ -140,22 +198,34 @@ export function createStdioAcpConnectionFactory(
       connection,
       async dispose() {
         disposing = true;
+        emitStdioProcessLifecycleLog({
+          ...lifecycleContext,
+          body: "ACP stdio process dispose started.",
+          eventName: "acp.stdio.process.dispose.started",
+          operationSummary: operationTracker.summary(),
+          severityNumber: SeverityNumber.DEBUG,
+        });
         try {
-          await terminateAgentProcess(child, (operation, error) => {
-            emitRuntimeSuppressedError({
-              attributes: {
-                "acp.agent.command": input.agent.command,
-                "acp.agent.type": input.agent.type,
-                "acp.process.cleanup.operation": operation,
-                "acp.process.pid": child.pid ?? undefined,
-                "acp.session.cwd": input.cwd,
-              },
-              body: "ACP stdio process cleanup failed.",
-              context: input.traceContext,
-              eventName: "acp.stdio.process.cleanup.failed",
-              exception: error,
-            });
-          });
+          await terminateAgentProcess(
+            child,
+            lifecycleContext,
+            operationTracker,
+            (operation, error) => {
+              emitRuntimeSuppressedError({
+                attributes: {
+                  "acp.agent.command": input.agent.command,
+                  "acp.agent.type": input.agent.type,
+                  "acp.process.cleanup.operation": operation,
+                  "acp.process.pid": child.pid ?? undefined,
+                  "acp.session.cwd": input.cwd,
+                },
+                body: "ACP stdio process cleanup failed.",
+                context: input.traceContext,
+                eventName: "acp.stdio.process.cleanup.failed",
+                exception: error,
+              });
+            },
+          );
           await onExit.catch((error) => {
             emitRuntimeSuppressedError({
               attributes: {
@@ -171,6 +241,13 @@ export function createStdioAcpConnectionFactory(
             });
           });
         } finally {
+          emitStdioProcessLifecycleLog({
+            ...lifecycleContext,
+            body: "ACP stdio process dispose finished.",
+            eventName: "acp.stdio.process.dispose.finished",
+            operationSummary: operationTracker.summary(),
+            severityNumber: SeverityNumber.DEBUG,
+          });
           detachAgentHandles(child);
         }
       },
@@ -750,29 +827,45 @@ function createExitWatcher(
     command: string;
     cwd: string;
     pid?: number;
+    startedAt: number;
   },
   stderrChunks: string[],
   isExpectedExit: () => boolean,
   getActiveOperationSummary: () => string | undefined,
+  onExit: (
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    expected: boolean,
+  ) => void,
 ): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     child.once("error", reject);
     child.once("close", (code, signal) => {
-      if (isExpectedExit()) {
+      const expected = isExpectedExit();
+      onExit(code, signal, expected);
+      if (expected) {
         resolve();
         return;
       }
 
       const stderr = stderrChunks.join("").trim();
+      const classification = classifyStdioProcessExit({
+        expected,
+        killCalled: child.killed,
+        signal,
+      });
       reject(
         formatUnexpectedStdioExitError({
           activeOperationSummary: getActiveOperationSummary(),
           code,
           command: context.command,
           cwd: context.cwd,
+          exitClassification: classification,
+          killCalled: child.killed,
           pid: context.pid,
           signal,
           stderr,
+          uptimeMs: Date.now() - context.startedAt,
         }),
       );
     });
@@ -795,10 +888,67 @@ function createStdioOperationTracker(): StdioOperationTracker {
       counts.delete(operation);
     },
     summary() {
-      const active = [...counts.keys()];
+      const active = [...counts.entries()].map(([operation, count]) =>
+        count > 1 ? `${operation}:${count}` : operation,
+      );
       return active.length > 0 ? active.join(",") : undefined;
     },
   };
+}
+
+function classifyStdioProcessExit(input: {
+  expected: boolean;
+  killCalled: boolean;
+  signal: NodeJS.Signals | null;
+}): string {
+  if (input.expected) {
+    return "expected_cleanup";
+  }
+  if (input.signal === "SIGKILL" && !input.killCalled) {
+    return "external_sigkill_or_os_oom";
+  }
+  if (input.signal && !input.killCalled) {
+    return "external_signal";
+  }
+  if (input.killCalled) {
+    return "runtime_requested_kill";
+  }
+  return "unexpected_exit";
+}
+
+export function emitStdioProcessLifecycleLog(
+  input: StdioProcessLifecycleLogInput,
+): void {
+  const memory = process.memoryUsage();
+  emitRuntimeLog({
+    attributes: {
+      "acp.agent.command": input.agent.command,
+      "acp.agent.args.count": input.agent.args?.length,
+      "acp.agent.env.keys": input.agent.env
+        ? Object.keys(input.agent.env).sort().join(",")
+        : undefined,
+      "acp.agent.type": input.agent.type,
+      "acp.process.exit.classification": input.exitClassification,
+      "acp.process.exit.code": input.exitCode ?? undefined,
+      "acp.process.exit.kill_called": input.exitKillCalled,
+      "acp.process.exit.signal": input.exitSignal ?? undefined,
+      "acp.process.operation.active": input.operationSummary,
+      "acp.process.pid": input.pid,
+      "acp.process.signal": input.signal,
+      "acp.process.stderr.tail": input.stderrTail,
+      "acp.process.uptime_ms": Math.max(0, Date.now() - input.startedAt),
+      "acp.runtime.memory.array_buffers_bytes": memory.arrayBuffers,
+      "acp.runtime.memory.external_bytes": memory.external,
+      "acp.runtime.memory.heap_total_bytes": memory.heapTotal,
+      "acp.runtime.memory.heap_used_bytes": memory.heapUsed,
+      "acp.runtime.memory.rss_bytes": memory.rss,
+      "acp.session.cwd": input.cwd,
+    },
+    body: input.body,
+    context: input.traceContext,
+    eventName: input.eventName,
+    severityNumber: input.severityNumber ?? SeverityNumber.INFO,
+  });
 }
 
 export function formatUnexpectedStdioExitError(input: {
@@ -806,9 +956,12 @@ export function formatUnexpectedStdioExitError(input: {
   code: number | null;
   command: string;
   cwd: string;
+  exitClassification?: string;
+  killCalled?: boolean;
   pid?: number;
   signal: NodeJS.Signals | null;
   stderr?: string;
+  uptimeMs?: number;
 }): Error {
   const parts = [
     "ACP stdio process exited unexpectedly",
@@ -825,6 +978,15 @@ export function formatUnexpectedStdioExitError(input: {
 
   parts.push(`code=${input.code}`);
   parts.push(`signal=${input.signal}`);
+  if (input.killCalled !== undefined) {
+    parts.push(`killCalled=${input.killCalled}`);
+  }
+  if (input.exitClassification) {
+    parts.push(`classification=${input.exitClassification}`);
+  }
+  if (input.uptimeMs !== undefined) {
+    parts.push(`uptimeMs=${Math.max(0, Math.round(input.uptimeMs))}`);
+  }
 
   const stderrTail = trimStderrTail(input.stderr);
   if (stderrTail) {
@@ -920,10 +1082,19 @@ function waitForChildExit(
 
 async function terminateAgentProcess(
   child: AgentProcess,
+  lifecycleContext: StdioProcessLifecycleContext,
+  operationTracker: StdioOperationTracker,
   onCleanupError: (operation: string, error: unknown) => void = () => {},
 ): Promise<void> {
   if (!child.stdin.destroyed) {
     try {
+      emitStdioProcessLifecycleLog({
+        ...lifecycleContext,
+        body: "ACP stdio process stdin end requested.",
+        eventName: "acp.stdio.process.stdin.end",
+        operationSummary: operationTracker.summary(),
+        severityNumber: SeverityNumber.DEBUG,
+      });
       child.stdin.end();
     } catch (error) {
       onCleanupError("stdin.end", error);
@@ -936,6 +1107,13 @@ async function terminateAgentProcess(
   );
   if (!exited && isChildProcessRunning(child)) {
     try {
+      emitStdioProcessLifecycleLog({
+        ...lifecycleContext,
+        body: "ACP stdio process SIGTERM sent.",
+        eventName: "acp.stdio.process.kill.sent",
+        operationSummary: operationTracker.summary(),
+        signal: "SIGTERM",
+      });
       child.kill("SIGTERM");
     } catch (error) {
       onCleanupError("kill.SIGTERM", error);
@@ -945,6 +1123,14 @@ async function terminateAgentProcess(
 
   if (!exited && isChildProcessRunning(child)) {
     try {
+      emitStdioProcessLifecycleLog({
+        ...lifecycleContext,
+        body: "ACP stdio process SIGKILL sent.",
+        eventName: "acp.stdio.process.kill.sent",
+        operationSummary: operationTracker.summary(),
+        severityNumber: SeverityNumber.WARN,
+        signal: "SIGKILL",
+      });
       child.kill("SIGKILL");
     } catch (error) {
       onCleanupError("kill.SIGKILL", error);

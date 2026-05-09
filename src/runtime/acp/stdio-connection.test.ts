@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { AnyMessage } from "@agentclientprotocol/sdk";
 
 import {
+  emitStdioProcessLifecycleLog,
   formatUnexpectedStdioExitError,
   emitAcpProtocolMessageLog,
   nodeReadableToWeb,
@@ -234,15 +235,68 @@ describe("stdio stream bridges", () => {
 });
 
 describe("stdio process exit diagnostics", () => {
+  it("emits process lifecycle logs with pid, operation, and memory context", () => {
+    emitStdioProcessLifecycleLog({
+      agent: {
+        args: ["--stdio"],
+        command: "codex-acp",
+        env: {
+          CODEX_HOME: "/tmp/codex",
+          SECRET_VALUE: "redacted-value",
+        },
+        type: "codex-acp",
+      },
+      body: "ACP stdio process exited unexpectedly.",
+      cwd: "/tmp/project",
+      eventName: "acp.stdio.process.exit.unexpected",
+      exitClassification: "external_sigkill_or_os_oom",
+      exitCode: null,
+      exitKillCalled: false,
+      exitSignal: "SIGKILL",
+      operationSummary: "prompt",
+      pid: 4242,
+      severityNumber: 17,
+      startedAt: Date.now() - 1_000,
+      stderrTail: "last stderr line",
+    });
+
+    const records = testLogExporter.getFinishedLogRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]?.eventName).toBe("acp.stdio.process.exit.unexpected");
+    expect(records[0]?.severityText).toBe("ERROR");
+    expect(records[0]?.attributes).toMatchObject({
+      "acp.agent.args.count": 1,
+      "acp.agent.command": "codex-acp",
+      "acp.agent.env.keys": "CODEX_HOME,SECRET_VALUE",
+      "acp.agent.type": "codex-acp",
+      "acp.process.exit.classification": "external_sigkill_or_os_oom",
+      "acp.process.exit.kill_called": false,
+      "acp.process.exit.signal": "SIGKILL",
+      "acp.process.operation.active": "prompt",
+      "acp.process.pid": 4242,
+      "acp.process.stderr.tail": "last stderr line",
+      "acp.session.cwd": "/tmp/project",
+    });
+    expect(
+      records[0]?.attributes?.["acp.process.uptime_ms"],
+    ).toBeGreaterThanOrEqual(0);
+    expect(
+      records[0]?.attributes?.["acp.runtime.memory.rss_bytes"],
+    ).toBeGreaterThan(0);
+  });
+
   it("includes lifecycle context in unexpected exit errors", () => {
     const error = formatUnexpectedStdioExitError({
       activeOperationSummary: "initialize",
       code: 1,
       command: "claude-agent-acp",
       cwd: "/tmp/project",
+      exitClassification: "unexpected_exit",
+      killCalled: false,
       pid: 4242,
       signal: null,
       stderr: "boot failed",
+      uptimeMs: 1234,
     });
 
     expect(error.message).toContain("ACP stdio process exited unexpectedly");
@@ -252,7 +306,29 @@ describe("stdio process exit diagnostics", () => {
     expect(error.message).toContain("pid=4242");
     expect(error.message).toContain("code=1");
     expect(error.message).toContain("signal=null");
+    expect(error.message).toContain("killCalled=false");
+    expect(error.message).toContain("classification=unexpected_exit");
+    expect(error.message).toContain("uptimeMs=1234");
     expect(error.message).toContain('stderr="boot failed"');
+  });
+
+  it("classifies external SIGKILL exits in diagnostics", () => {
+    const error = formatUnexpectedStdioExitError({
+      activeOperationSummary: "prompt",
+      code: null,
+      command: "codex-acp",
+      cwd: "/tmp/project",
+      exitClassification: "external_sigkill_or_os_oom",
+      killCalled: false,
+      signal: "SIGKILL",
+    });
+
+    expect(error.message).toContain("during prompt");
+    expect(error.message).toContain("signal=SIGKILL");
+    expect(error.message).toContain("killCalled=false");
+    expect(error.message).toContain(
+      "classification=external_sigkill_or_os_oom",
+    );
   });
 
   it("reports idle exits without stderr", () => {

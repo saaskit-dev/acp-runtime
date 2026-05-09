@@ -10,10 +10,27 @@ databases, or manually provision control-plane records.
 
 The default hosted relay is `relay.saaskit.app`.
 
-## Install Package
+## Install From Source
+
+Recommended one-command install:
 
 ```bash
-npm install -g @saaskit-dev/acp-runtime
+curl -fsSL https://raw.githubusercontent.com/saaskit-dev/acp-runtime/main/scripts/install.sh | bash
+```
+
+The script clones the source repository, builds it, installs the CLI globally
+from that source checkout, then runs `acp-runtime auth login`. On a fresh macOS
+login, that installs the default user daemon if no daemon service exists. From a
+local checkout, run the same script directly to build and install that checkout:
+
+```bash
+./scripts/install.sh
+```
+
+Use `--system` when this machine should use the boot-time system daemon:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/saaskit-dev/acp-runtime/main/scripts/install.sh | bash -s -- --system
 ```
 
 This installs one command with remote subcommands:
@@ -23,9 +40,9 @@ This installs one command with remote subcommands:
 - `acp-runtime bridge`: a generic stdio ACP bridge for clients that cannot connect
   to the relay WebSocket directly.
 
-Package install does not register a background daemon by itself. First-time
-service registration is explicit because it creates a long-running local
-process, may open browser login, and may need launchd or sudo privileges.
+Source install does not register a background daemon by itself. First-time
+service registration happens through `auth login` because it may open browser
+login and may need launchd or sudo privileges.
 
 ## Sign In
 
@@ -56,11 +73,16 @@ macOS prompts for sudo:
 acp-runtime auth login --force
 ```
 
-## Install Daemon
+## Advanced: Install Daemon
 
 ```bash
 acp-runtime daemon install
 ```
+
+Most users do not need to run this command directly; `auth login` handles the
+default user daemon after a fresh login. `daemon install` remains useful for
+system mode, changing relay/workspace options, and repairing or rewriting the
+launchd plist.
 
 If no cached session exists, daemon install still opens browser login for
 backward compatibility. In the normal fresh-login flow, `auth login` installs
@@ -79,7 +101,7 @@ On macOS, `install` registers a user LaunchAgent and starts it immediately. It
 runs at login and is restarted by launchd after both successful and failed
 exits. It also reconnects to the relay with backoff after transient network
 failures. `acp-runtime daemon stop` unloads the LaunchAgent so it stays stopped
-until `start` or `install` loads it again.
+until `restart` or `install` loads it again.
 
 If the daemon must start at system boot before the user logs in, install the
 optional system LaunchDaemon:
@@ -93,7 +115,7 @@ System install writes `/Library/LaunchDaemons/dev.saaskit.acp-runtime.daemon.pli
 and runs the daemon as `SUDO_USER` by default, so it can read that user's cached
 `~/.acp/relay-session.json` and write logs under that user's home directory. Use
 `--user` or `--home-dir` only when overriding that detected default. After a
-service is installed, `status`, `start`, `stop`, and `uninstall` auto-detect the
+service is installed, `status`, `restart`, `stop`, and `uninstall` auto-detect the
 installed mode. `--system` is only needed to force system mode or resolve an
 unexpected conflict. Commands that modify the system service automatically
 re-run through `sudo`, so macOS prompts for a password when needed.
@@ -107,7 +129,7 @@ Useful daemon commands:
 ```bash
 acp-runtime daemon status
 acp-runtime daemon stop
-acp-runtime daemon start
+acp-runtime daemon restart
 acp-runtime daemon uninstall
 acp-runtime daemon run
 ```
@@ -119,17 +141,17 @@ service.
 
 If a daemon service is already installed, the running daemon watches its own
 executable path and exits when that file changes. Because launchd has
-`KeepAlive`, it restarts with the upgraded code after a normal global npm
-upgrade that replaces the same command path:
+`KeepAlive`, it restarts with the upgraded code after a source reinstall that
+replaces the same command path:
 
 ```bash
-npm install -g @saaskit-dev/acp-runtime@latest
+curl -fsSL https://raw.githubusercontent.com/saaskit-dev/acp-runtime/main/scripts/install.sh | bash -s -- --no-login
 acp-runtime daemon status
 ```
 
-Run `daemon install` again only when installing for the first time, switching
-between user and system mode, changing workspace roots or relay options, or
-when the global npm command path itself changed and the plist must be rewritten:
+Run `daemon install` again only when switching between user and system mode,
+changing workspace roots or relay options, or when the global command path
+itself changed and the plist must be rewritten:
 
 ```bash
 acp-runtime daemon install
@@ -138,15 +160,15 @@ acp-runtime daemon install
 For the optional boot-time service, use:
 
 ```bash
-npm install -g @saaskit-dev/acp-runtime@latest
+curl -fsSL https://raw.githubusercontent.com/saaskit-dev/acp-runtime/main/scripts/install.sh | bash -s -- --no-login
 acp-runtime daemon install --system
 acp-runtime daemon status
 ```
 
 `install` rewrites the plist and kickstarts launchd, so the next daemon process
-uses the newly installed global package path. `daemon start` only reloads an
-existing plist; use `install` after upgrades that change service configuration
-or command path.
+uses the newly installed global package path. `daemon restart` force-loads and
+kickstarts an existing plist; use `install` after upgrades that change service
+configuration or command path.
 
 ## Configure Stdio Clients
 
@@ -155,15 +177,38 @@ bridge with the relay URL in the environment:
 
 ```json
 {
-  "command": "acp-runtime",
-  "args": ["bridge", "run"]
+  "command": "/absolute/path/to/acp-runtime",
+  "args": ["bridge", "run"],
+  "env": {
+    "ACP_RELAY_URL": "wss://relay.saaskit.app"
+  }
 }
 ```
 
-The bridge can print this generic config:
+The bridge can print this generic config. By default it resolves the installed
+`acp-runtime` command to an absolute path with `command -v acp-runtime`; use
+`--command <path>` to override it:
 
 ```bash
 acp-runtime bridge config
+```
+
+For Zed, generate the custom agent config with `--zed` and place it under
+`agent_servers` in Zed settings:
+
+```bash
+acp-runtime bridge config --zed
+```
+
+```json
+{
+  "type": "custom",
+  "command": "/absolute/path/to/acp-runtime",
+  "args": ["bridge", "run"],
+  "env": {
+    "ACP_RELAY_URL": "wss://relay.saaskit.app"
+  }
+}
 ```
 
 Direct WebSocket-capable ACP clients should connect to

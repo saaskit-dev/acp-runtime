@@ -12,7 +12,7 @@ import {
 import {
   getAcpRemoteDaemonUserServiceStatus,
   installAcpRemoteDaemonUserService,
-  startAcpRemoteDaemonUserService,
+  restartAcpRemoteDaemonUserService,
 } from "./daemon/service.js";
 import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
@@ -190,7 +190,7 @@ async function ensureDefaultDaemonInstalled(
     if (userStatus.running) {
       return `Daemon service already installed: running (${userStatus.plistPath})`;
     }
-    const started = await startAcpRemoteDaemonUserService(
+    const started = await restartAcpRemoteDaemonUserService(
       undefined,
       "user",
       homeDir,

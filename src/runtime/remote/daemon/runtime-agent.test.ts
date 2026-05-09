@@ -9,11 +9,16 @@ import {
 import { describe, expect, it } from "vitest";
 
 import { AcpProcessError } from "../../core/errors.js";
-import { AcpRuntimeTurnEventType } from "../../core/types.js";
+import {
+  AcpRuntimeThreadEntryKind,
+  AcpRuntimeThreadEntryStatus,
+  AcpRuntimeTurnEventType,
+} from "../../core/types.js";
 import type { AcpRuntimeSession } from "../../core/session.js";
 import type {
   AcpRuntimeHistoryEntry,
   AcpRuntimePrompt,
+  AcpRuntimeThreadEntry,
 } from "../../core/types.js";
 import { createAcpRemoteRuntimeAgent } from "./runtime-agent.js";
 
@@ -328,6 +333,149 @@ describe("AcpRemoteRuntimeAgent", () => {
         update: {
           content: { text: "previous assistant message", type: "text" },
           sessionUpdate: "agent_message_chunk",
+        },
+      },
+    ]);
+  });
+
+  it("replays active session thread entries when one-shot load history is drained", async () => {
+    const streams = createStreamPair();
+    const notifications: unknown[] = [];
+    let loadCalls = 0;
+    const session = createFakeRuntimeSession({
+      id: "active-runtime-session",
+      onPrompt() {},
+      threadEntries: [
+        {
+          id: "user-1",
+          kind: AcpRuntimeThreadEntryKind.UserMessage,
+          text: "active user message",
+          turnId: "turn-active",
+        },
+        {
+          id: "assistant-1",
+          kind: AcpRuntimeThreadEntryKind.AssistantMessage,
+          status: AcpRuntimeThreadEntryStatus.Completed,
+          text: "active assistant message",
+          turnId: "turn-active",
+        },
+        {
+          content: [
+            {
+              id: "content-1",
+              kind: "content",
+              text: "tool output",
+            },
+          ],
+          id: "tool-1",
+          kind: AcpRuntimeThreadEntryKind.ToolCall,
+          status: AcpRuntimeThreadEntryStatus.Completed,
+          title: "Read file",
+          toolCallId: "tool-1",
+          toolKind: "read",
+          turnId: "turn-active",
+        },
+      ],
+    });
+    session.state.history.drain();
+    const runtime = {
+      sessions: {
+        async list() {
+          return { sessions: [] };
+        },
+        async load() {
+          loadCalls += 1;
+          return session;
+        },
+        async resume() {
+          throw new Error("load should restore active session");
+        },
+        async start() {
+          throw new Error("load should not start a new session");
+        },
+      },
+    };
+
+    const agentConnection = new AgentSideConnection(
+      (connection) =>
+        createAcpRemoteRuntimeAgent({
+          connection,
+          options: {
+            agent: {
+              command: "fake-agent",
+              type: "fake",
+            },
+            runtime,
+            workspaceRoots: ["/workspace"],
+          },
+        }),
+      streams.server,
+    );
+    void agentConnection.closed.catch(() => {});
+
+    const clientConnection = new ClientSideConnection(
+      () =>
+        ({
+          async requestPermission() {
+            return {
+              outcome: {
+                optionId: "allow_once",
+                outcome: "selected",
+              },
+            };
+          },
+          async sessionUpdate(params) {
+            notifications.push(params);
+          },
+        }) satisfies Client,
+      streams.client,
+    );
+    void clientConnection.closed.catch(() => {});
+
+    await clientConnection.initialize({
+      clientCapabilities: {},
+      protocolVersion: PROTOCOL_VERSION,
+    });
+
+    const loaded = await clientConnection.loadSession({
+      cwd: "/workspace",
+      mcpServers: [],
+      sessionId: "zed-active-session",
+    });
+
+    expect(loaded.sessionId).toBe("active-runtime-session");
+    expect(loadCalls).toBe(1);
+    expect(notifications).toEqual([
+      {
+        sessionId: "zed-active-session",
+        update: {
+          content: { text: "active user message", type: "text" },
+          sessionUpdate: "user_message_chunk",
+        },
+      },
+      {
+        sessionId: "zed-active-session",
+        update: {
+          content: { text: "active assistant message", type: "text" },
+          sessionUpdate: "agent_message_chunk",
+        },
+      },
+      {
+        sessionId: "zed-active-session",
+        update: {
+          content: [
+            {
+              content: { text: "tool output", type: "text" },
+              type: "content",
+            },
+          ],
+          kind: "read",
+          rawInput: undefined,
+          rawOutput: undefined,
+          sessionUpdate: "tool_call",
+          status: "completed",
+          title: "Read file",
+          toolCallId: "tool-1",
         },
       },
     ]);
@@ -899,6 +1047,7 @@ function createFakeRuntimeSession(input: {
   history?: readonly AcpRuntimeHistoryEntry[];
   id?: string;
   onPrompt(prompt: AcpRuntimePrompt): void;
+  threadEntries?: readonly AcpRuntimeThreadEntry[];
 }): AcpRuntimeSession {
   const id = input.id ?? "runtime-session-1";
   let historyDrained = false;
@@ -946,6 +1095,9 @@ function createFakeRuntimeSession(input: {
           historyDrained = true;
           return input.history ?? [];
         },
+      },
+      thread: {
+        entries: () => input.threadEntries ?? [],
       },
     } as AcpRuntimeSession["state"],
     status: "ready",

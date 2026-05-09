@@ -7,10 +7,27 @@ Cloudflare、不需要创建 D1 database，也不需要手工 provision control-
 
 默认托管 relay 是 `relay.saaskit.app`。
 
-## 安装包
+## 从源码安装
+
+推荐的一条命令安装：
 
 ```bash
-npm install -g @saaskit-dev/acp-runtime
+curl -fsSL https://raw.githubusercontent.com/saaskit-dev/acp-runtime/main/scripts/install.sh | bash
+```
+
+这个脚本会 clone 源码仓库、构建源码、从该源码 checkout 全局安装 CLI，然后执行
+`acp-runtime auth login`。在 macOS 上，如果这是新登录并且还没有 daemon service，会
+安装默认 user daemon。本地 checkout 里也可以直接运行同一个脚本，它会构建并安装当前
+checkout：
+
+```bash
+./scripts/install.sh
+```
+
+如果这台机器要使用开机级 system daemon，使用：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/saaskit-dev/acp-runtime/main/scripts/install.sh | bash -s -- --system
 ```
 
 安装后会有一个命令和 remote 子命令：
@@ -20,8 +37,8 @@ npm install -g @saaskit-dev/acp-runtime
 - `acp-runtime bridge`：通用 stdio ACP bridge，给不能直连 relay WebSocket 的 client
   使用。
 
-npm 包安装本身不会自动注册后台 daemon。首次注册 service 是显式步骤，因为它会创建
-一个长期运行的本地进程，可能打开浏览器登录，也可能需要 launchd 或 sudo 权限。
+源码安装本身不会自动注册后台 daemon。首次注册 service 通过 `auth login` 触发，因为
+它可能打开浏览器登录，也可能需要 launchd 或 sudo 权限。
 
 ## 登录
 
@@ -49,11 +66,15 @@ system reinstall 路径，macOS 会提示输入 sudo 密码：
 acp-runtime auth login --force
 ```
 
-## 安装 Daemon
+## 高级：安装 Daemon
 
 ```bash
 acp-runtime daemon install
 ```
+
+大多数用户不需要直接运行这个命令；新登录后，`auth login` 会处理默认 user daemon。
+`daemon install` 主要保留给 system mode、修改 relay/workspace 参数，以及修复或重写
+launchd plist。
 
 为了兼容旧流程，如果没有登录缓存，daemon install 仍然会打开浏览器登录。正常新登录
 流程里，如果没有 service，`auth login` 会安装默认 user daemon，所以 `daemon install`
@@ -68,7 +89,7 @@ root。只有需要覆盖默认值时才使用 `--relay-url` 或 `--workspace-ro
 在 macOS 上，`install` 会注册 user LaunchAgent 并立即启动。它会在用户登录时自动
 启动，正常退出和异常退出后都会由 launchd 拉起；网络或 relay 短暂断开后，daemon
 自身也会用退避策略自动重连。`acp-runtime daemon stop` 会 unload LaunchAgent，所以会
-保持停止，直到再次执行 `start` 或 `install`。
+保持停止，直到再次执行 `restart` 或 `install`。
 
 如果 daemon 必须在系统启动时、用户登录前就拉起，可以安装可选的 system
 LaunchDaemon：
@@ -82,7 +103,7 @@ system install 会写入
 `/Library/LaunchDaemons/dev.saaskit.acp-runtime.daemon.plist`，默认让 daemon 以
 `SUDO_USER` 身份运行，这样它可以读取该用户的 `~/.acp/relay-session.json` 登录缓存，
 并把日志写到该用户 home 下。只有需要覆盖自动检测结果时才使用 `--user` 或
-`--home-dir`。service 安装后，`status`、`start`、`stop` 和 `uninstall` 会自动判断当前
+`--home-dir`。service 安装后，`status`、`restart`、`stop` 和 `uninstall` 会自动判断当前
 安装模式。只有需要强制 system mode，或处理异常冲突时才需要 `--system`。会修改
 system service 的命令会自动通过 `sudo` 重新执行，所以需要权限时 macOS 会提示输入
 密码。
@@ -96,7 +117,7 @@ sudo。
 ```bash
 acp-runtime daemon status
 acp-runtime daemon stop
-acp-runtime daemon start
+acp-runtime daemon restart
 acp-runtime daemon uninstall
 acp-runtime daemon run
 ```
@@ -105,17 +126,17 @@ acp-runtime daemon run
 
 ## 升级 Daemon
 
-如果 daemon service 已经安装，运行中的 daemon 会监控自己的可执行文件路径；当该文件
-被 npm 全局升级替换后，daemon 会退出。由于 launchd 配了 `KeepAlive`，它会自动用升级
-后的代码重新拉起：
+如果 daemon service 已经安装，运行中的 daemon 会监控自己的可执行文件路径；源码重新
+安装替换同一路径后，daemon 会退出。由于 launchd 配了 `KeepAlive`，它会自动用升级后
+的代码重新拉起：
 
 ```bash
-npm install -g @saaskit-dev/acp-runtime@latest
+curl -fsSL https://raw.githubusercontent.com/saaskit-dev/acp-runtime/main/scripts/install.sh | bash -s -- --no-login
 acp-runtime daemon status
 ```
 
-只有首次安装、切换 user/system 模式、修改 workspace root 或 relay 参数，或者全局
-npm 命令路径本身变化、需要重写 plist 时，才需要重新执行：
+只有切换 user/system 模式、修改 workspace root 或 relay 参数，或者全局命令路径本身
+变化、需要重写 plist 时，才需要重新执行：
 
 ```bash
 acp-runtime daemon install
@@ -124,14 +145,14 @@ acp-runtime daemon install
 如果使用开机级 system service，则使用：
 
 ```bash
-npm install -g @saaskit-dev/acp-runtime@latest
+curl -fsSL https://raw.githubusercontent.com/saaskit-dev/acp-runtime/main/scripts/install.sh | bash -s -- --no-login
 acp-runtime daemon install --system
 acp-runtime daemon status
 ```
 
 `install` 会重写 plist 并 kickstart launchd，所以新的 daemon 进程会使用刚安装的全局
-包路径。`daemon start` 只加载已有 plist；升级后如果 service 配置或命令路径变化，应
-使用 `install`。
+包路径。`daemon restart` 会强制加载并 kickstart 已有 plist；升级后如果 service 配置或
+命令路径变化，应使用 `install`。
 
 ## 配置 Stdio Client
 
@@ -140,15 +161,37 @@ relay URL：
 
 ```json
 {
-  "command": "acp-runtime",
-  "args": ["bridge", "run"]
+  "command": "/absolute/path/to/acp-runtime",
+  "args": ["bridge", "run"],
+  "env": {
+    "ACP_RELAY_URL": "wss://relay.saaskit.app"
+  }
 }
 ```
 
-bridge 可以输出这个通用配置：
+bridge 可以输出这个通用配置。默认会用 `command -v acp-runtime` 把已安装的
+`acp-runtime` 解析成绝对路径；也可以用 `--command <path>` 手动覆盖：
 
 ```bash
 acp-runtime bridge config
+```
+
+Zed 使用 `--zed` 生成 custom agent 配置，并放到 Zed settings 的
+`agent_servers` 下：
+
+```bash
+acp-runtime bridge config --zed
+```
+
+```json
+{
+  "type": "custom",
+  "command": "/absolute/path/to/acp-runtime",
+  "args": ["bridge", "run"],
+  "env": {
+    "ACP_RELAY_URL": "wss://relay.saaskit.app"
+  }
+}
 ```
 
 能直连 WebSocket 的 ACP client 应直接连接 `wss://relay.saaskit.app/acp`，不需要
@@ -167,7 +210,7 @@ daemon route。若 client 离线太久导致 connection 已过期，或 grant �
 
 ## 正常流程
 
-1. 安装 npm 包。
+1. 从源码安装 CLI。
 2. 登录；新登录时，如果没有 service，这个步骤会在 macOS 上安装默认 user daemon。
 3. 配置 ACP client 或 stdio bridge。
 4. 从 client 开启 session。

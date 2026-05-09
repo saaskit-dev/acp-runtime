@@ -108,6 +108,7 @@ export type AcpRemoteDaemonRequestJournal = {
 
 type ActiveRelayAcpConnection = {
   channel: RelayAcpChannel;
+  closeAfterInFlight?: boolean;
   connection: AgentSideConnection;
   lastInboundSeq?: number;
   outboundQueue: AcpRemoteDataFrame[];
@@ -117,6 +118,10 @@ type ActiveRelayAcpConnection = {
 export type AcpRemoteDaemonConnectionState = {
   active: Map<string, ActiveRelayAcpConnection>;
   daemonRequestContexts: Map<
+    string,
+    Map<string | number, AcpDaemonRequestDebugContext>
+  >;
+  inFlightRuntimeRequests: Map<
     string,
     Map<string | number, AcpDaemonRequestDebugContext>
   >;
@@ -142,11 +147,22 @@ export function createAcpRemoteDaemonConnectionState(): AcpRemoteDaemonConnectio
   return {
     active: new Map(),
     daemonRequestContexts: new Map(),
+    inFlightRuntimeRequests: new Map(),
     outboundSeq: new Map(),
     relayRequestContexts: new Map(),
     ticketChecks: new Map(),
     tickets: new Map(),
   };
+}
+
+export function countAcpRemoteDaemonInFlightRuntimeRequests(
+  state: Pick<AcpRemoteDaemonConnectionState, "inFlightRuntimeRequests">,
+): number {
+  let count = 0;
+  for (const requests of state.inFlightRuntimeRequests.values()) {
+    count += requests.size;
+  }
+  return count;
 }
 
 export function createAcpRemoteDaemonConnection(
@@ -157,6 +173,7 @@ export function createAcpRemoteDaemonConnection(
   const {
     active,
     daemonRequestContexts,
+    inFlightRuntimeRequests,
     outboundSeq,
     relayRequestContexts,
     ticketChecks,
@@ -237,8 +254,14 @@ export function createAcpRemoteDaemonConnection(
 
     if (frame.frameType === AcpRemoteFrameType.Close) {
       const entry = active.get(frame.connectionId);
-      entry?.channel.close();
-      active.delete(frame.connectionId);
+      if (hasInFlightRuntimeRequests(frame.connectionId)) {
+        if (entry) {
+          entry.closeAfterInFlight = true;
+        }
+      } else {
+        entry?.channel.close();
+        active.delete(frame.connectionId);
+      }
       daemonRequestContexts.delete(frame.connectionId);
       relayRequestContexts.delete(frame.connectionId);
       tickets.delete(frame.connectionId);
@@ -322,6 +345,7 @@ export function createAcpRemoteDaemonConnection(
       );
       entry = {
         channel,
+        closeAfterInFlight: false,
         connection,
         lastInboundSeq: undefined,
         outboundQueue: [],
@@ -367,7 +391,11 @@ export function createAcpRemoteDaemonConnection(
         return;
       }
     }
+    if (request) {
+      rememberInFlightRuntimeRequest(frame.connectionId, request);
+    }
     if (!entry.channel.enqueue(frame.payload as AnyMessage)) {
+      forgetInFlightRuntimeRequest(frame.connectionId, request?.id);
       closeRemoteConnection(
         frame.connectionId,
         "acp_connection_closed",
@@ -448,6 +476,7 @@ export function createAcpRemoteDaemonConnection(
     entry?.channel.close();
     active.delete(connectionId);
     daemonRequestContexts.delete(connectionId);
+    inFlightRuntimeRequests.delete(connectionId);
     relayRequestContexts.delete(connectionId);
     tickets.delete(connectionId);
     outboundSeq.delete(connectionId);
@@ -558,6 +587,7 @@ export function createAcpRemoteDaemonConnection(
   };
 
   const sendAcpPayload = (connectionId: string, payload: AnyMessage) => {
+    forgetCompletedInFlightRuntimeRequest(connectionId, payload);
     const entry = active.get(connectionId);
     if (!entry) {
       return;
@@ -585,6 +615,7 @@ export function createAcpRemoteDaemonConnection(
   };
 
   const sendAcpPayloadDirect = (connectionId: string, payload: AnyMessage) => {
+    forgetCompletedInFlightRuntimeRequest(connectionId, payload);
     rememberDaemonRequestResponse(connectionId, payload);
     logDaemonAcpPayload(connectionId, payload);
     const seq = (outboundSeq.get(connectionId) ?? 0) + 1;
@@ -627,6 +658,58 @@ export function createAcpRemoteDaemonConnection(
           },
         );
       });
+  };
+
+  const rememberInFlightRuntimeRequest = (
+    connectionId: string,
+    request: { id: string | number; method: string },
+  ) => {
+    const context = relayRequestContexts.get(connectionId)?.get(request.id);
+    requestContextMap(inFlightRuntimeRequests, connectionId).set(request.id, {
+      method: context?.method ?? request.method,
+      sessionId: context?.sessionId,
+      traceContext: context?.traceContext,
+    });
+  };
+
+  const forgetCompletedInFlightRuntimeRequest = (
+    connectionId: string,
+    payload: AnyMessage,
+  ) => {
+    if (!isJsonRpcResponseWithId(payload)) {
+      return;
+    }
+    forgetInFlightRuntimeRequest(connectionId, payload.id);
+  };
+
+  const forgetInFlightRuntimeRequest = (
+    connectionId: string,
+    id: string | number | undefined,
+  ) => {
+    if (id === undefined) {
+      return;
+    }
+    const requests = inFlightRuntimeRequests.get(connectionId);
+    if (!requests) {
+      return;
+    }
+    requests.delete(id);
+    if (requests.size === 0) {
+      inFlightRuntimeRequests.delete(connectionId);
+      closeDeferredConnectionIfIdle(connectionId);
+    }
+  };
+
+  const hasInFlightRuntimeRequests = (connectionId: string): boolean =>
+    (inFlightRuntimeRequests.get(connectionId)?.size ?? 0) > 0;
+
+  const closeDeferredConnectionIfIdle = (connectionId: string) => {
+    const entry = active.get(connectionId);
+    if (!entry?.closeAfterInFlight || hasInFlightRuntimeRequests(connectionId)) {
+      return;
+    }
+    entry.channel.close();
+    active.delete(connectionId);
   };
 
   const resolveDaemonRequestDuplicate = async (
@@ -708,6 +791,7 @@ export function createAcpRemoteDaemonConnection(
     }
     active.clear();
     daemonRequestContexts.clear();
+    inFlightRuntimeRequests.clear();
     outboundSeq.clear();
     relayRequestContexts.clear();
     tickets.clear();

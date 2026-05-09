@@ -1,6 +1,7 @@
 import { isAbsolute, relative, resolve } from "node:path";
 import { realpath } from "node:fs/promises";
 
+import { SeverityNumber } from "@opentelemetry/api-logs";
 import type {
   Agent,
   AgentCapabilities,
@@ -48,10 +49,12 @@ import {
   mapRuntimeHistoryEntryToAcpNotifications,
   mapRuntimeSessionListToAcp,
   mapRuntimeSessionToAcpResponse,
+  mapRuntimeThreadEntryToAcpNotifications,
   mapRuntimeTurnCompletionToAcp,
   mapRuntimeTurnEventToAcpNotifications,
   createRemoteInitializeResponse,
 } from "./mappers.js";
+import { emitRuntimeLog } from "../../observability/logging.js";
 import { traceContextFromMeta } from "../../observability/tracing.js";
 
 type RemoteRuntimeSessions = {
@@ -292,6 +295,7 @@ export class AcpRemoteRuntimeAgent implements Agent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
+    const traceContext = traceContextFromParams(params);
     const active = await this.getOrRestoreSession(params, "session/prompt");
     const turn = active.session.turn.start(
       mapAcpPromptToRuntimePrompt(params.prompt),
@@ -321,6 +325,13 @@ export class AcpRemoteRuntimeAgent implements Agent {
             userMessageId: params.messageId ?? undefined,
           };
         } else if (event.type === "failed") {
+          emitRemotePromptFailureLog({
+            daemonId: this.options.remoteDaemonId,
+            error: event.error,
+            sessionId: params.sessionId,
+            traceContext,
+            turnId: event.turnId,
+          });
           throw RequestError.internalError(
             { sessionId: params.sessionId, turnId: event.turnId },
             formatError(event.error),
@@ -511,13 +522,16 @@ export class AcpRemoteRuntimeAgent implements Agent {
     session: AcpRuntimeSession,
   ): Promise<void> {
     const history = session.state.history.drain();
-    for (const entry of history) {
-      for (const notification of mapRuntimeHistoryEntryToAcpNotifications(
-        sessionId,
-        entry,
-      )) {
-        await this.connection.sessionUpdate(notification);
-      }
+    const notifications =
+      history.length > 0
+        ? history.flatMap((entry) =>
+            mapRuntimeHistoryEntryToAcpNotifications(sessionId, entry),
+          )
+        : session.state.thread.entries().flatMap((entry) =>
+            mapRuntimeThreadEntryToAcpNotifications(sessionId, entry),
+          );
+    for (const notification of notifications) {
+      await this.connection.sessionUpdate(notification);
     }
   }
 
@@ -841,6 +855,27 @@ function formatError(error: unknown): string {
     return message;
   }
   return `${message} Caused by: ${formatError(cause)}`;
+}
+
+function emitRemotePromptFailureLog(input: {
+  daemonId?: string;
+  error: unknown;
+  sessionId: string;
+  traceContext?: import("@opentelemetry/api").Context;
+  turnId: string;
+}): void {
+  emitRuntimeLog({
+    attributes: {
+      "acp.remote.daemon.id": input.daemonId,
+      "acp.session.id": input.sessionId,
+      "acp.turn.id": input.turnId,
+    },
+    body: `Remote runtime prompt failed: ${formatError(input.error)}`,
+    context: input.traceContext,
+    eventName: "acp.remote.daemon.prompt.failed",
+    exception: input.error,
+    severityNumber: SeverityNumber.ERROR,
+  });
 }
 
 function readErrorCause(error: Error): unknown {

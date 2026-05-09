@@ -53,6 +53,7 @@ function printHelp(): void {
       "  acp-runtime auth logout",
       "  acp-runtime daemon install",
       "  acp-runtime daemon status",
+      "  acp-runtime daemon restart",
       "  acp-runtime daemon run",
       "  acp-runtime bridge run",
       "  acp-runtime bridge config",

@@ -109,15 +109,18 @@ ACP 二进制仍会作为本地 command override 的兼容项上报。
 前台运行和 macOS user service 安装：
 
 ```bash
-npm install -g @saaskit-dev/acp-runtime
-
-acp-runtime daemon install \
-  --relay-url wss://<relay-host> \
-  --workspace-root ~/Projects
+curl -fsSL https://raw.githubusercontent.com/saaskit-dev/acp-runtime/main/scripts/install.sh | bash
 ```
 
-npm 包安装本身不会自动注册后台 daemon。首次注册 service 是显式步骤，因为它会创建
-一个长期运行的本地进程，可能打开浏览器登录，也可能需要 launchd 或 sudo 权限。
+这个脚本会 clone 并构建源码，再从源码 checkout 全局安装 CLI，并执行
+`acp-runtime auth login`，这是普通 onboarding 入口。本地 checkout 也使用同一个脚本：
+
+```bash
+./scripts/install.sh
+```
+
+源码安装本身不会自动注册后台 daemon。首次注册 service 通过 `auth login` 触发，因为
+它可能打开浏览器登录，也可能需要 launchd 或 sudo 权限。
 
 用户可以显式管理登录状态：
 
@@ -143,7 +146,7 @@ daemon service，使用 `acp-runtime auth login --force`。如果机器已经是
 `~/.acp-runtime/logs/daemon.err.log`。LaunchAgent 配置了 `RunAtLoad` 和
 无条件 `KeepAlive`，因此正常退出和异常退出都会由 launchd 拉起；daemon 进程自身也会在
 relay 短暂断开后用指数退避自动重连。`acp-runtime daemon stop` 会 unload 这个
-LaunchAgent，所以会保持停止，直到再次执行 `start` 或 `install`。
+LaunchAgent，所以会保持停止，直到再次执行 `restart` 或 `install`。
 
 如果需要在用户登录前就随系统启动，可以使用可选的 system LaunchDaemon：
 
@@ -156,7 +159,7 @@ acp-runtime daemon install --system
 `SUDO_USER` 设置 `UserName` 和 `HOME`。目标 home 很重要：它让 system daemon 复用该
 用户缓存的 `~/.acp/relay-session.json`，而不是 sudo 后去 `/var/root` 下查找登录缓存。
 只有需要覆盖自动检测结果时才使用 `--user` 或 `--home-dir`。service 安装后，
-`status`、`start`、`stop` 和 `uninstall` 会自动判断当前安装模式。只有需要强制 system
+`status`、`restart`、`stop` 和 `uninstall` 会自动判断当前安装模式。只有需要强制 system
 mode，或处理异常冲突时才需要 `--system`。会修改 system service 的命令会自动通过
 `sudo` 重新执行，所以需要权限时 macOS 会提示输入密码。
 
@@ -164,11 +167,11 @@ mode，或处理异常冲突时才需要 `--system`。会修改 system service �
 安装 user mode 时，如果 system LaunchDaemon 仍然存在，会拒绝继续，因为移除它需要
 sudo。
 
-npm 包升级后，如果 daemon service 已经安装，运行中的 daemon 会监控自己的可执行文件
-路径；当该文件被 npm 替换后，daemon 会退出，launchd 的 `KeepAlive` 会用升级后的代码
-重新拉起。首次安装、切换模式、修改 service 参数，或全局 npm 命令路径变化需要重写
-plist 时，user service 重新执行 `acp-runtime daemon install`，system service 重新执行
-`acp-runtime daemon install --system`。`start` 只加载已有 plist。
+源码重新安装后，如果 daemon service 已经安装，运行中的 daemon 会监控自己的可执行文件
+路径；当该文件被替换后，daemon 会退出，launchd 的 `KeepAlive` 会用升级后的代码重新
+拉起。首次安装、切换模式、修改 service 参数，或全局命令路径变化需要重写 plist 时，
+user service 重新执行 `acp-runtime daemon install`，system service 重新执行
+`acp-runtime daemon install --system`。`restart` 会强制加载并 kickstart 已有 plist。
 
 常用命令：
 
@@ -176,7 +179,7 @@ plist 时，user service 重新执行 `acp-runtime daemon install`，system serv
 acp-runtime auth status
 acp-runtime daemon status
 acp-runtime daemon stop
-acp-runtime daemon start
+acp-runtime daemon restart
 acp-runtime daemon uninstall
 acp-runtime daemon run --relay-url wss://<relay-host> --workspace-root ~/Projects
 ```

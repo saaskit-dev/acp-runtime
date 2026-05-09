@@ -111,7 +111,7 @@ export async function uninstallAcpRemoteDaemonUserService(
   await rm(plistPath, { force: true });
 }
 
-export async function startAcpRemoteDaemonUserService(
+export async function restartAcpRemoteDaemonUserService(
   label = ACP_REMOTE_DAEMON_LAUNCHD_LABEL,
   scope: AcpRemoteDaemonServiceScope = "user",
   homeDir = homedir(),
@@ -374,7 +374,7 @@ function assertLaunchdScopePermissions(
   scope: AcpRemoteDaemonServiceScope = "user",
 ): void {
   if (scope === "system" && process.getuid?.() !== 0) {
-    throw new Error("System daemon install/start/stop/uninstall requires root. Re-run with sudo.");
+    throw new Error("System daemon install/restart/stop/uninstall requires root. Re-run with sudo.");
   }
 }
 

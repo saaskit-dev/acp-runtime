@@ -8,6 +8,10 @@ import {
   createAcpRemoteDaemonConnectionState,
   type AcpRemoteDaemonDebugContext,
 } from "./relay-connection.js";
+import {
+  hasDaemonRestartBlockers,
+  readDaemonRestartBlockers,
+} from "./restart-blockers.js";
 import type { DaemonMetadata } from "./relay-client.js";
 import {
   createAcpRemoteWebSocketFactory,
@@ -48,7 +52,7 @@ import {
   type AcpRemoteDaemonServiceScope,
   getAcpRemoteDaemonUserServiceStatus,
   installAcpRemoteDaemonUserService,
-  startAcpRemoteDaemonUserService,
+  restartAcpRemoteDaemonUserService,
   stopAcpRemoteDaemonUserService,
   uninstallAcpRemoteDaemonUserService,
 } from "./service.js";
@@ -58,6 +62,7 @@ const ACP_REMOTE_DAEMON_TICKET_PUBLIC_KEYS_ENV_VAR =
 const ACP_REMOTE_DAEMON_ACCOUNT_SESSION_ENV_VAR =
   "ACP_REMOTE_DAEMON_ACCOUNT_SESSION";
 const DAEMON_BINARY_CHANGE_CHECK_INTERVAL_MS = 60_000;
+const DAEMON_PENDING_RESTART_CHECK_INTERVAL_MS = 60_000;
 const DAEMON_LOG_DIR = join(homedir(), ".acp-runtime", "logs");
 const DAEMON_TEXT_LOG_PATH = join(DAEMON_LOG_DIR, "daemon.log.text.jsonl");
 const DAEMON_ERROR_LOG_PATH = join(DAEMON_LOG_DIR, "daemon.log.errors.jsonl");
@@ -348,8 +353,8 @@ async function main(rawArgv: readonly string[]): Promise<void> {
       );
       process.stdout.write("ACP remote daemon service uninstalled.\n");
       return;
-    case "start": {
-      const status = await startAcpRemoteDaemonUserService(
+    case "restart": {
+      const status = await restartAcpRemoteDaemonUserService(
         undefined,
         serviceOptions.scope,
         serviceOptions.homeDir,
@@ -491,24 +496,62 @@ async function runDaemon(argv: readonly string[]): Promise<void> {
       : "(none configured)";
   let stopping = false;
   let active: { close(): void } | undefined;
+  let pendingDaemonRestart:
+    | { currentMtimeMs: number; initialMtimeMs: number }
+    | undefined;
   const stop = () => {
     stopping = true;
     active?.close();
   };
+  const exitForDaemonBinaryChange = (change: {
+    currentMtimeMs: number;
+    initialMtimeMs: number;
+  }) => {
+    const blockers = readDaemonRestartBlockers(daemonConnectionState);
+    writeDaemonLog(
+      "Daemon executable changed on disk. Exiting so launchd can restart with the updated code.",
+      {
+        "acp.remote.active_connections": blockers.activeConnections,
+        "acp.remote.daemon_bin": process.argv[1],
+        "acp.remote.daemon_bin_current_mtime_ms": change.currentMtimeMs,
+        "acp.remote.daemon_bin_initial_mtime_ms": change.initialMtimeMs,
+        "acp.remote.in_flight_runtime_requests": blockers.inFlightRuntimeRequests,
+      },
+    );
+    process.exit(0);
+  };
   const stopWatchingDaemonBinary = watchDaemonBinaryForChanges({
     daemonBinPath: process.argv[1],
-    onChange({ currentMtimeMs, initialMtimeMs }) {
-      writeDaemonLog(
-        "Daemon executable changed on disk. Exiting so launchd can restart with the updated code.",
-        {
-          "acp.remote.daemon_bin": process.argv[1],
-          "acp.remote.daemon_bin_initial_mtime_ms": initialMtimeMs,
-          "acp.remote.daemon_bin_current_mtime_ms": currentMtimeMs,
-        },
-      );
-      process.exit(0);
+    onChange(change) {
+      const blockers = readDaemonRestartBlockers(daemonConnectionState);
+      if (hasDaemonRestartBlockers(blockers)) {
+        pendingDaemonRestart = change;
+        writeDaemonLog(
+          "Daemon executable changed on disk. Deferring restart until active remote work completes.",
+          {
+            "acp.remote.active_connections": blockers.activeConnections,
+            "acp.remote.daemon_bin": process.argv[1],
+            "acp.remote.daemon_bin_current_mtime_ms": change.currentMtimeMs,
+            "acp.remote.daemon_bin_initial_mtime_ms": change.initialMtimeMs,
+            "acp.remote.in_flight_runtime_requests": blockers.inFlightRuntimeRequests,
+          },
+        );
+        return;
+      }
+      exitForDaemonBinaryChange(change);
     },
   });
+  const pendingRestartTimer = setInterval(() => {
+    if (
+      !pendingDaemonRestart ||
+      hasDaemonRestartBlockers(readDaemonRestartBlockers(daemonConnectionState))
+    ) {
+      return;
+    }
+    exitForDaemonBinaryChange(pendingDaemonRestart);
+  }, DAEMON_PENDING_RESTART_CHECK_INTERVAL_MS);
+  pendingRestartTimer.unref?.();
+  const stopPendingRestartTimer = () => clearInterval(pendingRestartTimer);
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
 
@@ -554,6 +597,7 @@ async function runDaemon(argv: readonly string[]): Promise<void> {
     waitForDisconnect: waitForDaemonDisconnect,
   });
   stopWatchingDaemonBinary?.();
+  stopPendingRestartTimer();
   await relayTelemetry?.close();
 }
 
@@ -661,27 +705,38 @@ function normalizeDaemonSocketCloseEvent(event: unknown): string | undefined {
   return parts.length ? parts.join(" ") : undefined;
 }
 
+type DaemonServiceCommand =
+  | "install"
+  | "restart"
+  | "run"
+  | "status"
+  | "stop"
+  | "uninstall";
+
 function readCommand(argv: readonly string[]): {
   argv: readonly string[];
-  name: "install" | "run" | "start" | "status" | "stop" | "uninstall";
+  name: DaemonServiceCommand;
 } {
   const first = argv[0];
   if (
     first === "install" ||
     first === "run" ||
-    first === "start" ||
+    first === "restart" ||
     first === "status" ||
     first === "stop" ||
     first === "uninstall"
   ) {
     return { argv: argv.slice(1), name: first };
   }
+  if (first && !first.startsWith("--")) {
+    throw new Error(`Unknown daemon command: ${first}`);
+  }
   return { argv, name: "run" };
 }
 
 function readServiceOptions(
   argv: readonly string[],
-  commandName: "install" | "run" | "start" | "status" | "stop" | "uninstall",
+  commandName: DaemonServiceCommand,
 ): {
   homeDir: string;
   modeConflict?: {
@@ -738,7 +793,7 @@ function readServiceOptions(
 }
 
 function shouldRerunWithSudo(
-  command: "install" | "run" | "start" | "status" | "stop" | "uninstall",
+  command: DaemonServiceCommand,
   scope: AcpRemoteDaemonServiceScope,
 ): boolean {
   return (
@@ -829,7 +884,7 @@ function printHelp(): void {
       "  acp-runtime daemon install [--relay-url <ws-url>] [--workspace-root <path>...] [--system]",
       "  acp-runtime daemon status [--system]",
       "  acp-runtime daemon stop [--system]",
-      "  acp-runtime daemon start [--system]",
+      "  acp-runtime daemon restart [--system]",
       "  acp-runtime daemon uninstall [--system]",
       "",
       "Options:",

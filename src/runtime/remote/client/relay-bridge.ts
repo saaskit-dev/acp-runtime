@@ -11,6 +11,7 @@ import {
 import { ACP_REMOTE_DEFAULT_RELAY_URL } from "../defaults.js";
 import {
   createAcpRelayBridgeStdioConfig,
+  createAcpRelayBridgeZedConfig,
   parseAcpRelayBridgeConfigArgs,
 } from "./bridge-config.js";
 import { createAcpRemoteStdioBridge } from "./stdio-bridge.js";
@@ -125,10 +126,32 @@ async function main(): Promise<void> {
     return;
   }
   if (argv[0] === "config") {
-    const config = createAcpRelayBridgeStdioConfig(
-      parseAcpRelayBridgeConfigArgs(argv.slice(1)),
+    const options = parseAcpRelayBridgeConfigArgs(argv.slice(1));
+    const stdioConfig = createAcpRelayBridgeStdioConfig(options);
+    const zedConfig = createAcpRelayBridgeZedConfig(options);
+    if (options.format === "generic") {
+      process.stdout.write(`${JSON.stringify(stdioConfig, null, 2)}\n`);
+      return;
+    }
+    if (options.format === "zed") {
+      process.stdout.write(`${JSON.stringify(zedConfig, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(
+      [
+        "ACP Runtime Bridge Config",
+        "",
+        `Command: ${stdioConfig.command}`,
+        `Relay URL: ${stdioConfig.env.ACP_RELAY_URL}`,
+        "",
+        "Generic stdio ACP client:",
+        JSON.stringify(stdioConfig, null, 2),
+        "",
+        "Zed custom agent config:",
+        JSON.stringify(zedConfig, null, 2),
+        "",
+      ].join("\n"),
     );
-    process.stdout.write(`${JSON.stringify(config, null, 2)}\n`);
     return;
   }
 
@@ -206,7 +229,7 @@ function printHelp(): void {
     [
       "Usage:",
       "  acp-runtime bridge run",
-      "  acp-runtime bridge config [--relay-url <ws-url>]",
+      "  acp-runtime bridge config [--relay-url <ws-url>] [--command <path>] [--zed|--all]",
       "",
       "Runtime environment:",
       `  ACP_RELAY_URL              Relay WebSocket URL (default: ${ACP_REMOTE_DEFAULT_RELAY_URL})`,
@@ -214,6 +237,13 @@ function printHelp(): void {
       "  ACP_DAEMON_ID              Optional daemon id pin",
       "  ACP_ACCOUNT_SESSION        Optional account session token",
       "  ACP_REMOTE_AUTO_AUTHORIZE  Test-only auto authorization flag",
+      "",
+      "Config options:",
+      "  --command        Override the acp-runtime command path in generated config.",
+      "  --format         Output format: generic, zed, or all. Default: generic.",
+      "  --legacy-command Generate a config where command contains the full launcher.",
+      "  --zed            Shortcut for --format zed.",
+      "  --all            Shortcut for --format all.",
       "",
       "The bridge is a generic stdio ACP adapter. Configure stdio-only ACP",
       "clients to launch `acp-runtime bridge run`. ACP_RELAY_URL is optional for the default relay.",

@@ -123,16 +123,20 @@ Users should not need to keep a terminal open for the daemon. The packaged
 mode:
 
 ```bash
-npm install -g @saaskit-dev/acp-runtime
-
-acp-runtime daemon install \
-  --relay-url wss://<relay-host> \
-  --workspace-root ~/Projects
+curl -fsSL https://raw.githubusercontent.com/saaskit-dev/acp-runtime/main/scripts/install.sh | bash
 ```
 
-The npm package install does not register a background daemon by itself.
-First-time service registration is explicit because it creates a long-running
-local process, may open browser login, and may need launchd or sudo privileges.
+That script clones and builds the source, installs the global CLI from that
+source checkout, and runs `acp-runtime auth login`, which is the normal
+onboarding entrypoint. Local checkout installs use the same script:
+
+```bash
+./scripts/install.sh
+```
+
+Source install does not register a background daemon by itself. First-time
+service registration happens through `auth login` because it may open browser
+login and may need launchd or sudo privileges.
 
 Users can manage login explicitly with:
 
@@ -164,7 +168,7 @@ On macOS, `install` writes a user LaunchAgent at
 unconditional `KeepAlive`, so launchd restarts it after both successful and
 failed exits. The daemon process also reconnects to the relay with exponential
 backoff after transient disconnects. `acp-runtime daemon stop` unloads the
-LaunchAgent so it stays stopped until `start` or `install` loads it again.
+LaunchAgent so it stays stopped until `restart` or `install` loads it again.
 
 For boot-time startup before GUI login, use the optional system LaunchDaemon:
 
@@ -178,7 +182,7 @@ sets `UserName` plus `HOME` for `SUDO_USER` by default. The target home is
 important: it lets the system daemon reuse the user's cached
 `~/.acp/relay-session.json` instead of looking under `/var/root` after sudo. Use
 `--user` or `--home-dir` only when overriding the detected default. After a
-service is installed, `status`, `start`, `stop`, and `uninstall` auto-detect
+service is installed, `status`, `restart`, `stop`, and `uninstall` auto-detect
 whether the installed mode is user or system. Use `--system` only to force
 system mode or resolve an unexpected conflict.
 Commands that modify the system service automatically re-run through `sudo`, so
@@ -188,12 +192,12 @@ Only one service mode should be installed on a machine. Installing `--system`
 removes the target user's LaunchAgent. Installing user mode refuses to proceed
 if a system LaunchDaemon is still installed, because removing it requires sudo.
 
-After package upgrades, an already-installed daemon watches its own executable
-path and exits when npm replaces that file; launchd `KeepAlive` restarts it with
+After source reinstalls, an already-installed daemon watches its own executable
+path and exits when that file is replaced; launchd `KeepAlive` restarts it with
 the upgraded code. Rerun `acp-runtime daemon install` for user services, or
-`acp-runtime daemon install --system` for system services, when installing for
-the first time, switching modes, changing service options, or rewriting a plist
-whose global npm command path changed. `start` only loads the existing plist.
+`acp-runtime daemon install --system` for system services, when switching modes,
+changing service options, or rewriting a plist whose global command path
+changed. `restart` force-loads and kickstarts the existing plist.
 
 Useful commands:
 
@@ -201,7 +205,7 @@ Useful commands:
 acp-runtime auth status
 acp-runtime daemon status
 acp-runtime daemon stop
-acp-runtime daemon start
+acp-runtime daemon restart
 acp-runtime daemon uninstall
 acp-runtime daemon run --relay-url wss://<relay-host> --workspace-root ~/Projects
 ```

@@ -30,6 +30,9 @@ import {
   AcpRuntimePermissionDecisionValue,
   AcpRuntimePermissionScope,
   AcpRuntimePromptMessageRole,
+  AcpRuntimeThreadEntryKind,
+  AcpRuntimeThreadEntryStatus,
+  AcpRuntimeThreadToolContentKind,
   AcpRuntimeTurnEventType,
   type AcpRuntimeAgentConfigOption,
   type AcpRuntimeHistoryEntry,
@@ -42,6 +45,8 @@ import {
   type AcpRuntimePromptPart,
   type AcpRuntimeSessionMetadata,
   type AcpRuntimeSessionReference,
+  type AcpRuntimeThreadEntry,
+  type AcpRuntimeThreadToolContent,
   type AcpRuntimeTurnCompletion,
   type AcpRuntimeTurnEvent,
   type AcpRuntimeUsage,
@@ -282,6 +287,80 @@ export function mapRuntimeHistoryEntryToAcpNotifications(
     ];
   }
   return mapRuntimeTurnEventToAcpNotifications(sessionId, entry);
+}
+
+export function mapRuntimeThreadEntryToAcpNotifications(
+  sessionId: string,
+  entry: AcpRuntimeThreadEntry,
+): SessionNotification[] {
+  switch (entry.kind) {
+    case AcpRuntimeThreadEntryKind.UserMessage:
+      return [
+        {
+          sessionId,
+          update: {
+            content: { text: entry.text, type: "text" },
+            sessionUpdate: "user_message_chunk",
+          },
+        },
+      ];
+    case AcpRuntimeThreadEntryKind.AssistantMessage:
+      return [
+        {
+          sessionId,
+          update: {
+            content: { text: entry.text, type: "text" },
+            sessionUpdate: "agent_message_chunk",
+          },
+        },
+      ];
+    case AcpRuntimeThreadEntryKind.AssistantThought:
+      return [
+        {
+          sessionId,
+          update: {
+            content: { text: entry.text, type: "text" },
+            sessionUpdate: "agent_thought_chunk",
+          },
+        },
+      ];
+    case AcpRuntimeThreadEntryKind.Plan:
+      return [
+        {
+          sessionId,
+          update: {
+            entries: entry.plan.map((item) => ({
+              content: item.content,
+              priority: item.priority,
+              status: item.status,
+            })),
+            sessionUpdate: "plan",
+          },
+        },
+      ];
+    case AcpRuntimeThreadEntryKind.ToolCall:
+      return [
+        {
+          sessionId,
+          update: {
+            content: mapThreadToolContent(entry.content),
+            kind: mapThreadToolKind(entry.toolKind),
+            locations: entry.locations?.map((location) => ({
+              line: location.line,
+              path: location.path,
+            })),
+            rawInput: entry.rawInput,
+            rawOutput: entry.rawOutput,
+            sessionUpdate: "tool_call",
+            status: mapThreadStatusToToolStatus(entry.status),
+            title: entry.title,
+            toolCallId: entry.toolCallId,
+          },
+        },
+      ];
+    default:
+      return assertNever(entry);
+  }
 }
 
 export function mapRemotePermissionRequestToAcp(
@@ -581,6 +660,123 @@ function mapOperationPhaseToToolStatus(
       return "pending";
     default:
       return "pending";
+  }
+}
+
+function mapThreadStatusToToolStatus(
+  status: string,
+): ToolCallStatus {
+  switch (status) {
+    case AcpRuntimeThreadEntryStatus.Completed:
+      return "completed";
+    case AcpRuntimeThreadEntryStatus.Failed:
+      return "failed";
+    case AcpRuntimeThreadEntryStatus.InProgress:
+    case AcpRuntimeThreadEntryStatus.Streaming:
+      return "in_progress";
+    case AcpRuntimeThreadEntryStatus.Pending:
+      return "pending";
+    default:
+      return "pending";
+  }
+}
+
+function mapThreadToolKind(kind: string | undefined): ToolKind {
+  switch (kind) {
+    case "read":
+    case "edit":
+    case "delete":
+    case "move":
+    case "search":
+    case "execute":
+    case "think":
+    case "fetch":
+    case "other":
+      return kind;
+    default:
+      return "other";
+  }
+}
+
+function mapThreadToolContent(
+  content: readonly AcpRuntimeThreadToolContent[],
+): ToolCallContent[] | undefined {
+  if (content.length === 0) {
+    return undefined;
+  }
+
+  return content.map((item): ToolCallContent => {
+    switch (item.kind) {
+      case AcpRuntimeThreadToolContentKind.Content:
+        return {
+          content: item.part
+            ? mapRuntimeOutputPartToAcpContent(item.part)
+            : { text: item.text ?? item.label ?? "", type: "text" },
+          type: "content",
+        };
+      case AcpRuntimeThreadToolContentKind.Diff:
+        return {
+          newText: item.newText,
+          oldText: item.oldText,
+          path: item.path,
+          type: "diff",
+        };
+      case AcpRuntimeThreadToolContentKind.Terminal:
+        return {
+          terminalId: item.terminalId,
+          type: "terminal",
+        };
+      default:
+        return assertNever(item);
+    }
+  });
+}
+
+function mapRuntimeOutputPartToAcpContent(
+  part: AcpRuntimeOutputPart,
+): ContentBlock {
+  switch (part.type) {
+    case AcpRuntimeContentPartType.Text:
+      return { text: part.text, type: "text" };
+    case AcpRuntimeContentPartType.Image:
+      return {
+        mimeType: part.mediaType ?? "image/*",
+        name: part.alt ?? part.uri,
+        title: part.alt,
+        type: "resource_link",
+        uri: part.uri,
+      };
+    case AcpRuntimeContentPartType.Audio:
+      return {
+        data: part.data,
+        mimeType: part.mediaType,
+        type: "audio",
+      };
+    case AcpRuntimeContentPartType.File:
+      return {
+        mimeType: part.mediaType,
+        name: part.title ?? part.uri,
+        title: part.title,
+        type: "resource_link",
+        uri: part.uri,
+      };
+    case AcpRuntimeContentPartType.Resource:
+      return {
+        resource: {
+          mimeType: part.mediaType,
+          text:
+            part.text ??
+            (part.value === undefined
+              ? ""
+              : JSON.stringify(part.value, null, 2)),
+          uri: part.uri,
+        },
+        type: "resource",
+      };
+    case AcpRuntimeContentPartType.Json:
+      return { text: JSON.stringify(part.value, null, 2), type: "text" };
+    default:
+      return assertNever(part);
   }
 }
 
