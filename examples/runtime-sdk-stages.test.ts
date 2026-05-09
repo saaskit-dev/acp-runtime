@@ -14,6 +14,8 @@ import {
   stage7ResolveTerminalAuthenticationExample,
 } from "./runtime-sdk-stage-7-host-authority.js";
 
+const STAGE_1_EXAMPLE_TEST_TIMEOUT_MS = 15_000;
+
 describe("runtime SDK staged examples", () => {
   let runtimeHomeDir = "";
 
@@ -29,15 +31,21 @@ describe("runtime SDK staged examples", () => {
     }
   });
 
-  it("covers stage 1 minimal startup through registry-id and explicit agent paths", async () => {
-    const registryResult = await stage1RegistryMinimalExample();
-    const explicitResult = await stage1ExplicitAgentExample();
+  it(
+    "covers stage 1 minimal startup through registry-id and explicit agent paths",
+    async () => {
+      const registryResult = await stage1RegistryMinimalExample();
+      const explicitResult = await stage1ExplicitAgentExample();
 
-    expect(registryResult.metadata.id).toBeTruthy();
-    expect(registryResult.snapshot.session.id).toBe(registryResult.metadata.id);
-    expect(registryResult.outputText.length).toBeGreaterThan(0);
-    expect(explicitResult.outputText.length).toBeGreaterThan(0);
-  });
+      expect(registryResult.metadata.id).toBeTruthy();
+      expect(registryResult.snapshot.session.id).toBe(
+        registryResult.metadata.id,
+      );
+      expect(registryResult.outputText.length).toBeGreaterThan(0);
+      expect(explicitResult.outputText.length).toBeGreaterThan(0);
+    },
+    STAGE_1_EXAMPLE_TEST_TIMEOUT_MS,
+  );
 
   it("covers stage 2 interactive send and stream paths", async () => {
     const sendResult = await stage2SendExample();
