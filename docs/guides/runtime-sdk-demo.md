@@ -1,4 +1,4 @@
-# Runtime SDK Demo
+# Runtime CLI
 
 Language:
 - English (default)
@@ -17,15 +17,15 @@ It is intentionally written only in runtime concepts:
 
 It does not use raw ACP methods or vendor-specific protocol details.
 
-## Source Demo
+## Source Module
 
-- [runtime-sdk-demo.ts](../../examples/runtime-sdk-demo.ts)
+- [runtime-command.ts](../../src/runtime/cli/runtime-command.ts)
 
 Recommended companions:
 - [Runtime SDK By Scenario](runtime-sdk-by-scenario.md)
 - [Runtime SDK API Coverage](runtime-sdk-api-coverage.md)
 
-This unified example uses `runtime.sessions.start({ agent })` as the default host entry point and switches behavior by agent id.
+The maintained `./run runtime` command uses `runtime.sessions.start({ agent })` as the default host entry point and switches behavior by agent id.
 
 ## Covered Scenarios
 
@@ -54,7 +54,7 @@ Use this file after the staged examples when you want the entire user-facing hos
 
 ## Design Notes
 
-- The demo treats `runtime` as the host-facing SDK instance.
+- The command treats `runtime` as the host-facing SDK instance.
 - Agent startup is resolved by passing a registry agent id to `runtime.sessions.start(...)` instead of hard-coded launch arguments.
 - Raw agent control happens through `session.agent.setMode()` and `session.agent.setConfigOption()`.
 - Permission decisions are modeled through `permission` handlers, not raw ACP messages.

@@ -842,7 +842,7 @@ export class AcpRuntime {
     const storedSnapshot = await this.getStoredSnapshot(options.sessionId);
     const agent = options.agent
       ? await this.resolveAgentInput(options.agent)
-      : storedSnapshot?.agent;
+      : await this.resolveStoredSnapshotAgent(storedSnapshot);
     const cwd = options.cwd ?? storedSnapshot?.cwd;
 
     if (!agent || !cwd) {
@@ -890,6 +890,33 @@ export class AcpRuntime {
 
   private async resolveAgentInput(agent: AcpRuntimeAgentInput) {
     return typeof agent === "string" ? this.resolveAgent(agent) : agent;
+  }
+
+  private async resolveStoredSnapshotAgent(
+    snapshot: AcpRuntimeSnapshot | undefined,
+  ): Promise<AcpRuntimeAgent | undefined> {
+    if (!snapshot?.agent) {
+      return undefined;
+    }
+    if (!snapshot.agent.type) {
+      return snapshot.agent;
+    }
+    try {
+      return await this.resolveAgent(snapshot.agent.type);
+    } catch (error) {
+      emitRuntimeSuppressedError({
+        attributes: sessionAttributes({
+          action: "load",
+          agent: snapshot.agent,
+          cwd: snapshot.cwd,
+          sessionId: snapshot.session.id,
+        }),
+        body: "Stored session agent could not be refreshed from registry; using the stored launch config.",
+        eventName: "acp.session.stored_agent.refresh.failed",
+        exception: error,
+      });
+      return snapshot.agent;
+    }
   }
 
   private async resolveAgent(agentId: string) {

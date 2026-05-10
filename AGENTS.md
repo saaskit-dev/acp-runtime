@@ -63,11 +63,12 @@ Examples that should be handled by runtime/profile, not external hosts:
 - Generic hosts should consume `selectRuntimeAuthenticationMethod(...)`, `runtimeAuthenticationTerminalSuccessPatterns(...)`, and `resolveRuntimeTerminalAuthenticationRequest(...)` instead of duplicating auth policy.
 - Runtime may auto-authenticate safe protocol-only `agent` methods when no host authentication handler is provided. It must not auto-run terminal or env-var auth without host participation.
 
-## Demo And Harness Rules
+## CLI, Demo, And Harness Rules
 
-- `examples/runtime-sdk-demo.ts` should demonstrate host usage, not own core compatibility.
-- `examples/runtime-demo-auth-adapter.ts` may choose auth methods and run terminal auth, but should not contain agent-specific skip/workaround logic.
-- CLI conveniences such as display formatting, command parsing, and interactive prompts can stay in examples.
+- `src/runtime/cli/runtime-command.ts` owns the maintained `./run runtime` command.
+- `src/runtime/cli/auth-adapter.ts` may choose auth methods and run terminal auth, but should not contain agent-specific skip/workaround logic.
+- Runtime CLI conveniences such as display formatting, command parsing, and interactive prompts belong in `src/runtime/cli/`.
+- `examples/` should stay focused on SDK usage examples and staged host integration scenarios.
 - Harness cases should validate observable behavior and compatibility surfaces. Add cases when a new agent integration exposes a new behavioral family.
 - Harness output is diagnostic. Keep generated artifacts under `.tmp/` or configured output directories, not committed docs unless intentionally summarized.
 
@@ -99,7 +100,7 @@ Use broader checks before handing off larger changes:
 For real agent checks:
 
 - `./run agents` lists registry-supported agents.
-- `./run runtime <id-or-alias>` starts the interactive runtime demo.
+- `./run runtime <id-or-alias>` starts the maintained interactive runtime CLI.
 - `./run runtime --list-agents` lists supported registry agents.
 - `pnpm harness:check-admission -- --type <agent>` is the first-pass admission gate.
 - `pnpm harness:run-agent -- --type <agent>` is the stricter full matrix.
@@ -110,20 +111,8 @@ For real agent checks:
 - Runtime cache defaults to `~/.acp-runtime/cache/`.
 - Runtime logs default to `~/.acp-runtime/logs/runtime.log` and `.jsonl`.
 - Session logs live under `~/.acp-runtime/logs/sessions/<sessionId>/`.
-- Override with `ACP_RUNTIME_HOME_DIR`, `ACP_RUNTIME_CACHE_DIR`, or demo `--log-file` flags.
+- Override with `ACP_RUNTIME_HOME_DIR`, `ACP_RUNTIME_CACHE_DIR`, or runtime CLI `--log-file` flags.
 - Use logs to inspect raw ACP JSON-RPC before changing compatibility behavior.
-
-## Remote Relay Durability
-
-- Treat relay in-memory state as a cache only. Any intermediate state required to continue after WebSocket reconnect, Cloudflare Durable Object hibernation, or relay process restart must be persisted in Durable Object storage.
-- Persist route/session continuity state such as client-to-daemon bindings, authorization/ticket/bootstrap state, frame sequence counters, last inbound sequence, unacknowledged frames, queued frames, session restore request metadata, and disconnect grace timestamps.
-- Persist successful per-session control state such as `session/set_mode` and `session/set_config_option`. Daemon reconnect replay must restore those controls before replaying pending or queued prompts.
-- Treat daemon ACK as transport receipt only, not business completion. Once a daemon-bound JSON-RPC request has been ACKed, do not replay it after daemon restart; if the daemon runtime instance changes before the JSON-RPC response, fail the client request with an explicit unknown/retryable error instead of hanging or duplicating the turn.
-- Use WebSocket attachments only for small socket routing metadata needed to restore hibernated sockets. Do not rely on attachments as the full source of truth for frame replay or ACK state.
-- Reconnection logic must be able to rebuild live sockets, event listeners, timers, and waiters from durable state. Do not persist runtime-only handles such as WebSocket objects, timer handles, event listeners, or pending Promise waiters.
-- If losing a relay state value can cause a hang, dropped token/output, duplicate execution, failed resume, or missing ACK/replay, make that state durable and cover it with reconnect or hibernation tests.
-- Default reconnect grace should cover normal laptop sleep and Cloudflare WebSocket churn; do not shorten client or daemon route grace without an explicit product/security reason and reconnect tests.
-- Connection ticket TTL and renewal windows must be relay-configurable. Ticket expiry must trigger renewal for bound routes instead of forcing clients through a fresh authorization when the grant is still valid.
 
 ## Process And Signal Handling
 

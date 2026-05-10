@@ -28,20 +28,6 @@ export {
   selectRuntimeAuthenticationMethod,
 } from "./core/authentication-utils.js";
 export {
-  ACP_RELAY_LOG_UPLOAD_BATCH_SIZE_ENV_VAR,
-  ACP_RELAY_LOG_UPLOAD_ENV_VAR,
-  ACP_RELAY_LOG_UPLOAD_FLUSH_INTERVAL_MS_ENV_VAR,
-  ACP_RELAY_LOG_UPLOAD_TOKEN_ENV_VAR,
-  ACP_RELAY_LOG_UPLOAD_URL_ENV_VAR,
-  configureAcpRelayTelemetry,
-  configureAcpRelayTelemetryFromEnv,
-  createAcpRelayLogRecordExporter,
-  createAcpRelayLogUploadUrl,
-  createAcpRelayLogUploader,
-  createAcpRelayLogUploaderFromEnv,
-  createAcpRelaySpanExporter,
-} from "./remote/relay-log-upload.js";
-export {
   listRuntimeAgentModeKeys,
   resolveRuntimeAgentModeId,
   runtimeAgentModeKey,
@@ -222,13 +208,3 @@ export type {
   AcpRuntimeUsageUpdatedEvent,
 } from "./core/types.js";
 export type { StdioFactoryOptions } from "./acp/stdio-connection.js";
-export type {
-  AcpRelayLogTextOptions,
-  AcpRelayLogUploader,
-  AcpRelayLogUploaderEnvOptions,
-  AcpRelayLogUploaderOptions,
-  AcpRelayLogUploadPayload,
-  AcpRelayLogUploadRecord,
-  AcpRelayLogUploadRecordKind,
-  AcpRelayTelemetry,
-} from "./remote/relay-log-upload.js";

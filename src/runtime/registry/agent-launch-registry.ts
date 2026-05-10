@@ -143,6 +143,15 @@ function agentCacheDirs(agentId: string): string[] {
   return runtimeCacheRootCandidates().map((root) => join(root, "agents", agentId));
 }
 
+function archiveCacheDirName(archiveFilename: string): string {
+  const withoutArchiveExtension = archiveFilename
+    .replace(/\.tar\.gz$/i, "")
+    .replace(/\.tgz$/i, "")
+    .replace(/\.zip$/i, "");
+  const safeName = withoutArchiveExtension.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return safeName || "archive";
+}
+
 async function isCacheFresh(filePath: string): Promise<boolean> {
   try {
     const info = await stat(filePath);
@@ -240,12 +249,14 @@ async function extractArchive(archivePath: string, destDir: string): Promise<voi
 async function ensureBinaryFromArchive(agentId: string, target: BinaryTarget): Promise<AgentLaunchConfig> {
   const archiveUrl = target.archive;
   const archiveFilename = archiveUrl.split("/").pop() ?? "agent.archive";
+  const cacheSubdir = archiveCacheDirName(archiveFilename);
   const cmdName = target.cmd.replace(/^\.\//, "");
   const failures: string[] = [];
 
   for (const cacheDir of agentCacheDirs(agentId)) {
-    const archivePath = join(cacheDir, archiveFilename);
-    const cachedCmd = resolve(cacheDir, cmdName);
+    const versionedCacheDir = join(cacheDir, cacheSubdir);
+    const archivePath = join(versionedCacheDir, archiveFilename);
+    const cachedCmd = resolve(versionedCacheDir, cmdName);
 
     try {
       await stat(cachedCmd);
@@ -259,7 +270,7 @@ async function ensureBinaryFromArchive(agentId: string, target: BinaryTarget): P
     }
 
     try {
-      await mkdir(cacheDir, { recursive: true });
+      await mkdir(versionedCacheDir, { recursive: true });
       return await withCacheLock(join(cacheDir, ".prepare.lock"), async () => {
         try {
           await stat(cachedCmd);
@@ -276,7 +287,7 @@ async function ensureBinaryFromArchive(agentId: string, target: BinaryTarget): P
         await downloadFile(archiveUrl, archivePath);
 
         process.stderr.write(`Extracting ${archiveFilename}...\n`);
-        await extractArchive(archivePath, cacheDir);
+        await extractArchive(archivePath, versionedCacheDir);
 
         if (platform() !== "win32") {
           spawnSync("chmod", ["+x", cachedCmd]);

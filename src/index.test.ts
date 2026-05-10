@@ -7,7 +7,6 @@ import {
   ACP_RUNTIME_HOME_DIR_ENV_VAR,
   ACP_RUNTIME_TERMINAL_AUTH_SUCCESS_PATTERNS_META_KEY,
   ACP_REGISTRY_AGENT_ALIASES,
-  ACP_RELAY_LOG_UPLOAD_ENV_VAR,
   ACP_PROTOCOL_ALIGNMENT_VERIFIED_AT,
   ACP_PROTOCOL_DOCS_SCHEMA_URL,
   ACP_PROTOCOL_DOCS_URL,
@@ -35,7 +34,6 @@ import {
   createGitHubCopilotAcpAgent,
   createOpenCodeAcpAgent,
   createPiAcpAgent,
-  createAcpRelayLogUploadUrl,
   createSimulatorAgentAcpAgent,
   listRuntimeAgentModeKeys,
   resolveRuntimeCachePath,
@@ -70,7 +68,6 @@ describe("public protocol alignment exports", () => {
     );
     expect(ACP_RUNTIME_HOME_DIR_ENV_VAR).toBe("ACP_RUNTIME_HOME_DIR");
     expect(ACP_RUNTIME_CACHE_DIR_ENV_VAR).toBe("ACP_RUNTIME_CACHE_DIR");
-    expect(ACP_RELAY_LOG_UPLOAD_ENV_VAR).toBe("ACP_RELAY_LOG_UPLOAD");
     expect(ACP_REGISTRY_AGENT_ALIASES.claude).toBe("claude-acp");
     expect(CLAUDE_CODE_ACP_COMMAND).toBe("claude-agent-acp");
     expect(CLAUDE_CODE_ACP_PACKAGE).toBe("@agentclientprotocol/claude-agent-acp");
@@ -90,9 +87,6 @@ describe("public protocol alignment exports", () => {
     expect(createGitHubCopilotAcpAgent).toBeTypeOf("function");
     expect(createOpenCodeAcpAgent).toBeTypeOf("function");
     expect(createPiAcpAgent).toBeTypeOf("function");
-    expect(createAcpRelayLogUploadUrl("wss://relay.test/client")).toBe(
-      "https://relay.test/api/logs",
-    );
     expect(createSimulatorAgentAcpAgent).toBeTypeOf("function");
     expect(resolveRuntimeHomePath).toBeTypeOf("function");
     expect(resolveRuntimeCachePath).toBeTypeOf("function");
@@ -112,11 +106,6 @@ describe("public protocol alignment exports", () => {
       "ACP_PROTOCOL_SOURCE_REPO",
       "ACP_PROTOCOL_VERSION",
       "ACP_REGISTRY_AGENT_ALIASES",
-      "ACP_RELAY_LOG_UPLOAD_BATCH_SIZE_ENV_VAR",
-      "ACP_RELAY_LOG_UPLOAD_ENV_VAR",
-      "ACP_RELAY_LOG_UPLOAD_FLUSH_INTERVAL_MS_ENV_VAR",
-      "ACP_RELAY_LOG_UPLOAD_TOKEN_ENV_VAR",
-      "ACP_RELAY_LOG_UPLOAD_URL_ENV_VAR",
       "ACP_RUNTIME_AUTHENTICATION_DEFAULT_METHOD_META_KEY",
       "ACP_RUNTIME_CACHE_DIR_ENV_VAR",
       "ACP_RUNTIME_HOME_DIR_ENV_VAR",
@@ -200,13 +189,6 @@ describe("public protocol alignment exports", () => {
       "SIMULATOR_AGENT_ACP_COMMAND",
       "SIMULATOR_AGENT_ACP_PACKAGE",
       "SIMULATOR_AGENT_ACP_REGISTRY_ID",
-      "configureAcpRelayTelemetry",
-      "configureAcpRelayTelemetryFromEnv",
-      "createAcpRelayLogRecordExporter",
-      "createAcpRelayLogUploadUrl",
-      "createAcpRelayLogUploader",
-      "createAcpRelayLogUploaderFromEnv",
-      "createAcpRelaySpanExporter",
       "createClaudeCodeAcpAgent",
       "createCodexAcpAgent",
       "createCursorAcpAgent",

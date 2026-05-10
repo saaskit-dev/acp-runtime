@@ -112,11 +112,11 @@ Rule:
 
 ### Host / adapter-only
 
-- `examples/runtime-demo-auth-adapter.ts`
+- `src/runtime/cli/auth-adapter.ts`
   - auth method prompting
   - terminal login process execution
   - generic metadata consumption
-- `examples/runtime-sdk-demo.ts`
+- `src/runtime/cli/runtime-command.ts`
   - CLI prompts and platform warnings
 
 ## Review Checklist

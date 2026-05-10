@@ -54,6 +54,10 @@ import {
   extractRuntimeConfig,
   mapSessionConfigOptions,
 } from "./capability-mapper.js";
+import {
+  mapRawToolOutputToOutputParts,
+  mapRawToolOutputToOutputText,
+} from "./raw-tool-output.js";
 
 export type AcpMappedPermissionRequest = {
   operation: AcpRuntimeOperation;
@@ -142,6 +146,9 @@ export function mapSessionUpdateToRuntimeEvents(input: {
     case "session_info_update":
       if (update.title !== undefined) {
         input.metadata.title = update.title ?? undefined;
+      }
+      if (update.updatedAt !== undefined) {
+        input.metadata.updatedAt = update.updatedAt ?? undefined;
       }
       return [
         {
@@ -405,6 +412,11 @@ function mapToolCallUpdateToRuntimeEvents(
       output: mapToolCallContentToOutput(update.content),
       outputText: collectToolCallContentText(update.content),
     };
+  } else if (update.rawOutput !== undefined && update.rawOutput !== null) {
+    existing.result = {
+      output: mapRawToolOutputToOutputParts(update.rawOutput),
+      outputText: mapRawToolOutputToOutputText(update.rawOutput),
+    };
   }
   if (
     existing.phase === RuntimeOperationPhase.Failed &&
@@ -485,12 +497,13 @@ function upsertOperationFromToolCall(input: {
   if (existingId) {
     const existing = input.turn.operations.get(existingId);
     if (existing) {
+      const kind = normalizeToolKind(input.kind);
       if (input.status) {
         existing.phase = mapOperationPhase(input.status);
       }
       existing.updatedAt = new Date().toISOString();
       existing.target = input.profile.inferOperationTarget({
-        kind: input.kind,
+        kind,
         locations: input.locations,
         rawInput: input.rawInput,
       });
@@ -498,13 +511,14 @@ function upsertOperationFromToolCall(input: {
     }
   }
 
+  const kind = normalizeToolKind(input.kind);
   const operation: AcpRuntimeOperation = {
     id: nextOperationId(input.turn),
-    kind: input.profile.mapOperationKind(input.kind),
+    kind: input.profile.mapOperationKind(kind),
     phase: mapOperationPhase(input.status ?? "pending"),
     startedAt: new Date().toISOString(),
     target: input.profile.inferOperationTarget({
-      kind: input.kind,
+      kind,
       locations: input.locations,
       rawInput: input.rawInput,
     }),
@@ -515,6 +529,24 @@ function upsertOperationFromToolCall(input: {
   input.turn.vendorToolCallToOperationId.set(input.toolCallId, operation.id);
   input.turn.operations.set(operation.id, operation);
   return cloneOperation(operation);
+}
+
+function normalizeToolKind(kind: ToolKind | null | undefined): ToolKind {
+  switch (kind) {
+    case "read":
+    case "edit":
+    case "delete":
+    case "move":
+    case "search":
+    case "execute":
+    case "think":
+    case "fetch":
+    case "switch_mode":
+    case "other":
+      return kind;
+    default:
+      return "other";
+  }
 }
 
 function extractText(

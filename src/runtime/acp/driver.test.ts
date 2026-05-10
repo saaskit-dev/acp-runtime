@@ -219,10 +219,10 @@ describe("AcpSdkSessionDriver thread-first model", () => {
     );
     expect(
       logs.find((record) => record.eventName === "acp.turn.started")?.body,
-    ).toBe("hello");
+    ).toBe("Turn started.");
     expect(
       logs.find((record) => record.eventName === "acp.turn.output")?.body,
-    ).toBe("done");
+    ).toBe("Assistant output chunk.");
   });
 
   it("applies observability redaction before writing captured content", async () => {
@@ -404,9 +404,41 @@ describe("AcpSdkSessionDriver thread-first model", () => {
       },
     } satisfies SessionNotification);
 
+    await bridge.sessionUpdate({
+      sessionId: "session-1",
+      update: {
+        rawInput: {
+          target: "button[data-route=\"clients\"]",
+        },
+        sessionUpdate: "tool_call",
+        status: "in_progress",
+        title: "browser_click",
+        toolCallId: "tool-2",
+      },
+    } satisfies SessionNotification);
+
+    await bridge.sessionUpdate({
+      sessionId: "session-1",
+      update: {
+        rawOutput:
+          "Wall time: 1.1160 seconds\nOutput:\nclicked clients tab",
+        sessionUpdate: "tool_call_update",
+        status: "completed",
+        toolCallId: "tool-2",
+      },
+    } satisfies SessionNotification);
+
     expect(driver.threadEntries()).toEqual([
       {
         content: [
+          {
+            changeType: "write",
+            id: "diff-1",
+            kind: "diff",
+            newText: "hello",
+            oldText: "",
+            path: "/tmp/hello.md",
+          },
           {
             command: "npm test",
             cwd: "/tmp/project",
@@ -438,6 +470,32 @@ describe("AcpSdkSessionDriver thread-first model", () => {
         title: "Write hello.md",
         toolCallId: "tool-1",
         toolKind: "edit",
+        turnId: expect.any(String),
+      },
+      {
+        content: [
+          {
+            id: "raw-output-1",
+            kind: "content",
+            part: {
+              text: "Wall time: 1.1160 seconds\nOutput:\nclicked clients tab",
+              type: "text",
+            },
+            text: "Wall time: 1.1160 seconds\nOutput:\nclicked clients tab",
+          },
+        ],
+        id: "tool-call-2",
+        kind: "tool_call",
+        locations: undefined,
+        rawInput: {
+          target: "button[data-route=\"clients\"]",
+        },
+        rawOutput:
+          "Wall time: 1.1160 seconds\nOutput:\nclicked clients tab",
+        status: "completed",
+        title: "browser_click",
+        toolCallId: "tool-2",
+        toolKind: "other",
         turnId: expect.any(String),
       },
     ]);

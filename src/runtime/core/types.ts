@@ -677,6 +677,7 @@ export type AcpRuntimeSessionMetadata = {
   currentModeId?: string;
   id: string;
   title?: string;
+  updatedAt?: string;
 };
 
 export type AcpRuntimeUsage = {

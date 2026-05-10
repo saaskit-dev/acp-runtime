@@ -1,4 +1,4 @@
-# Runtime SDK Demo
+# Runtime CLI
 
 [English](../../guides/runtime-sdk-demo.md)
 
@@ -15,15 +15,15 @@
 
 不直接使用 ACP 原始方法，也不使用厂商私有协议细节。
 
-## 示例源码
+## 源码模块
 
-- [runtime-sdk-demo.ts](../../../examples/runtime-sdk-demo.ts)
+- [runtime-command.ts](../../../src/runtime/cli/runtime-command.ts)
 
 建议配合阅读：
 - [Runtime SDK 分阶段接入](runtime-sdk-by-scenario.md)
 - [Runtime SDK API 覆盖矩阵](runtime-sdk-api-coverage.md)
 
-这个统一示例默认通过 `runtime.sessions.start({ agent })` 进入 runtime，并通过 agent id 切换行为。
+正式维护的 `./run runtime` 命令默认通过 `runtime.sessions.start({ agent })` 进入 runtime，并通过 agent id 切换行为。
 
 ## 覆盖的场景
 
@@ -40,7 +40,7 @@
 
 ## 在阅读顺序中的位置
 
-建议先看完分阶段示例，再回到这个完整 demo。
+建议先看完分阶段示例，再回到这个完整命令。
 它更适合一次性查看完整用户宿主流程：
 
 - startup
@@ -53,7 +53,7 @@
 
 ## 设计说明
 
-- 示例里的 `runtime` 代表宿主拿到的顶层 SDK 实例
+- 命令里的 `runtime` 代表宿主拿到的顶层 SDK 实例
 - agent 启动通过 runtime 的 registry 入口解析，而不是手写 launch 参数
 - 原生 agent 控制通过 `session.agent.setMode()` 与 `session.agent.setConfigOption()` 表达
 - 权限处理通过 `permission` handler 表达，而不是 raw ACP message

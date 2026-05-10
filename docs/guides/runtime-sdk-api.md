@@ -603,4 +603,4 @@ Top-level typed runtime errors:
 ## Examples
 
 - [Runtime SDK Minimal Demo](runtime-sdk-minimal-demo.md)
-- [Runtime SDK Demo](runtime-sdk-demo.md)
+- [Runtime CLI](runtime-sdk-demo.md)

@@ -33,6 +33,18 @@ describe("resolveAcpAgentProfile", () => {
 
     expect(standard.mapOperationKind("execute")).toBe("execute_command");
     expect(local.mapOperationKind("search")).toBe("read_file");
+    expect(standard.mapOperationKind("other")).toBe("mcp_call");
+    expect(standard.mapOperationKind("view_image" as never)).toBe("mcp_call");
+    expect(
+      standard.inferOperationTarget({
+        kind: "other",
+        locations: undefined,
+        rawInput: { args: ["status"], command: "git" },
+      }),
+    ).toEqual({
+      type: "command",
+      value: "git status",
+    });
   });
 
   it("resolves Claude profiles", () => {

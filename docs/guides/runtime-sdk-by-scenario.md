@@ -162,7 +162,7 @@ Use this stage when you are building a real host integration instead of a simple
 
 Source examples:
 - [runtime-sdk-stage-7-host-authority.ts](../../examples/runtime-sdk-stage-7-host-authority.ts)
-- [runtime-demo-auth-adapter.ts](../../examples/runtime-demo-auth-adapter.ts)
+- [auth-adapter.ts](../../src/runtime/cli/auth-adapter.ts)
 
 Primary APIs:
 - `AcpRuntimeAuthorityHandlers`
@@ -184,7 +184,7 @@ Use the full demo when you want the whole host flow in one place:
 - timeline rendering
 
 Source example:
-- [runtime-sdk-demo.ts](../../examples/runtime-sdk-demo.ts)
+- [runtime-command.ts](../../src/runtime/cli/runtime-command.ts)
 
 Guide:
-- [Runtime SDK Demo](runtime-sdk-demo.md)
+- [Runtime CLI](runtime-sdk-demo.md)

@@ -821,39 +821,69 @@ function mergeToolContent(
     return incoming;
   }
 
-  return incoming.map((next) => {
-    const previous = existing.find((entry) => toolContentKey(entry) === toolContentKey(next));
-    if (!previous) {
-      return next;
-    }
+  if (incoming.length === 0) {
+    return existing;
+  }
 
-    if (
-      next.kind === AcpRuntimeThreadToolContentKind.Terminal &&
-      previous.kind === AcpRuntimeThreadToolContentKind.Terminal
-    ) {
-      return {
-        ...previous,
-        ...next,
-        command: next.command ?? previous.command,
-        cwd: next.cwd ?? previous.cwd,
-        output: next.output ?? previous.output,
-        truncated: next.truncated ?? previous.truncated,
-      };
+  const usedIncomingKeys = new Set<string>();
+  const merged = existing.map((previous) => {
+    const previousKey = toolContentKey(previous);
+    const next = incoming.find((entry) => toolContentKey(entry) === previousKey);
+    if (!next) {
+      return previous;
     }
-
-    if (
-      next.kind === AcpRuntimeThreadToolContentKind.Diff &&
-      previous.kind === AcpRuntimeThreadToolContentKind.Diff
-    ) {
-      return {
-        ...previous,
-        ...next,
-        changeType: next.changeType ?? previous.changeType,
-      };
-    }
-
-    return next;
+    usedIncomingKeys.add(previousKey);
+    return mergeToolContentItem(previous, next);
   });
+
+  for (const next of incoming) {
+    const key = toolContentKey(next);
+    if (!usedIncomingKeys.has(key)) {
+      merged.push(next);
+    }
+  }
+
+  return merged;
+}
+
+function mergeToolContentItem(
+  previous: AcpRuntimeThreadToolContent,
+  next: AcpRuntimeThreadToolContent,
+): AcpRuntimeThreadToolContent {
+  if (previous.kind !== next.kind) {
+    return next;
+  }
+
+  if (next.kind === AcpRuntimeThreadToolContentKind.Content) {
+    return next;
+  }
+
+  if (
+    next.kind === AcpRuntimeThreadToolContentKind.Terminal &&
+    previous.kind === AcpRuntimeThreadToolContentKind.Terminal
+  ) {
+    return {
+      ...previous,
+      ...next,
+      command: next.command ?? previous.command,
+      cwd: next.cwd ?? previous.cwd,
+      output: next.output ?? previous.output,
+      truncated: next.truncated ?? previous.truncated,
+    };
+  }
+
+  if (
+    next.kind === AcpRuntimeThreadToolContentKind.Diff &&
+    previous.kind === AcpRuntimeThreadToolContentKind.Diff
+  ) {
+    return {
+      ...previous,
+      ...next,
+      changeType: next.changeType ?? previous.changeType,
+    };
+  }
+
+  return next;
 }
 
 function toolContentKey(content: AcpRuntimeThreadToolContent): string {

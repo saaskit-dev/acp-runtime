@@ -156,14 +156,14 @@ const session = await runtime.sessions.start({
 const result = await session.turn.run("hello");
 ```
 
-## Demo CLI Raw Logs
+## Runtime CLI Logs
 
-The `./run runtime ...` demo CLI writes logs by default under
+The `./run runtime ...` runtime CLI writes logs by default under
 `~/.acp-runtime/logs/runtime.log`. Use `--log-file <path>` to override the
 location, or `--no-log-file` to disable file logging for that run.
 
 For the default `runtime.log` path, each process starts a fresh "latest" log.
-After the ACP session is created, the demo also mirrors the same content into
+After the ACP session is created, the CLI also mirrors the same content into
 `~/.acp-runtime/logs/sessions/<sessionId>/`. Startup records emitted before the
 session id exists are backfilled into that session directory.
 
@@ -171,8 +171,15 @@ It writes these outputs:
 
 - `<path>`: human-readable terminal transcript
 - `<path>.jsonl`: OpenTelemetry-shaped log records
+- `<path>.events.jsonl`: log-record view derived from `<path>.jsonl`
+- `<path>.spans.jsonl`: span view derived from OpenTelemetry finished spans
+- `<path>.text.jsonl`: terminal transcript lines as structured text records
+- `<path>.errors.jsonl`: warning/error-oriented view derived from events and text
 - `sessions/<sessionId>/runtime.log`: per-session human transcript for the default path
 - `sessions/<sessionId>/runtime.log.jsonl`: per-session raw log records for the default path
+
+The classified files are views for faster triage, not separate sources of truth.
+The session files are mirrors of the same run-level records scoped to one session.
 
 The raw `.jsonl` file is no longer a custom `recordType` event stream.
 It now mirrors the same log signal model used by the SDK core, including fields such as:
@@ -184,6 +191,35 @@ It now mirrors the same log signal model used by the SDK core, including fields 
 - `severityText`
 - `instrumentationScope`
 - `spanContext`
+
+Runtime CLI-specific events use the `acp.runtime_cli.*` namespace, for example
+`acp.runtime_cli.authentication.selected`, `acp.runtime_cli.local_command`, and
+`acp.runtime_cli.permission.resolved`.
+
+## Log And Trace Boundary
+
+Some lifecycle names intentionally appear as both spans and log events.
+For example, `acp.session.start`, `acp.turn`, `acp.tool`, and `acp.permission`
+spans capture duration, parent/child relationships, status, and aggregated
+attributes. Matching log events such as `acp.session.start`,
+`acp.turn.started`, `acp.tool.completed`, and `acp.permission.resolved` capture
+discrete facts that are easy to grep and replay as a timeline.
+
+Use this rule of thumb:
+
+- spans answer "how long, under which parent, with which outcome?"
+- log events answer "what happened at this point in the timeline?"
+- raw protocol logs answer "what exact ACP JSON-RPC message crossed the wire?"
+- classified files answer "show me a filtered view quickly"
+- session mirrors answer "show me only records related to this session"
+
+Large content is kept out of high-level runtime log event bodies. Prompt,
+assistant output, thoughts, plans, tool raw input/output, terminal output, and
+diff text are attached through span attributes/events or raw protocol logs,
+subject to `observability.captureContent` and `redact(...)`. Hosts that want to
+avoid content duplication should prefer `captureContent: "summary"` or
+`captureContent: "none"` and keep full payloads only in the raw protocol log or
+in their own secure storage.
 
 ## ACP Trace Propagation
 

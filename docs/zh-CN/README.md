@@ -17,9 +17,7 @@
 - [Runtime SDK API 覆盖矩阵](guides/runtime-sdk-api-coverage.md)
 - [Runtime SDK 读模型说明](guides/runtime-sdk-read-models.md)
 - [Runtime SDK Minimal Demo](guides/runtime-sdk-minimal-demo.md)
-- [Runtime SDK Demo](guides/runtime-sdk-demo.md)
-- [Remote ACP Runtime 实施计划](guides/remote-acp-runtime-implementation-plan.md)
-- [Remote ACP Runtime 部署指南](guides/remote-acp-runtime-deployment.md)
+- [Runtime CLI](guides/runtime-sdk-demo.md)
 
 ## Active RFC
 
@@ -28,7 +26,6 @@
 - [RFC-0003：Runtime Snapshot、Policy 与 Recovery](rfcs/0003-runtime-snapshot-policy-and-recovery.md)
 - [RFC-0004：Runtime Diagnostics 与 Host Integration](rfcs/0004-runtime-diagnostics-and-host-integration.md)
 - [RFC-0005：Simulator Agent ACP](rfcs/0005-simulator-agent.md)
-- [RFC-0006：Remote ACP Runtime Relay](rfcs/0006-remote-acp-runtime-relay.md)
 
 ## Research
 

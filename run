@@ -41,13 +41,16 @@ case "$target" in
     fi
 
     if [[ $# -eq 0 ]]; then
-      echo 'usage: ./run runtime <agent-id> [--sessions] [--load SESSION_ID] [--resume SESSION_ID] [--resume-last] [--mode ID] [--model ID] [--effort LEVEL] [--initial-config-strict] [--system-prompt TEXT] [--system-prompt-file PATH] [--prompt TEXT] [--log-file PATH] [--no-log-file] [prompt...]' >&2
+      echo 'usage: ./run runtime [agent-id] [--sessions] [--load SESSION_ID] [--resume SESSION_ID] [--resume-last] [--mode ID] [--model ID] [--effort LEVEL] [--initial-config-strict] [--system-prompt TEXT] [--system-prompt-file PATH] [--prompt TEXT] [--log-file PATH] [--no-log-file] [prompt...]' >&2
       echo '       ./run runtime --list-agents' >&2
       exit 2
     fi
 
-    agent="$1"
-    shift
+    agent=""
+    if [[ $# -gt 0 && "$1" != --* ]]; then
+      agent="$1"
+      shift
+    fi
     prompt=""
     log_file="${ACP_RUNTIME_LOG_FILE:-}"
     log_arg=""
@@ -147,11 +150,16 @@ case "$target" in
 
     pnpm run build:self
 
-    if [[ -n "$prompt" ]]; then
-      exec node dist/examples/runtime-sdk-demo.js "$agent" "${runtime_args[@]}" "$prompt"
+    demo_args=()
+    if [[ -n "$agent" ]]; then
+      demo_args+=("$agent")
     fi
 
-    exec node dist/examples/runtime-sdk-demo.js "$agent" "${runtime_args[@]}"
+    if [[ -n "$prompt" ]]; then
+      exec node dist/runtime/cli/runtime-command.js "${demo_args[@]}" "${runtime_args[@]}" "$prompt"
+    fi
+
+    exec node dist/runtime/cli/runtime-command.js "${demo_args[@]}" "${runtime_args[@]}"
     ;;
   *)
     exec make "$target" "$@"

@@ -143,7 +143,7 @@
 
 源码：
 - [runtime-sdk-stage-7-host-authority.ts](../../../examples/runtime-sdk-stage-7-host-authority.ts)
-- [runtime-demo-auth-adapter.ts](../../../examples/runtime-demo-auth-adapter.ts)
+- [auth-adapter.ts](../../../src/runtime/cli/auth-adapter.ts)
 
 覆盖：
 - `AcpRuntimeAuthorityHandlers`
@@ -165,7 +165,7 @@
 - timeline 渲染
 
 源码：
-- [runtime-sdk-demo.ts](../../../examples/runtime-sdk-demo.ts)
+- [runtime-command.ts](../../../src/runtime/cli/runtime-command.ts)
 
 说明：
-- [Runtime SDK Demo](runtime-sdk-demo.md)
+- [Runtime CLI](runtime-sdk-demo.md)

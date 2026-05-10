@@ -344,6 +344,56 @@ describe("agent launch registry", () => {
     });
   });
 
+  it("keys cached archive binaries by archive filename so registry upgrades do not reuse stale binaries", async () => {
+    mockStat.mockResolvedValueOnce({
+      mtimeMs: Date.now(),
+    });
+    mockReadFile.mockResolvedValueOnce(JSON.stringify({
+      agents: [
+        {
+          description: "Codex",
+          distribution: {
+            binary: {
+              "linux-x86_64": {
+                archive: "https://example.invalid/codex-acp-0.14.0-x86_64-unknown-linux-gnu.tar.gz",
+                cmd: "./codex-acp",
+              },
+            },
+          },
+          id: "codex-acp",
+          name: "Codex CLI",
+          version: "0.14.0",
+        },
+      ],
+      version: "1",
+    }));
+    mockSpawnSync.mockReturnValue({
+      status: 1,
+    });
+    mockStat.mockResolvedValueOnce({});
+
+    const { resolveAgentLaunch } = await import("./agent-launch-registry.js");
+    const launch = await resolveAgentLaunch("codex-acp");
+
+    expect(launch).toEqual({
+      args: [],
+      command: resolve(
+        "/mock-home/.acp-runtime/cache/agents/codex-acp/codex-acp-0.14.0-x86_64-unknown-linux-gnu",
+        "codex-acp",
+      ),
+      env: {},
+    });
+    expect(mockStat).toHaveBeenLastCalledWith(
+      resolve(
+        "/mock-home/.acp-runtime/cache/agents/codex-acp/codex-acp-0.14.0-x86_64-unknown-linux-gnu",
+        "codex-acp",
+      ),
+    );
+    expect(mockStat).not.toHaveBeenCalledWith(
+      resolve("/mock-home/.acp-runtime/cache/agents/codex-acp", "codex-acp"),
+    );
+  });
+
   it("fails clearly when the registry fetch fails and there is no fresh cache", async () => {
     mockStat.mockRejectedValueOnce(new Error("missing cache"));
     vi.mocked(fetch).mockResolvedValueOnce({

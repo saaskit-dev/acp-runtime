@@ -14,6 +14,4 @@ Language:
 - [Runtime SDK Observability](runtime-sdk-observability.md)
 - [Runtime SDK Read Models](runtime-sdk-read-models.md)
 - [Runtime SDK Minimal Demo](runtime-sdk-minimal-demo.md)
-- [Runtime SDK Demo](runtime-sdk-demo.md)
-- [Remote ACP Runtime Implementation Plan](remote-acp-runtime-implementation-plan.md)
-- [Remote ACP Runtime Deployment Guide](remote-acp-runtime-deployment.md)
+- [Runtime CLI](runtime-sdk-demo.md)

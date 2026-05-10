@@ -5,9 +5,9 @@ import { fileURLToPath } from "node:url";
 export function resolveSimulatorWorkspaceRoot(): string {
   const here = dirname(fileURLToPath(import.meta.url));
   const candidates = [
-    // Source execution: src/runtime/registry -> repo root.
+    // Source and normal compiled execution both use */runtime/registry -> repo root.
     resolve(here, "..", "..", "..", "packages", "simulator-agent"),
-    // Compiled harness execution: dist/src/runtime/registry -> repo root.
+    // Backward-compatible fallback for older dist/src/runtime/registry output.
     resolve(here, "..", "..", "..", "..", "packages", "simulator-agent"),
     // CLI/scripts are normally launched from the repository root.
     resolve(process.cwd(), "packages", "simulator-agent"),

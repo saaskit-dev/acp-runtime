@@ -561,4 +561,4 @@ snapshot 模型里没有独立的 runtime `agentId` 字段。
 ## 示例
 
 - [Runtime SDK Minimal Demo](runtime-sdk-minimal-demo.md)
-- [Runtime SDK Demo](runtime-sdk-demo.md)
+- [Runtime CLI](runtime-sdk-demo.md)

@@ -218,6 +218,73 @@ describe("session update mapper permission evidence", () => {
     );
   });
 
+  it("maps missing tool kind to a standard mcp operation and exposes raw output", () => {
+    const turn = createTurnState();
+    const startedEvents = mapSessionUpdateToRuntimeEvents({
+      diagnostics: {},
+      metadata: createMetadata(),
+      notification: {
+        sessionId: "session-1",
+        update: {
+          rawInput: {
+            target: "button[data-route=\"clients\"]",
+          },
+          sessionUpdate: "tool_call",
+          status: "in_progress",
+          title: "browser_click",
+          toolCallId: "tool-1",
+        },
+      } as never,
+      profile,
+      turn,
+    });
+
+    expect(startedEvents).toHaveLength(1);
+    expect(startedEvents[0]).toMatchObject({
+      operation: {
+        kind: "mcp_call",
+        phase: "running",
+        title: "browser_click",
+      },
+      type: "operation_started",
+    });
+
+    const updatedEvents = mapSessionUpdateToRuntimeEvents({
+      diagnostics: {},
+      metadata: createMetadata(),
+      notification: {
+        sessionId: "session-1",
+        update: {
+          rawOutput:
+            "Wall time: 1.1160 seconds\nOutput:\nclicked clients tab",
+          sessionUpdate: "tool_call_update",
+          status: "completed",
+          toolCallId: "tool-1",
+        },
+      } as never,
+      profile,
+      turn,
+    });
+
+    expect(updatedEvents).toHaveLength(1);
+    expect(updatedEvents[0]).toMatchObject({
+      operation: {
+        kind: "mcp_call",
+        phase: "completed",
+        result: {
+          output: [
+            {
+              text: "Wall time: 1.1160 seconds\nOutput:\nclicked clients tab",
+              type: "text",
+            },
+          ],
+          outputText: "Wall time: 1.1160 seconds\nOutput:\nclicked clients tab",
+        },
+      },
+      type: "operation_completed",
+    });
+  });
+
   it("classifies mode-denied failures without permission requests", () => {
     const turn = createTurnState();
     const initialEvents = mapSessionUpdateToRuntimeEvents({

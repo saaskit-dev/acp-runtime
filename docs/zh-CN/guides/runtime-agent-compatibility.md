@@ -103,11 +103,11 @@ metadata，让 generic host 不需要检查具体 agent id。
 
 ### 只应该在 Host / adapter
 
-- `examples/runtime-demo-auth-adapter.ts`
+- `src/runtime/cli/auth-adapter.ts`
   - auth method prompt
   - terminal login 进程执行
   - 消费通用 metadata
-- `examples/runtime-sdk-demo.ts`
+- `src/runtime/cli/runtime-command.ts`
   - CLI prompt 和平台提示
 
 ## 评审清单

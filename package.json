@@ -10,18 +10,28 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./internal/agent-launch-registry": {
+      "types": "./dist/internal/agent-launch-registry.d.ts",
+      "import": "./dist/internal/agent-launch-registry.js"
+    },
+    "./internal/launch-config": {
+      "types": "./dist/internal/launch-config.d.ts",
+      "import": "./dist/internal/launch-config.js"
+    },
+    "./internal/simulator-workspace": {
+      "types": "./dist/internal/simulator-workspace.d.ts",
+      "import": "./dist/internal/simulator-workspace.js"
     }
   },
   "files": [
     "dist/index.js",
     "dist/index.d.ts",
+    "dist/internal",
     "dist/runtime",
     "README.md",
     "LICENSE"
   ],
-  "bin": {
-    "acp-runtime": "dist/runtime/remote/bin.js"
-  },
   "publishConfig": {
     "access": "public"
   },
@@ -38,13 +48,12 @@
     "harness:run-agent": "node dist/harness/run-agent-matrix.js --gate full",
     "predemo:client-sdk": "pnpm run build",
     "demo:client-sdk": "node dist/examples/client-sdk-demo.js",
-    "predemo:runtime:claude": "pnpm run build",
-    "demo:runtime:claude": "node dist/examples/runtime-sdk-demo.js claude-acp",
-    "predemo:runtime": "pnpm run build",
-    "demo:runtime": "node dist/examples/runtime-sdk-demo.js",
+    "preruntime:claude": "pnpm run build",
+    "runtime:claude": "node dist/runtime/cli/runtime-command.js claude-acp",
+    "preruntime": "pnpm run build",
+    "runtime": "node dist/runtime/cli/runtime-command.js",
     "test": "pnpm --filter @saaskit-dev/simulator-agent-acp build && pnpm --filter @saaskit-dev/simulator-agent-acp test && vitest run",
     "test:watch": "vitest",
-    "remote:prod-smoke": "node scripts/remote-prod-smoke.mjs",
     "lint": "tsc --noEmit -p tsconfig.json && pnpm run build:lib && tsc --noEmit -p tsconfig.examples.json && tsc --noEmit -p tsconfig.harness.json",
     "prepublishOnly": "npm run build && npm test"
   },
@@ -69,7 +78,6 @@
     "@types/node": "^22.15.3",
     "@types/tar": "^7.0.87",
     "@types/unzipper": "^0.10.11",
-    "@types/ws": "^8.18.1",
     "typescript": "^5.5.0",
     "vitest": "^3.0.0"
   },
@@ -80,8 +88,7 @@
     "@opentelemetry/sdk-logs": "0.215.0",
     "@opentelemetry/sdk-trace-base": "^1.9.1",
     "tar": "^7.5.13",
-    "unzipper": "^0.12.3",
-    "ws": "^8.18.0"
+    "unzipper": "^0.12.3"
   },
   "repository": {
     "type": "git",

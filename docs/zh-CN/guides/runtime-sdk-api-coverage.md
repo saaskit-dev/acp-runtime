@@ -64,8 +64,8 @@ workaround；当新 agent 的行为和 runtime 期望的 ACP shape 不一致时�
 | `session.turn.run(...)` | 阶段 1 与阶段 5 |
 | `session.turn.send(...)` | 阶段 2 |
 | `session.turn.stream(...)` | 阶段 2 |
-| `session.turn.queue.clear()/sendNow()/get()/list()/remove()` | interactive smoke CLI：[`runtime-sdk-demo.ts`](../../examples/runtime-sdk-demo.ts) |
-| `session.queue.policy()/setPolicy(...)` | interactive smoke CLI：[`runtime-sdk-demo.ts`](../../examples/runtime-sdk-demo.ts) |
+| `session.turn.queue.clear()/sendNow()/get()/list()/remove()` | interactive runtime CLI：[`runtime-command.ts`](../../../src/runtime/cli/runtime-command.ts) |
+| `session.queue.policy()/setPolicy(...)` | interactive runtime CLI：[`runtime-command.ts`](../../../src/runtime/cli/runtime-command.ts) |
 
 ## Session 读模型
 

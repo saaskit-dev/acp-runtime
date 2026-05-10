@@ -19,9 +19,7 @@ Language:
 - [Runtime SDK API Coverage](guides/runtime-sdk-api-coverage.md)
 - [Runtime SDK Read Models](guides/runtime-sdk-read-models.md)
 - [Runtime SDK Minimal Demo](guides/runtime-sdk-minimal-demo.md)
-- [Runtime SDK Demo](guides/runtime-sdk-demo.md)
-- [Remote ACP Runtime Implementation Plan](guides/remote-acp-runtime-implementation-plan.md)
-- [Remote ACP Runtime Deployment Guide](guides/remote-acp-runtime-deployment.md)
+- [Runtime CLI](guides/runtime-sdk-demo.md)
 
 ## Active RFCs
 
@@ -30,7 +28,6 @@ Language:
 - [RFC-0003: Runtime Snapshot, Policy, and Recovery](rfcs/0003-runtime-snapshot-policy-and-recovery.md)
 - [RFC-0004: Runtime Diagnostics and Host Integration](rfcs/0004-runtime-diagnostics-and-host-integration.md)
 - [RFC-0005: Simulator Agent ACP](rfcs/0005-simulator-agent.md)
-- [RFC-0006: Remote ACP Runtime Relay](rfcs/0006-remote-acp-runtime-relay.md)
 
 ## Research
 

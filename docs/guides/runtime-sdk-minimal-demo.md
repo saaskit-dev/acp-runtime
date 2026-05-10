@@ -35,4 +35,4 @@ Use this demo when you want:
 
 For richer session state, streaming, operations, permissions, resume, and typed error handling, see:
 - [Runtime SDK By Scenario](runtime-sdk-by-scenario.md)
-- [Runtime SDK Demo](runtime-sdk-demo.md)
+- [Runtime CLI](runtime-sdk-demo.md)

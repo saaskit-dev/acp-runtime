@@ -33,4 +33,4 @@
 
 如果要看更完整的 session state、stream、operation、permission、resume 和 typed error handling，见：
 - [Runtime SDK 分阶段接入](runtime-sdk-by-scenario.md)
-- [Runtime SDK Demo](runtime-sdk-demo.md)
+- [Runtime CLI](runtime-sdk-demo.md)

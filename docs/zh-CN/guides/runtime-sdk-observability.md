@@ -161,22 +161,29 @@ const session = await runtime.sessions.start({
 const result = await session.turn.run("hello");
 ```
 
-## Demo CLI Raw 日志
+## Runtime CLI 日志
 
-`./run runtime ...` 这个 demo CLI 默认会写到
+`./run runtime ...` 这个 runtime CLI 默认会写到
 `~/.acp-runtime/logs/runtime.log`。可以用 `--log-file <path>` 覆盖位置，
 或用 `--no-log-file` 关闭本次文件日志。
 
 默认 `runtime.log` 路径每次进程启动都会写一份新的 latest 日志。ACP session 创建后，
-demo 会把同样内容镜像到 `~/.acp-runtime/logs/sessions/<sessionId>/`。在拿到
+CLI 会把同样内容镜像到 `~/.acp-runtime/logs/sessions/<sessionId>/`。在拿到
 session id 之前产生的启动日志会回填到这个 session 目录里。
 
 它会写这些输出：
 
 - `<path>`：给人看的终端文本日志
 - `<path>.jsonl`：OpenTelemetry 形状的 log records
+- `<path>.events.jsonl`：从 `<path>.jsonl` 派生出来的 log-record 视图
+- `<path>.spans.jsonl`：从 OpenTelemetry finished spans 派生出来的 span 视图
+- `<path>.text.jsonl`：结构化的终端文本记录
+- `<path>.errors.jsonl`：从 events 和 text 派生出来的 warning/error 视图
 - `sessions/<sessionId>/runtime.log`：默认路径下的单 session 文本日志
 - `sessions/<sessionId>/runtime.log.jsonl`：默认路径下的单 session raw log records
+
+分类文件是为了快速排查生成的视图，不是另一份事实来源。
+session 目录里的文件是同一轮运行日志按 session 做的镜像。
 
 raw `.jsonl` 已经不再是旧的自定义 `recordType` 事件流。
 现在它和 SDK core 使用的是同一套日志语义，字段会包括：
@@ -188,6 +195,33 @@ raw `.jsonl` 已经不再是旧的自定义 `recordType` 事件流。
 - `severityText`
 - `instrumentationScope`
 - `spanContext`
+
+Runtime CLI 自己的事件使用 `acp.runtime_cli.*` 命名空间，例如
+`acp.runtime_cli.authentication.selected`、`acp.runtime_cli.local_command` 和
+`acp.runtime_cli.permission.resolved`。
+
+## Log 和 Trace 的边界
+
+有些生命周期名称会同时出现在 span 和 log event 里，这是刻意保留的。
+例如 `acp.session.start`、`acp.turn`、`acp.tool`、`acp.permission`
+这些 span 负责记录耗时、父子关系、状态和聚合属性；对应的
+`acp.session.start`、`acp.turn.started`、`acp.tool.completed`、
+`acp.permission.resolved` 这些 log event 负责记录容易 grep、容易回放时间线的离散事实。
+
+可以按这个规则理解：
+
+- span 回答“耗时多久、父级是谁、结果是什么”
+- log event 回答“时间线上这一刻发生了什么”
+- raw protocol log 回答“线上实际传了哪条 ACP JSON-RPC 消息”
+- classified 文件回答“快速看过滤视图”
+- session mirror 回答“只看这个 session 相关记录”
+
+高层 runtime log event body 不再承载大内容。prompt、assistant output、
+thought、plan、tool raw input/output、terminal output 和 diff text 会通过
+span attributes/events 或 raw protocol log 记录，并受
+`observability.captureContent` 和 `redact(...)` 控制。如果宿主想减少内容重复，
+优先使用 `captureContent: "summary"` 或 `captureContent: "none"`，把完整
+payload 只留在 raw protocol log 或自己的安全存储里。
 
 ## ACP Trace 传递
 

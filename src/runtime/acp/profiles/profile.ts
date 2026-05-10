@@ -143,11 +143,7 @@ function inferOperationTarget(input: {
     };
   }
 
-  if (
-    input.kind === "execute" &&
-    isRecord(input.rawInput) &&
-    typeof input.rawInput.command === "string"
-  ) {
+  if (isRecord(input.rawInput) && typeof input.rawInput.command === "string") {
     const args = Array.isArray(input.rawInput.args)
       ? input.rawInput.args.filter(
           (value): value is string => typeof value === "string",
@@ -188,8 +184,10 @@ function mapOperationKind(
       return "execute_command";
     case "fetch":
       return "network_request";
+    case "other":
+      return "mcp_call";
     default:
-      return "unknown";
+      return "mcp_call";
   }
 }
 

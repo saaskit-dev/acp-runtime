@@ -74,7 +74,6 @@ import { AcpClientBridge } from "./authority-bridge.js";
 import {
   emitRuntimeLog,
   emitRuntimeSuppressedError,
-  observedLogBody,
 } from "../observability/logging.js";
 import {
   captureContentAttribute,
@@ -107,6 +106,8 @@ import {
   mapSessionUpdateToRuntimeEvents,
   mapUsage,
 } from "./session-update-mapper.js";
+import { normalizeSessionNotification } from "./session-update-normalizer.js";
+import { mapRawToolOutputToThreadContent } from "./raw-tool-output.js";
 import { mapPromptToAcp } from "./prompt-mapper.js";
 import { createTurnState, type AcpRuntimeTurnState } from "./turn-state.js";
 
@@ -734,15 +735,7 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
         "acp.turn.id": state.turnId,
         ...promptAttributes(prompt),
       },
-      body: observedLogBody({
-        options: this.observability,
-        redactContext: {
-          kind: "prompt",
-          sessionId: this.bootstrap.sessionId,
-          turnId: state.turnId,
-        },
-        value: prompt,
-      }) ?? "Turn queued.",
+      body: "Turn queued.",
       context: turnContext,
       eventName: "acp.turn.queued",
     });
@@ -863,9 +856,14 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
   private async handleSessionUpdate(
     params: SessionNotification,
   ): Promise<void> {
-    if (params.sessionId !== this.bootstrap.sessionId) {
+    const normalizedParams = normalizeSessionNotification(params);
+    if (
+      !normalizedParams ||
+      normalizedParams.sessionId !== this.bootstrap.sessionId
+    ) {
       return;
     }
+    params = normalizedParams;
 
     const activeTurn = this.currentTurn;
     const turnState = activeTurn?.state ?? this.historyTurn;
@@ -1091,15 +1089,7 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
         "acp.turn.id": queuedTurn.activeTurn.state.turnId,
         ...promptAttributes(prompt),
       },
-      body: observedLogBody({
-        options: this.observability,
-        redactContext: {
-          kind: "prompt",
-          sessionId: this.bootstrap.sessionId,
-          turnId: queuedTurn.activeTurn.state.turnId,
-        },
-        value: prompt,
-      }) ?? "Turn started.",
+      body: "Turn started.",
       context: queuedTurn.activeTurn.telemetry.turnContext,
       eventName: "acp.turn.started",
     });
@@ -1350,15 +1340,7 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
             "acp.turn.id": event.turnId,
             "acp.session.id": this.bootstrap.sessionId,
           },
-          body: observedLogBody({
-            options: this.observability,
-            redactContext: {
-              kind: AcpRuntimeObservabilityRedactionKind.AssistantThought,
-              sessionId: this.bootstrap.sessionId,
-              turnId: event.turnId,
-            },
-            value: event.text,
-          }) ?? "Assistant thought chunk.",
+          body: "Assistant thought chunk.",
           context: activeTurn.telemetry.turnContext,
           eventName: "acp.turn.thought",
         });
@@ -1383,15 +1365,7 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
             "acp.turn.id": event.turnId,
             "acp.session.id": this.bootstrap.sessionId,
           },
-          body: observedLogBody({
-            options: this.observability,
-            redactContext: {
-              kind: AcpRuntimeObservabilityRedactionKind.AssistantOutput,
-              sessionId: this.bootstrap.sessionId,
-              turnId: event.turnId,
-            },
-            value: event.text,
-          }) ?? "Assistant output chunk.",
+          body: "Assistant output chunk.",
           context: activeTurn.telemetry.turnContext,
           eventName: "acp.turn.output",
         });
@@ -1416,15 +1390,7 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
             "acp.turn.id": event.turnId,
             "acp.session.id": this.bootstrap.sessionId,
           },
-          body: observedLogBody({
-            options: this.observability,
-            redactContext: {
-              kind: AcpRuntimeObservabilityRedactionKind.Plan,
-              sessionId: this.bootstrap.sessionId,
-              turnId: event.turnId,
-            },
-            value: event.plan,
-          }) ?? "Turn plan updated.",
+          body: "Turn plan updated.",
           context: activeTurn.telemetry.turnContext,
           eventName: "acp.turn.plan",
         });
@@ -1570,15 +1536,7 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
             "acp.turn.id": event.turnId,
             "acp.turn.outcome": "completed",
           },
-          body: observedLogBody({
-            options: this.observability,
-            redactContext: {
-              kind: AcpRuntimeObservabilityRedactionKind.AssistantOutput,
-              sessionId: this.bootstrap.sessionId,
-              turnId: event.turnId,
-            },
-            value: event.outputText,
-          }) ?? "Turn completed.",
+          body: "Turn completed.",
           context: activeTurn.telemetry.turnContext,
           eventName: "acp.turn.completed",
         });
@@ -1889,11 +1847,20 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     }
 
     if (update.sessionUpdate === "tool_call") {
-      const content = await mapToolCallContentToThreadContent({
+      const mappedContent = await mapToolCallContentToThreadContent({
         content: update.content ?? [],
         rawInput: update.rawInput ?? undefined,
         terminalHandler: this.bootstrap.handlers?.terminal,
       });
+      const content =
+        mappedContent.length === 0 &&
+        update.rawOutput !== undefined &&
+        update.rawOutput !== null
+          ? mapRawToolOutputToThreadContent({
+              idPrefix: "raw-output",
+              value: update.rawOutput,
+            })
+          : mappedContent;
       if (!shouldCommit()) {
         return false;
       }
@@ -1921,6 +1888,13 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
               rawInput,
               terminalHandler: this.bootstrap.handlers?.terminal,
             })
+          : update.rawOutput !== undefined &&
+              update.rawOutput !== null &&
+              (!existing || existing.content.length === 0)
+            ? mapRawToolOutputToThreadContent({
+                idPrefix: "raw-output",
+                value: update.rawOutput,
+              })
           : undefined;
       if (!shouldCommit()) {
         return false;
@@ -1933,7 +1907,10 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
         status: update.status ? mapToolCallStatus(update.status) : undefined,
         title: update.title ?? undefined,
         toolCallId: update.toolCallId,
-        toolKind: mapToolKind(update.kind ?? undefined),
+        toolKind:
+          update.kind === undefined || update.kind === null
+            ? undefined
+            : mapToolKind(update.kind),
         turnId,
       });
       return true;
@@ -2160,7 +2137,7 @@ function mapToolCallStatus(
 }
 
 function mapToolKind(kind: ToolKind | undefined): string | undefined {
-  return kind ?? undefined;
+  return kind ?? "other";
 }
 
 function mapTerminalStatus(

@@ -1,6 +1,6 @@
 ---
 name: acp-runtime-log-triage
-description: Use this skill whenever the user asks to debug, inspect, search, explain, or correlate acp-runtime logs, relay logs, bridge logs, daemon logs, runtime demo logs, Cloudflare logs, traceId/sessionId issues, missing remote sessions, auth failures, daemon disconnects, timeouts, or "全链路日志". This skill gives the project-specific log locations, IDs, filters, and troubleshooting playbooks for acp-runtime.
+description: Use this skill whenever the user asks to debug, inspect, search, explain, or correlate acp-runtime logs, relay logs, bridge logs, daemon logs, runtime CLI logs, Cloudflare logs, traceId/sessionId issues, missing remote sessions, auth failures, daemon disconnects, timeouts, or "全链路日志". This skill gives the project-specific log locations, IDs, filters, and troubleshooting playbooks for acp-runtime.
 ---
 
 # acp-runtime Log Triage
@@ -25,7 +25,7 @@ When the user asks to investigate a problem:
 High-signal opening questions when needed:
 
 - "有 `traceId`、`sessionId`、`connectionId` 或大概时间吗？"
-- "这是本地 runtime demo、stdio bridge，还是 remote daemon/relay 链路？"
+- "这是本地 runtime CLI、stdio bridge，还是 remote daemon/relay 链路？"
 - "问题发生在 `session/new`、`session/load`、`session/prompt`、auth，还是 daemon 连接阶段？"
 
 Do not block on questions if local logs are available. Start with recent errors.
@@ -55,23 +55,23 @@ Important trace behavior:
 
 Default runtime home is `~/.acp-runtime`.
 
-Runtime demo:
+Runtime CLI:
 
 - `~/.acp-runtime/logs/runtime.log`
 - `~/.acp-runtime/logs/runtime.log.jsonl`
 - `~/.acp-runtime/logs/runtime.log.text.jsonl`
-- `~/.acp-runtime/logs/runtime.log.events.jsonl`
-- `~/.acp-runtime/logs/runtime.log.spans.jsonl`
-- `~/.acp-runtime/logs/runtime.log.errors.jsonl`
+- `~/.acp-runtime/logs/runtime.log.events.jsonl` (derived event view)
+- `~/.acp-runtime/logs/runtime.log.spans.jsonl` (derived span view)
+- `~/.acp-runtime/logs/runtime.log.errors.jsonl` (derived warning/error view)
 
-Runtime demo session mirror:
+Runtime CLI session mirror:
 
 - `~/.acp-runtime/logs/sessions/<sessionId>/runtime.log`
 - `~/.acp-runtime/logs/sessions/<sessionId>/runtime.log.jsonl`
 - `~/.acp-runtime/logs/sessions/<sessionId>/runtime.log.text.jsonl`
-- `~/.acp-runtime/logs/sessions/<sessionId>/runtime.log.events.jsonl`
-- `~/.acp-runtime/logs/sessions/<sessionId>/runtime.log.spans.jsonl`
-- `~/.acp-runtime/logs/sessions/<sessionId>/runtime.log.errors.jsonl`
+- `~/.acp-runtime/logs/sessions/<sessionId>/runtime.log.events.jsonl` (derived event mirror)
+- `~/.acp-runtime/logs/sessions/<sessionId>/runtime.log.spans.jsonl` (derived span mirror)
+- `~/.acp-runtime/logs/sessions/<sessionId>/runtime.log.errors.jsonl` (derived warning/error mirror)
 
 stdio bridge:
 
@@ -94,7 +94,7 @@ Overrides:
 
 - `ACP_RUNTIME_HOME_DIR`
 - `ACP_RUNTIME_CACHE_DIR`
-- runtime demo `--log-file`
+- runtime CLI `--log-file`
 
 ## Local Commands
 

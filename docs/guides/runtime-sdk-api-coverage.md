@@ -67,8 +67,8 @@ the runtime.
 | `session.turn.run(...)` | Stage 1 and Stage 5 |
 | `session.turn.send(...)` | Stage 2, [runtime-sdk-stage-2-interactive.ts](../../examples/runtime-sdk-stage-2-interactive.ts) |
 | `session.turn.stream(...)` | Stage 2, [runtime-sdk-stage-2-interactive.ts](../../examples/runtime-sdk-stage-2-interactive.ts) |
-| `session.turn.queue.clear()/sendNow()/get()/list()/remove()` | Interactive smoke CLI, [runtime-sdk-demo.ts](../../examples/runtime-sdk-demo.ts) |
-| `session.queue.policy()/setPolicy(...)` | Interactive smoke CLI, [runtime-sdk-demo.ts](../../examples/runtime-sdk-demo.ts) |
+| `session.turn.queue.clear()/sendNow()/get()/list()/remove()` | Interactive runtime CLI, [runtime-command.ts](../../src/runtime/cli/runtime-command.ts) |
+| `session.queue.policy()/setPolicy(...)` | Interactive runtime CLI, [runtime-command.ts](../../src/runtime/cli/runtime-command.ts) |
 
 ## Session Read Model
 

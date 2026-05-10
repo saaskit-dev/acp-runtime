@@ -797,6 +797,103 @@ describe("AcpRuntime public SDK", () => {
     );
   });
 
+  it("re-resolves stored snapshot agents by type when loading old sessions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "acp-runtime-agent-upgrade-"));
+    tempDirs.push(root);
+    const registryPath = join(root, "runtime-session-registry.json");
+    const registry = new AcpRuntimeSessionRegistry({
+      store: new AcpRuntimeJsonSessionRegistryStore(registryPath),
+    });
+    await registry.rememberSnapshot(createSnapshot({
+      agent: {
+        command: "/old/cache/agents/codex-acp/codex-acp",
+        type: "codex-acp",
+      },
+      session: { id: "old-session" },
+    }));
+
+    const backend = new SpySessionBackend(createSnapshot({
+      agent: {
+        command: "/new/cache/agents/codex-acp/codex-acp-0.14.0/codex-acp",
+        type: "codex-acp",
+      },
+      session: { id: "old-session" },
+    }), () => []);
+    let resolvedAgentId: string | undefined;
+    let loadOptions: AcpRuntimeLoadOptions | undefined;
+    const runtime = createTestRuntime(
+      {
+        async load(options: AcpRuntimeLoadOptions) {
+          loadOptions = options;
+          return backend;
+        },
+      },
+      {
+        async agentResolver(agentId) {
+          resolvedAgentId = agentId;
+          return {
+            command: "/new/cache/agents/codex-acp/codex-acp-0.14.0/codex-acp",
+            type: agentId,
+          };
+        },
+        state: { sessionRegistryPath: registryPath },
+      },
+    );
+
+    await runtime.sessions.load({ sessionId: "old-session" });
+
+    expect(resolvedAgentId).toBe("codex-acp");
+    expect(loadOptions?.agent).toEqual({
+      command: "/new/cache/agents/codex-acp/codex-acp-0.14.0/codex-acp",
+      type: "codex-acp",
+    });
+    expect(loadOptions?.cwd).toBe("/tmp/project");
+  });
+
+  it("keeps stored command agents without a type when loading old sessions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "acp-runtime-command-agent-"));
+    tempDirs.push(root);
+    const registryPath = join(root, "runtime-session-registry.json");
+    const agent: AcpRuntimeAgent = { command: "/custom/agent" };
+    const registry = new AcpRuntimeSessionRegistry({
+      store: new AcpRuntimeJsonSessionRegistryStore(registryPath),
+    });
+    await registry.rememberSnapshot(createSnapshot({
+      agent,
+      session: { id: "custom-session" },
+    }));
+
+    const backend = new SpySessionBackend(createSnapshot({
+      agent,
+      session: { id: "custom-session" },
+    }), () => []);
+    let resolverCalled = false;
+    let loadOptions: AcpRuntimeLoadOptions | undefined;
+    const runtime = createTestRuntime(
+      {
+        async load(options: AcpRuntimeLoadOptions) {
+          loadOptions = options;
+          return backend;
+        },
+      },
+      {
+        async agentResolver(agentId) {
+          resolverCalled = true;
+          return {
+            command: `/resolved/${agentId}`,
+            type: agentId,
+          };
+        },
+        state: { sessionRegistryPath: registryPath },
+      },
+    );
+
+    await runtime.sessions.load({ sessionId: "custom-session" });
+
+    expect(resolverCalled).toBe(false);
+    expect(loadOptions?.agent).toEqual(agent);
+  });
+
   it("lists sessions from registry-resolved agents", async () => {
     const expectedList: AcpRuntimeSessionList = {
       sessions: [],
