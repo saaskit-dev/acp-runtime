@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { context, trace } from "@opentelemetry/api";
 import type { InitializeResponse, SessionNotification } from "@agentclientprotocol/sdk";
 
 import { AcpClientBridge } from "./authority-bridge.js";
@@ -137,10 +138,14 @@ describe("AcpSdkSessionDriver thread-first model", () => {
       sessionId: "session-1",
     });
 
+    const parentSpan = trace.getTracer("test").startSpan("free.runtime.run_turn");
+    const parentContext = trace.setSpan(context.active(), parentSpan);
+
     const events = [];
-    for await (const event of driver.stream("hello")) {
+    for await (const event of driver.stream("hello", { _traceContext: parentContext })) {
       events.push(event);
     }
+    parentSpan.end();
 
     expect(events.map((event) => event.type)).toContain("usage_updated");
     expect(events).toContainEqual(
@@ -171,6 +176,7 @@ describe("AcpSdkSessionDriver thread-first model", () => {
       spans.find((span) => span.name === "acp.permission")?.attributes["acp.permission.decision"],
     ).toBe("allowed");
     const turnSpan = spans.find((span) => span.name === "acp.turn");
+    expect(turnSpan?.parentSpanId).toBe(parentSpan.spanContext().spanId);
     expect(turnSpan?.attributes["acp.prompt.content"]).toBe("hello");
     expect(turnSpan?.attributes["acp.turn.output_text"]).toBe("done");
     expect(

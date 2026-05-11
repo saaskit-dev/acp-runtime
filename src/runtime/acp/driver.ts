@@ -674,7 +674,7 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     );
     const { context: turnContext, span: turnSpan } = childSpan(
       "acp.turn",
-      context.active(),
+      options?._traceContext ?? context.active(),
       {
         "acp.agent.type": this.bootstrap.agent.type,
         "acp.session.id": this.bootstrap.sessionId,

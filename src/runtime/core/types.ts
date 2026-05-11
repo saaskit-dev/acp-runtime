@@ -1167,6 +1167,7 @@ export type AcpRuntimeResumeSessionOptions = AcpRuntimeLoadSessionOptions;
 
 export type AcpRuntimeStreamOptions = {
   timeoutMs?: number;
+  _traceContext?: import("@opentelemetry/api").Context;
 };
 
 export type AcpRuntimeTurnHandle = {
