@@ -48,6 +48,8 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.18.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
   }
 }
-

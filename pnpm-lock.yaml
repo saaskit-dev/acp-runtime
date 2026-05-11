@@ -51,6 +51,10 @@ importers:
       '@agentclientprotocol/sdk':
         specifier: ^0.18.0
         version: 0.18.0(zod@4.3.6)
+    devDependencies:
+      typescript:
+        specifier: ^5.5.0
+        version: 5.9.3
 
 packages:
 
