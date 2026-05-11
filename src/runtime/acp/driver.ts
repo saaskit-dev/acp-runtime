@@ -1418,7 +1418,7 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
       case AcpRuntimeTurnEventType.OperationStarted:
       case AcpRuntimeTurnEventType.OperationUpdated: {
         const span = this.ensureOperationSpan(activeTurn, event.operation);
-        this.observeToolCallSnapshot(activeTurn, event.operation.id, span);
+        this.observeToolCallSnapshot(event.operation.id, span);
         emitRuntimeLog({
           attributes: {
             ...operationAttributes(event.operation),
@@ -1436,7 +1436,6 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
       }
       case AcpRuntimeTurnEventType.OperationCompleted:
         this.observeToolCallSnapshot(
-          activeTurn,
           event.operation.id,
           this.ensureOperationSpan(activeTurn, event.operation),
         );
@@ -1458,7 +1457,7 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
         return;
       case AcpRuntimeTurnEventType.OperationFailed: {
         const span = this.ensureOperationSpan(activeTurn, event.operation);
-        this.observeToolCallSnapshot(activeTurn, event.operation.id, span);
+        this.observeToolCallSnapshot(event.operation.id, span);
         recordException(span, event.error);
         this.completeOperationSpan(activeTurn, event.operation.id, {
           "acp.operation.outcome":
@@ -1634,12 +1633,8 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     return span;
   }
 
-  private observeToolCallSnapshot(
-    activeTurn: ActiveTurn,
-    operationId: string,
-    span: Span,
-  ): void {
-    const toolCallId = this.findToolCallIdForOperation(activeTurn, operationId);
+  private observeToolCallSnapshot(operationId: string, span: Span): void {
+    const toolCallId = this.findToolCallIdForOperation(operationId);
     if (!toolCallId) {
       return;
     }
@@ -1760,16 +1755,8 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
     });
   }
 
-  private findToolCallIdForOperation(
-    activeTurn: ActiveTurn,
-    operationId: string,
-  ): string | undefined {
-    for (const [toolCallId, mappedOperationId] of activeTurn.state.vendorToolCallToOperationId.entries()) {
-      if (mappedOperationId === operationId) {
-        return toolCallId;
-      }
-    }
-    return undefined;
+  private findToolCallIdForOperation(operationId: string): string | undefined {
+    return this.timeline.getToolCall(operationId) ? operationId : undefined;
   }
 
   private completeOperationSpan(

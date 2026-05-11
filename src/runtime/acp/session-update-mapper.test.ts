@@ -242,8 +242,12 @@ describe("session update mapper permission evidence", () => {
     expect(startedEvents).toHaveLength(1);
     expect(startedEvents[0]).toMatchObject({
       operation: {
+        id: "tool-1",
         kind: "mcp_call",
         phase: "running",
+        rawInput: {
+          target: "button[data-route=\"clients\"]",
+        },
         title: "browser_click",
       },
       type: "operation_started",
@@ -271,6 +275,8 @@ describe("session update mapper permission evidence", () => {
       operation: {
         kind: "mcp_call",
         phase: "completed",
+        rawOutput:
+          "Wall time: 1.1160 seconds\nOutput:\nclicked clients tab",
         result: {
           output: [
             {

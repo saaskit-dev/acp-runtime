@@ -445,6 +445,8 @@ export type AcpRuntimeOperation = {
   phase: AcpRuntimeOperationPhase;
   permission?: AcpRuntimeOperationPermission;
   progress?: AcpRuntimeOperationProgress;
+  rawInput?: unknown;
+  rawOutput?: unknown;
   result?: AcpRuntimeOperationResult;
   startedAt?: string;
   summary?: string;

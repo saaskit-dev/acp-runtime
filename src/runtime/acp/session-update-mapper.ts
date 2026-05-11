@@ -46,7 +46,6 @@ import {
 } from "../core/types.js";
 import type { AcpAgentProfile } from "./profiles/index.js";
 import {
-  nextOperationId,
   nextPermissionRequestId,
   type AcpRuntimeTurnState,
 } from "./turn-state.js";
@@ -391,12 +390,7 @@ function mapToolCallUpdateToRuntimeEvents(
   profile: AcpAgentProfile,
   turn: AcpRuntimeTurnState,
 ): AcpRuntimeTurnEvent[] {
-  const operationId = turn.vendorToolCallToOperationId.get(update.toolCallId);
-  if (!operationId) {
-    return [];
-  }
-
-  const existing = turn.operations.get(operationId);
+  const existing = turn.operations.get(update.toolCallId);
   if (!existing) {
     return [];
   }
@@ -408,11 +402,15 @@ function mapToolCallUpdateToRuntimeEvents(
     existing.phase = mapOperationPhase(update.status);
   }
   if (update.content !== undefined && update.content !== null) {
+    if (update.rawOutput !== undefined && update.rawOutput !== null) {
+      existing.rawOutput = update.rawOutput;
+    }
     existing.result = {
       output: mapToolCallContentToOutput(update.content),
       outputText: collectToolCallContentText(update.content),
     };
   } else if (update.rawOutput !== undefined && update.rawOutput !== null) {
+    existing.rawOutput = update.rawOutput;
     existing.result = {
       output: mapRawToolOutputToOutputParts(update.rawOutput),
       outputText: mapRawToolOutputToOutputText(update.rawOutput),
@@ -491,31 +489,28 @@ function upsertOperationFromToolCall(input: {
   toolCallId: string;
   turn: AcpRuntimeTurnState;
 }): AcpRuntimeOperation {
-  const existingId = input.turn.vendorToolCallToOperationId.get(
-    input.toolCallId,
-  );
-  if (existingId) {
-    const existing = input.turn.operations.get(existingId);
-    if (existing) {
-      const kind = normalizeToolKind(input.kind);
-      if (input.status) {
-        existing.phase = mapOperationPhase(input.status);
-      }
-      existing.updatedAt = new Date().toISOString();
-      existing.target = input.profile.inferOperationTarget({
-        kind,
-        locations: input.locations,
-        rawInput: input.rawInput,
-      });
-      return cloneOperation(existing);
+  const existing = input.turn.operations.get(input.toolCallId);
+  if (existing) {
+    const kind = normalizeToolKind(input.kind);
+    if (input.status) {
+      existing.phase = mapOperationPhase(input.status);
     }
+    existing.rawInput = input.rawInput;
+    existing.updatedAt = new Date().toISOString();
+    existing.target = input.profile.inferOperationTarget({
+      kind,
+      locations: input.locations,
+      rawInput: input.rawInput,
+    });
+    return cloneOperation(existing);
   }
 
   const kind = normalizeToolKind(input.kind);
   const operation: AcpRuntimeOperation = {
-    id: nextOperationId(input.turn),
+    id: input.toolCallId,
     kind: input.profile.mapOperationKind(kind),
     phase: mapOperationPhase(input.status ?? "pending"),
+    rawInput: input.rawInput,
     startedAt: new Date().toISOString(),
     target: input.profile.inferOperationTarget({
       kind,
@@ -526,7 +521,6 @@ function upsertOperationFromToolCall(input: {
     turnId: input.turn.turnId,
     updatedAt: new Date().toISOString(),
   };
-  input.turn.vendorToolCallToOperationId.set(input.toolCallId, operation.id);
   input.turn.operations.set(operation.id, operation);
   return cloneOperation(operation);
 }
