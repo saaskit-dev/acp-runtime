@@ -21,6 +21,36 @@ function createMetadata(): AcpRuntimeSessionMetadata {
 }
 
 describe("session update mapper permission evidence", () => {
+  it("preserves image chunks as runtime image data URIs", () => {
+    const turn = createTurnState();
+    mapSessionUpdateToRuntimeEvents({
+      diagnostics: {},
+      metadata: createMetadata(),
+      notification: {
+        sessionId: "session-1",
+        update: {
+          content: {
+            data: "aGVsbG8=",
+            mimeType: "image/png",
+            type: "image",
+            uri: "file:///tmp/source.png",
+          },
+          sessionUpdate: "agent_message_chunk",
+        },
+      } as never,
+      profile,
+      turn,
+    });
+
+    expect(turn.output).toEqual([
+      {
+        mediaType: "image/png",
+        type: "image",
+        uri: "data:image/png;base64,aGVsbG8=",
+      },
+    ]);
+  });
+
   it("updates config values and option metadata from config option updates", () => {
     const metadata = createMetadata();
     const events = mapSessionUpdateToRuntimeEvents({

@@ -2105,7 +2105,7 @@ function mapGenericToolCallContent(
         alt: undefined,
         mediaType: block.mimeType ?? undefined,
         type: "image",
-        uri: block.uri ?? `data:${block.mimeType};base64,${block.data}`,
+        uri: imageDataUri(block.mimeType, block.data),
       },
     };
   }
@@ -2167,4 +2167,8 @@ function coalescePrompts(prompts: readonly AcpRuntimePrompt[]): AcpRuntimePrompt
     items.push(...prompt);
   }
   return items;
+}
+
+function imageDataUri(mimeType: string, data: string): string {
+  return `data:${mimeType};base64,${data}`;
 }

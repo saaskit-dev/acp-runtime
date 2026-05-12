@@ -563,7 +563,7 @@ function mapContentChunkToOutput(
         {
           mediaType: content.mimeType,
           type: "image",
-          uri: content.uri ?? `data:${content.mimeType};base64,${content.data}`,
+          uri: imageDataUri(content.mimeType, content.data),
         },
       ];
     case "resource_link":
@@ -817,4 +817,8 @@ function assertNever(value: never): never {
   throw new Error(
     `Unhandled ACP session update value: ${JSON.stringify(value)}`,
   );
+}
+
+function imageDataUri(mimeType: string, data: string): string {
+  return `data:${mimeType};base64,${data}`;
 }

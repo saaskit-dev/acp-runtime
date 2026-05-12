@@ -56,6 +56,18 @@ function mapPromptPartToAcp(
         },
       ];
     case "image":
+      {
+        const image = parseImageDataUri(part.uri);
+        if (image) {
+          return [
+            {
+              data: image.data,
+              mimeType: image.mimeType,
+              type: "image",
+            },
+          ];
+        }
+      }
       return [
         {
           type: "resource_link",
@@ -106,6 +118,19 @@ function isPromptMessage(
     | import("../core/types.js").AcpRuntimePromptMessage,
 ): value is import("../core/types.js").AcpRuntimePromptMessage {
   return "role" in value;
+}
+
+function parseImageDataUri(
+  uri: string,
+): { data: string; mimeType: string } | undefined {
+  const match = /^data:([^;,]+)(?:;[^,]*)*;base64,(.*)$/is.exec(uri);
+  if (!match || !match[1].startsWith("image/")) {
+    return undefined;
+  }
+  return {
+    data: match[2],
+    mimeType: match[1],
+  };
 }
 
 function assertNever(value: never): never {
