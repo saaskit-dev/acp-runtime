@@ -696,6 +696,7 @@ export type AcpRuntimeUsage = {
 
 export type AcpRuntimeHistoryEntry =
   | {
+      content?: readonly AcpRuntimePromptPart[];
       text: string;
       type: typeof AcpRuntimePromptMessageRole.User;
     }
@@ -755,6 +756,7 @@ export type AcpRuntimeThreadEntry =
       turnId: string;
     }
   | {
+      content?: readonly AcpRuntimePromptPart[];
       id: string;
       kind: typeof AcpRuntimeThreadEntryKind.UserMessage;
       text: string;

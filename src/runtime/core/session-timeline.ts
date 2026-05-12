@@ -30,6 +30,7 @@ import type {
   AcpRuntimeUsage,
 } from "./types.js";
 import {
+  AcpRuntimeContentPartType,
   AcpRuntimeOperationProjectionLifecycle,
   AcpRuntimePermissionProjectionLifecycle,
   AcpRuntimeProjectionUpdateType,
@@ -420,12 +421,41 @@ export class AcpRuntimeSessionTimeline {
     });
   }
 
+  appendHistoryUserContent(content: readonly AcpRuntimePromptPart[]): void {
+    const clonedContent = clonePromptParts(content);
+    const text = promptPartsToThreadText(clonedContent);
+    if (clonedContent.length === 0 && !text) {
+      return;
+    }
+    this.appendTimelineEntry({
+      content: clonedContent,
+      text,
+      type: "user",
+    });
+    const entry = {
+      content: clonedContent,
+      id: this.nextEntryId("user"),
+      kind: AcpRuntimeThreadEntryKind.UserMessage,
+      text,
+    } satisfies Extract<
+      AcpRuntimeThreadEntry,
+      { kind: typeof AcpRuntimeThreadEntryKind.UserMessage }
+    >;
+    this.entriesValue.push(entry);
+    this.emit({
+      entry: cloneThreadEntry(entry),
+      type: AcpRuntimeReadModelUpdateType.ThreadEntryAdded,
+    });
+  }
+
   appendPrompt(prompt: AcpRuntimePrompt, turnId: string): void {
-    const text = promptToThreadText(prompt);
-    if (!text) {
+    const content = promptToUserContent(prompt);
+    const text = promptPartsToThreadText(content);
+    if (content.length === 0 && !text) {
       return;
     }
     const entry = {
+      content: shouldPersistPromptContent(content) ? content : undefined,
       id: this.nextEntryId("user"),
       kind: AcpRuntimeThreadEntryKind.UserMessage,
       text,
@@ -797,8 +827,12 @@ function cloneThreadEntry(entry: AcpRuntimeThreadEntry): AcpRuntimeThreadEntry {
         output: entry.output ? [...entry.output] : undefined,
       };
     case AcpRuntimeThreadEntryKind.AssistantThought:
-    case AcpRuntimeThreadEntryKind.UserMessage:
       return { ...entry };
+    case AcpRuntimeThreadEntryKind.UserMessage:
+      return {
+        ...entry,
+        content: entry.content ? clonePromptParts(entry.content) : undefined,
+      };
     case AcpRuntimeThreadEntryKind.Plan:
       return {
         ...entry,
@@ -949,29 +983,29 @@ function clonePermissionRequest(
   };
 }
 
-function promptToThreadText(prompt: AcpRuntimePrompt): string {
+function promptToUserContent(prompt: AcpRuntimePrompt): readonly AcpRuntimePromptPart[] {
   if (typeof prompt === "string") {
-    return prompt;
+    return prompt ? [{ text: prompt, type: AcpRuntimeContentPartType.Text }] : [];
   }
 
   if (!Array.isArray(prompt)) {
-    return "";
+    return [];
   }
 
   if (prompt.length === 0) {
-    return "";
+    return [];
   }
 
   return prompt
-    .flatMap((item) =>
-      isPromptMessage(item)
-        ? item.role === "user"
+    .flatMap((item) => {
+      if (isPromptMessage(item)) {
+        return item.role === "user"
           ? normalizePromptContent(item.content)
-          : []
-        : normalizePromptPart(item),
-    )
-    .join("\n")
-    .trim();
+          : [];
+      }
+      return [item];
+    })
+    .map((part) => clonePromptPart(part));
 }
 
 function isPromptMessage(value: unknown): value is AcpRuntimePromptMessage {
@@ -985,11 +1019,15 @@ function isPromptMessage(value: unknown): value is AcpRuntimePromptMessage {
 
 function normalizePromptContent(
   content: string | readonly AcpRuntimePromptPart[],
-): string[] {
+): readonly AcpRuntimePromptPart[] {
   if (typeof content === "string") {
-    return [content];
+    return content ? [{ text: content, type: AcpRuntimeContentPartType.Text }] : [];
   }
-  return content.flatMap((part) => normalizePromptPart(part));
+  return content.map((part) => clonePromptPart(part));
+}
+
+function promptPartsToThreadText(parts: readonly AcpRuntimePromptPart[]): string {
+  return parts.flatMap((part) => normalizePromptPart(part)).join("\n").trim();
 }
 
 function normalizePromptPart(part: AcpRuntimePromptPart): string[] {
@@ -1003,10 +1041,26 @@ function normalizePromptPart(part: AcpRuntimePromptPart): string[] {
     case "file":
       return [part.title ?? part.uri];
     case "image":
-      return [part.alt ?? part.uri];
+      return [part.alt ?? `Image content (${part.mediaType ?? "image"})`];
     case "audio":
-      return [part.title ?? part.mediaType];
+      return [part.title ?? `Audio content (${part.mediaType})`];
     default:
       return [];
   }
+}
+
+function clonePromptParts(
+  content: readonly AcpRuntimePromptPart[],
+): AcpRuntimePromptPart[] {
+  return content.map((part) => clonePromptPart(part));
+}
+
+function shouldPersistPromptContent(
+  content: readonly AcpRuntimePromptPart[],
+): boolean {
+  return content.some((part) => part.type !== AcpRuntimeContentPartType.Text);
+}
+
+function clonePromptPart(part: AcpRuntimePromptPart): AcpRuntimePromptPart {
+  return { ...part };
 }

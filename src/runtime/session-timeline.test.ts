@@ -44,6 +44,69 @@ describe("AcpRuntimeSessionTimeline", () => {
     ]);
   });
 
+  it("preserves image prompt content for thread and history replay", () => {
+    const timeline = new AcpRuntimeSessionTimeline();
+
+    timeline.appendHistoryUserContent([
+      {
+        mediaType: "image/png",
+        type: "image",
+        uri: "data:image/png;base64,aGVsbG8=",
+      },
+    ]);
+    timeline.sealHistoryReplay();
+    timeline.appendPrompt([
+      { text: "look", type: "text" },
+      {
+        mediaType: "image/png",
+        type: "image",
+        uri: "data:image/png;base64,aGVsbG8=",
+      },
+    ], "turn-image");
+
+    expect(timeline.drainHistoryEntries()).toEqual([
+      {
+        content: [
+          {
+            mediaType: "image/png",
+            type: "image",
+            uri: "data:image/png;base64,aGVsbG8=",
+          },
+        ],
+        text: "Image content (image/png)",
+        type: "user",
+      },
+    ]);
+    expect(timeline.entries).toEqual([
+      {
+        content: [
+          {
+            mediaType: "image/png",
+            type: "image",
+            uri: "data:image/png;base64,aGVsbG8=",
+          },
+        ],
+        id: "user-1",
+        kind: "user_message",
+        text: "Image content (image/png)",
+      },
+      {
+        content: [
+          { text: "look", type: "text" },
+          {
+            mediaType: "image/png",
+            type: "image",
+            uri: "data:image/png;base64,aGVsbG8=",
+          },
+        ],
+        id: "user-2",
+        kind: "user_message",
+        text: "look\nImage content (image/png)",
+        turnId: "turn-image",
+      },
+    ]);
+  });
+
   it("tracks tool call entries with diff and terminal content", () => {
     const timeline = new AcpRuntimeSessionTimeline();
     const updates: string[] = [];

@@ -1,4 +1,5 @@
 import type {
+  ContentBlock,
   PromptResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
@@ -881,9 +882,11 @@ export class AcpSdkSessionDriver implements AcpSessionDriver {
 
     if (!activeTurn) {
       if (params.update.sessionUpdate === "user_message_chunk") {
-        const text = extractHistoryText(params.update.content);
-        if (text) {
-          this.timeline.appendHistoryUser(text);
+        const content = mapContentBlockToPromptPart(params.update.content);
+        if (content?.type === "text") {
+          this.timeline.appendHistoryUser(content.text);
+        } else if (content) {
+          this.timeline.appendHistoryUserContent([content]);
         }
       }
 
@@ -1939,6 +1942,51 @@ function extractHistoryText(
   return content.type === "text" && typeof content.text === "string"
     ? content.text
     : "";
+}
+
+function mapContentBlockToPromptPart(
+  content: ContentBlock,
+): AcpRuntimePromptPart | undefined {
+  switch (content.type) {
+    case "text":
+      return { text: content.text, type: "text" };
+    case "image":
+      return {
+        mediaType: content.mimeType,
+        type: "image",
+        uri: imageDataUri(content.mimeType, content.data),
+      };
+    case "audio":
+      return {
+        data: content.data,
+        mediaType: content.mimeType,
+        type: "audio",
+      };
+    case "resource_link":
+      if (content.mimeType?.startsWith("image/")) {
+        return {
+          alt: content.title ?? content.name,
+          mediaType: content.mimeType,
+          type: "image",
+          uri: content.uri,
+        };
+      }
+      return {
+        mediaType: content.mimeType ?? undefined,
+        title: content.title ?? content.name,
+        type: "file",
+        uri: content.uri,
+      };
+    case "resource":
+      return {
+        mediaType: content.resource.mimeType ?? undefined,
+        text: "text" in content.resource ? content.resource.text : undefined,
+        type: "resource",
+        uri: content.resource.uri,
+      };
+    default:
+      return undefined;
+  }
 }
 
 function waitFor(ms: number): Promise<void> {
