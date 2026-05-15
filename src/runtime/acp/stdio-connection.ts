@@ -58,6 +58,11 @@ type StdioOperationTracker = {
   summary(): string | undefined;
 };
 
+type StdioStderrTail = {
+  append(chunk: string): void;
+  read(): string;
+};
+
 type StdioProcessLifecycleContext = {
   agent: AcpRuntimeAgent;
   cwd: string;
@@ -110,11 +115,11 @@ export function createStdioAcpConnectionFactory(
       eventName: "acp.stdio.process.spawned",
     });
 
-    const stderrChunks: string[] = [];
+    const stderrTail = createStdioStderrTail(STDERR_TAIL_LIMIT);
     if (child.stderr) {
       child.stderr.setEncoding("utf8");
       child.stderr.on("data", (chunk: string) => {
-        stderrChunks.push(chunk);
+        stderrTail.append(chunk);
       });
     }
 
@@ -143,11 +148,11 @@ export function createStdioAcpConnectionFactory(
         pid: child.pid ?? undefined,
         startedAt: processStartedAt,
       },
-      stderrChunks,
+      stderrTail,
       () => disposing,
       () => operationTracker.summary(),
       (code, signal, expected) => {
-        const stderrTail = trimStderrTail(stderrChunks.join("").trim());
+        const stderrOutput = stderrTail.read();
         emitStdioProcessLifecycleLog({
           ...lifecycleContext,
           body: expected
@@ -166,7 +171,7 @@ export function createStdioAcpConnectionFactory(
           exitSignal: signal,
           operationSummary: operationTracker.summary(),
           severityNumber: expected ? SeverityNumber.DEBUG : SeverityNumber.ERROR,
-          stderrTail,
+          stderrTail: stderrOutput,
         });
       },
     );
@@ -577,29 +582,21 @@ function createNdJsonMessageStream(
             continue;
           }
           content += textDecoder.decode(value, { stream: true });
-          const lines = content.split("\n");
-          content = lines.pop() || "";
-          for (const line of lines) {
-            const trimmedLine = line.trim();
-            if (
-              !trimmedLine ||
-              shouldIgnoreNonJsonAgentOutputLine(agentCommand, trimmedLine)
-            ) {
-              continue;
+          let lineStart = 0;
+          while (true) {
+            const lineEnd = content.indexOf("\n", lineStart);
+            if (lineEnd === -1) {
+              break;
             }
-            try {
-              controller.enqueue(
-                normalizeInboundAcpMessage(
-                  JSON.parse(trimmedLine) as AnyMessage,
-                ),
-              );
-            } catch (error) {
-              console.error(
-                "Failed to parse JSON message:",
-                trimmedLine,
-                error,
-              );
-            }
+            enqueueNdJsonLine(
+              agentCommand,
+              controller,
+              content.slice(lineStart, lineEnd),
+            );
+            lineStart = lineEnd + 1;
+          }
+          if (lineStart > 0) {
+            content = content.slice(lineStart);
           }
         }
       } finally {
@@ -609,19 +606,70 @@ function createNdJsonMessageStream(
     },
   });
 
+  let writer: WritableStreamDefaultWriter<Uint8Array> | undefined;
   const writable = new WritableStream<AnyMessage>({
+    start() {
+      writer = output.getWriter();
+    },
     async write(message) {
       const content = JSON.stringify(message) + "\n";
-      const writer = output.getWriter();
+      if (!writer) {
+        throw new Error("ACP connection closed");
+      }
+      await writer.write(textEncoder.encode(content));
+    },
+    async close() {
+      if (!writer) {
+        return;
+      }
       try {
-        await writer.write(textEncoder.encode(content));
+        await writer.close();
       } finally {
         writer.releaseLock();
+        writer = undefined;
+      }
+    },
+    async abort(reason) {
+      if (!writer) {
+        return;
+      }
+      try {
+        await writer.abort(reason);
+      } finally {
+        writer.releaseLock();
+        writer = undefined;
       }
     },
   });
 
   return { readable, writable };
+}
+
+function enqueueNdJsonLine(
+  agentCommand: string,
+  controller: ReadableStreamDefaultController<AnyMessage>,
+  line: string,
+): void {
+  const trimmedLine = line.trim();
+  if (
+    !trimmedLine ||
+    shouldIgnoreNonJsonAgentOutputLine(agentCommand, trimmedLine)
+  ) {
+    return;
+  }
+  try {
+    controller.enqueue(
+      normalizeInboundAcpMessage(
+        JSON.parse(trimmedLine) as AnyMessage,
+      ),
+    );
+  } catch (error) {
+    console.error(
+      "Failed to parse JSON message:",
+      trimmedLine,
+      error,
+    );
+  }
 }
 
 export function normalizeInboundAcpMessage(message: AnyMessage): AnyMessage {
@@ -829,7 +877,7 @@ function createExitWatcher(
     pid?: number;
     startedAt: number;
   },
-  stderrChunks: string[],
+  stderrTail: StdioStderrTail,
   isExpectedExit: () => boolean,
   getActiveOperationSummary: () => string | undefined,
   onExit: (
@@ -848,7 +896,7 @@ function createExitWatcher(
         return;
       }
 
-      const stderr = stderrChunks.join("").trim();
+      const stderr = stderrTail.read();
       const classification = classifyStdioProcessExit({
         expected,
         killCalled: child.killed,
@@ -870,6 +918,21 @@ function createExitWatcher(
       );
     });
   });
+}
+
+function createStdioStderrTail(limit: number): StdioStderrTail {
+  let tail = "";
+  return {
+    append(chunk: string) {
+      tail += chunk;
+      if (tail.length > limit) {
+        tail = tail.slice(-limit);
+      }
+    },
+    read() {
+      return tail.trim();
+    },
+  };
 }
 
 function createStdioOperationTracker(): StdioOperationTracker {

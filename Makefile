@@ -38,34 +38,34 @@ help:
 		'  Use PROMPT="/describe" instead.'
 
 install:
-	pnpm install
+	bun install
 
 clean:
-	pnpm run clean
+	bun run clean
 
 build:
-	pnpm run build
+	bun run build
 
 build-self:
-	pnpm run build:self
+	bun run build:self
 
 dev:
-	pnpm run dev
+	bun run dev
 
 lint:
-	pnpm run lint
+	bun run lint
 
 test:
-	pnpm run test
+	bun run test
 
 test-watch:
-	pnpm run test:watch
+	bun run test:watch
 
 demo-client-sdk:
-	pnpm run demo:client-sdk
+	bun run demo:client-sdk
 
 demo-runtime:
-	pnpm run runtime
+	bun run runtime
 
 runtime:
 	@if [ -z "$(RUNTIME_AGENT)" ]; then \
@@ -80,7 +80,7 @@ runtime:
 	if [ "$$agent_id" = "codex" ]; then \
 		agent_id="codex-acp"; \
 	fi; \
-	node dist/runtime/cli/runtime-command.js "$$agent_id" $(PROMPT)
+		bun dist/runtime/cli/runtime-command.js "$$agent_id" $(PROMPT)
 
 simulator:
 	@:
@@ -92,16 +92,16 @@ codex:
 	@:
 
 harness-clean:
-	pnpm run harness:clean-outputs
+	bun run harness:clean-outputs
 
 harness-admission:
-	pnpm run harness:check-admission
+	bun run harness:check-admission
 
 harness-full:
-	pnpm run harness:run-agent
+	bun run harness:run-agent
 
 local-pack:
-	pnpm run build:lib
+	bun run build:lib
 	npm pack
 
 local-install: local-pack

@@ -1,5 +1,7 @@
 node_modules/
 dist/
+dist-bin/
+packages/*/dist-bin/
 *.tsbuildinfo
 .DS_Store
 .dev.vars
