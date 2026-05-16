@@ -131,6 +131,13 @@
 - `runtime.sessions.list({ source: "local" })`
 - `runtime.sessions.list({ source: "remote", agent, cwd })`
 - `runtime.sessions.list({ source: "all", agent, cwd })`
+- `runtime.sessions.resume({ sessionId, handlers })`
+
+恢复说明：
+- 本地 snapshot 是 agent/cwd/MCP 恢复的 durable source
+- 宿主只应该持久化哪些产品 session 尚未关闭这类生命周期事实
+- runtime snapshot 可用时，宿主不应该重复保存解析后的 agent 启动参数
+- authority handlers 是 live callback，resume 时仍然必须重新传入
 
 ## 阶段 7：宿主 authority 与认证
 

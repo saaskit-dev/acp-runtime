@@ -72,6 +72,15 @@ Runtime-owned state is enabled by default and stored under
 `new AcpRuntime(factory, { state: { sessionRegistryPath } })`, or disable local
 state with `{ state: false }`.
 
+The session registry is the runtime's recovery source of truth. After a session
+has been started, loaded, or resumed, the runtime stores a snapshot containing
+the ACP session id, resolved agent launch config, cwd, MCP servers, mode/config
+state, and title metadata. Later calls to `runtime.sessions.resume({ sessionId,
+handlers })` can reopen the ACP session from that stored snapshot without the
+host duplicating `agent`, `cwd`, or `mcpServers`. Hosts still provide fresh
+authority handlers on every open because permission, filesystem, terminal, and
+authentication callbacks are live process closures, not persisted state.
+
 Then read in this order:
 - [Runtime SDK By Scenario](docs/guides/runtime-sdk-by-scenario.md)
 - [Runtime SDK Read Models](docs/guides/runtime-sdk-read-models.md)

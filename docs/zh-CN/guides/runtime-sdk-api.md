@@ -79,6 +79,35 @@ runtime 自有状态默认现在统一放在 `~/.acp-runtime/` 下。
 runtime 默认会把本地会话索引维护在 `~/.acp-runtime/state/runtime-session-registry.json`。
 如需改路径，传 `new AcpRuntime(factory, { state: { sessionRegistryPath } })`；如需关闭本地状态，传 `{ state: false }`。
 
+### Session Registry 与恢复
+
+runtime 自有的 session registry 会记录重新打开 ACP session 所需的 snapshot。
+managed session 注册时会写入 snapshot，driver 后续报告 snapshot 变化时也会刷新。snapshot
+包含 ACP session id、解析后的 agent 启动配置、cwd、MCP servers、当前 mode/config
+状态和 session 标题元数据。
+
+只要本地存在 stored snapshot，`runtime.sessions.resume({ sessionId, handlers })`
+就足以让 runtime 按之前的 agent/cwd/MCP 配置恢复 session。宿主不需要并行保存这些启动参数：
+
+```ts
+const resumed = await runtime.sessions.resume({
+  sessionId,
+  handlers: {
+    permission: decidePermission,
+    filesystem,
+    terminal,
+    authentication,
+  },
+});
+```
+
+如果没有 stored snapshot，按 id 打开 session 时调用方至少要提供 `agent` 和 `cwd`，
+否则 runtime 会抛 `AcpLoadError`。需要崩溃恢复的宿主应该把 runtime registry
+当作 durable recovery source，只持久化宿主自己拥有的生命周期事实，例如哪些产品 session
+尚未关闭。`handlers` 仍然必须在每次 `start`、`load`、`resume` 时由宿主重新传入，
+因为 permission、filesystem、terminal、authentication 回调都是当前进程里的 live
+closure，不能从 snapshot 恢复。
+
 ### Initial Config
 
 宿主希望 session 打开后立刻进入某个 mode/model/reasoning preset 时，可以传 `initialConfig`：

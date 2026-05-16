@@ -1,5 +1,6 @@
+import { resolve } from "node:path";
+
 import {
-  createSimulatorAgentAcpAgent,
   type AcpRuntimeCapabilities,
   type AcpRuntimeDiagnostics,
   type AcpRuntimeSessionMetadata,
@@ -60,7 +61,11 @@ export async function stage1ExplicitAgentExample(input: {
     registryPath: resolveExampleRegistryPath("runtime-sdk-stage-1-explicit.json"),
   });
   const session = await runtime.sessions.start({
-    agent: createSimulatorAgentAcpAgent({ via: "npx" }),
+    agent: {
+      args: [resolve("packages/simulator-agent/dist/cli.js")],
+      command: process.execPath,
+      type: "simulator-agent-acp",
+    },
     cwd: input.cwd ?? process.cwd(),
     handlers: createExampleHandlers(),
   });

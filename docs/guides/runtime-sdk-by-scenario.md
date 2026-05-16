@@ -150,6 +150,13 @@ Primary APIs:
 - `runtime.sessions.list({ source: "local" })`
 - `runtime.sessions.list({ source: "remote", agent, cwd })`
 - `runtime.sessions.list({ source: "all", agent, cwd })`
+- `runtime.sessions.resume({ sessionId, handlers })`
+
+Recovery note:
+- local snapshots are the durable source for agent/cwd/MCP recovery
+- hosts should persist product lifecycle facts such as which sessions remain open
+- hosts should not duplicate resolved agent launch options when a runtime snapshot is available
+- authority handlers are live callbacks and must be supplied again on resume
 
 ## Stage 7: Host Authority and Authentication
 

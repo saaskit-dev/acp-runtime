@@ -94,6 +94,38 @@ an agent id is accepted.
 Runtime-owned local state is enabled by default and stored at `~/.acp-runtime/state/runtime-session-registry.json`.
 Use `new AcpRuntime(factory, { state: { sessionRegistryPath } })` to override that path, or `{ state: false }` to disable local state.
 
+### Session Registry and Recovery
+
+The runtime-owned session registry records the session snapshot needed to reopen
+an ACP session later. Snapshots are written when a managed session is registered
+and refreshed when the driver reports snapshot changes. They include the ACP
+session id, resolved agent launch config, cwd, MCP servers, current mode/config
+state, and session title metadata.
+
+When a stored snapshot exists, `runtime.sessions.resume({ sessionId, handlers })`
+is enough for the runtime to recover the previous agent/cwd/MCP setup. The host
+does not need to keep a parallel copy of those launch options:
+
+```ts
+const resumed = await runtime.sessions.resume({
+  sessionId,
+  handlers: {
+    permission: decidePermission,
+    filesystem,
+    terminal,
+    authentication,
+  },
+});
+```
+
+If no stored snapshot exists, opening by id requires the caller to provide at
+least `agent` and `cwd`; otherwise the runtime raises `AcpLoadError`. Hosts that
+need crash recovery should treat the registry as the durable recovery source and
+persist only host-owned lifecycle facts such as which product sessions are still
+open. Live authority callbacks must still be passed on every `start`, `load`, or
+`resume` call because they are process-local closures and cannot be restored from
+the snapshot.
+
 ### Initial Config
 
 Use `initialConfig` when a host wants a preferred mode/model/reasoning preset immediately after the ACP session is opened:

@@ -161,6 +161,23 @@ const session = await runtime.sessions.start({
 
 如果只想先拿到解析后的启动配置而不立即创建 session，可以使用 `resolveRuntimeAgentFromRegistry(agentId)`。
 
+runtime 自带的 session registry 是恢复链路的事实源。session 被
+`start`、`load` 或 `resume` 打开后，runtime 会保存 snapshot，包含 ACP
+session id、解析后的 agent 启动配置、cwd、MCP servers、mode/config 状态和标题元数据。
+因此宿主在恢复一个已记录的 session 时，通常只需要调用：
+
+```ts
+await runtime.sessions.resume({
+  sessionId,
+  handlers,
+});
+```
+
+只要本地 registry 里有 snapshot，runtime 会自动按原来的 agent/cwd/MCP
+配置恢复，不需要宿主重复维护这些启动参数。`handlers` 仍然应该由宿主每次重新传入，
+因为 permission、filesystem、terminal、authentication 回调是当前进程里的 live
+closure，不是可持久化状态。
+
 建议先看：
 - [Runtime SDK 分阶段接入](docs/zh-CN/guides/runtime-sdk-by-scenario.md)
 - [Runtime SDK API 覆盖矩阵](docs/zh-CN/guides/runtime-sdk-api-coverage.md)
